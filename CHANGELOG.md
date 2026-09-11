@@ -5,6 +5,8 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+## 2026-09-11 — Codex-wide registration
+
 ### Added
 
 - Codex-wide installation with a managed global instruction section that preserves
