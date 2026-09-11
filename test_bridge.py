@@ -66,7 +66,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             server.close()
             await server.wait_closed()
-            target.unlink()
+            target.unlink(missing_ok=True)
 
     async def test_persistence_and_size_limit(self):
         self.b.store(os.getpid(), {'type':'user','message':{'content':'saved'}})

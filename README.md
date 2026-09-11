@@ -28,6 +28,11 @@ The watcher registers the live bridge as a named peer and queues a content-free 
 
 Verified with Codex CLI 0.154.0 and Claude Code 2.1.267: address delivery, replies, discovery and delivery by name, queued notifications, and subsequent notification arrival in the targeted Codex conversation. Claude's protocol and registry are inspected internal interfaces, not a documented compatibility guarantee. Check your installed CLI's help before use.
 
+## Install and enable
+
+See [the installation guide](docs/INSTALL.md) for per-user services, selecting your
+Codex thread, persistent instructions, upgrades, and removal. For a manual trial:
+
 ## Start
 
 Clone this repository, then run the server in a persistent terminal or managed tool session:
@@ -77,7 +82,7 @@ The watcher checks every two seconds and batches new user messages into a notice
 
 ## Lifecycle
 
-Both processes must remain running. This project does not install a boot service. Stop the watcher with Ctrl-C or SIGTERM; `bridge.py stop` stops the server and causes the watcher to exit. Graceful cleanup removes only the process's own sockets and registry entry. SQLite and checkpoints remain for restart.
+Both processes must remain running. The optional installer supplies systemd user services; see [installation](docs/INSTALL.md). Stop the watcher with Ctrl-C or SIGTERM; `bridge.py stop` stops the server and causes the watcher to exit. Graceful cleanup removes only the process's own sockets and registry entry. SQLite and checkpoints remain for restart.
 
 Socket addresses change with the server PID. The watcher publishes `<bridge-pid>.json` in `${CLAUDE_CONFIG_DIR:-~/.claude}/sessions` and refuses to overwrite a pre-existing record. Its process-start marker protects against PID reuse. A forced kill may leave stale sockets or a registry record: verify that the old process is dead and socket connections are refused before removing those specific stale files. Never clear the shared socket or registry directory.
 
@@ -100,3 +105,19 @@ python3 -m unittest discover -v
 Tests cover fragmented and EOF-delimited messages, malformed and oversized input, inert controls, outgoing socket identity, persistent storage, local control requests, notification filtering, and checkpoints. CI runs on Linux with Python 3.11–3.13. Tests use synthetic peers and never message live Claude sessions.
 
 See [PROTOCOL.md](PROTOCOL.md) for the implemented wire format and discovery details.
+
+## Contributing
+
+Fork and extend under MIT, or open an issue before proposing an upstream change.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for signed commits, DCO sign-off, local checks,
+and the `feature/*` → `develop` → `main` pull-request flow.
+
+Maintainers can reproduce repository settings and enable the local branch guard with:
+
+```sh
+scripts/setup-repo.sh
+```
+
+## License
+
+[MIT](LICENSE) © 2026 Robert Capps.

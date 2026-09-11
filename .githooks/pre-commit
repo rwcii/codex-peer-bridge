@@ -1,0 +1,9 @@
+#!/bin/sh
+# Release and integration branches receive changes through pull requests.
+branch="$(git symbolic-ref --short -q HEAD)"
+case "$branch" in
+  main|develop)
+    echo "Blocked: work on a feature, fix, or chore branch off develop." >&2
+    exit 1
+    ;;
+esac

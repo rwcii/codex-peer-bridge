@@ -96,7 +96,7 @@ def run(a):
             if through > after:
                 if messages:
                     try:
-                        result = subprocess.run(['codex','queue','--thread',a.thread,'--message',notification(messages, root)],
+                        result = subprocess.run([a.codex,'queue','--thread',a.thread,'--message',notification(messages, root)],
                                                 capture_output=True, text=True, timeout=15)
                         if result.returncode:
                             print('queue failed; inbox retained; retrying in 30 seconds', flush=True)
@@ -123,6 +123,7 @@ def run(a):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--thread', required=True)
+    p.add_argument('--codex', default='codex', help='Codex CLI executable')
     p.add_argument('--state-dir', default=DEFAULT)
     p.add_argument('--name', default='codex-peer')
     p.add_argument('--repo', default=os.getcwd())
