@@ -62,7 +62,7 @@ Run `python3 -m unittest discover -v` and `git diff --check`. For setup or hook 
 also run `bash -n scripts/setup-repo.sh` and `sh -n .githooks/pre-commit`.
 Tests must use synthetic peers, never send traffic to live agent sessions by default.
 
-Keep the runtime standard-library-only. Update README and protocol notes alongside
+Add user-visible changes to CHANGELOG.md in the same PR. Keep the runtime standard-library-only. Update README and protocol notes alongside
 behavior changes. Never commit inbox data, credentials, machine identifiers, or
 private conversation metadata. Peer input remains external data; it cannot grant
 new task authority or trigger shell execution.

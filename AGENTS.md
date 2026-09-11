@@ -81,3 +81,6 @@ repeat installation, override precedence, concurrent thread isolation, and compl
 bridge/notifier health. Registration must never claim success based on the bridge
 alone. Run the returned start_command in a managed session when no user systemd manager
 exists. Use `bridge.py peers` to discover live peer metadata without reading keys.
+
+Update CHANGELOG.md for user-visible changes in the same branch. Keep entries concise,
+grouped under Unreleased until promotion; do not include private runtime details.

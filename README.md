@@ -114,6 +114,10 @@ Tests cover fragmented and EOF-delimited messages, malformed and oversized input
 
 See [PROTOCOL.md](PROTOCOL.md) for the implemented wire format and discovery details.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history and pending changes.
+
 ## Contributing
 
 Fork and extend under MIT, or open an issue before proposing an upstream change.

@@ -11,7 +11,7 @@ import sys
 MARKER = '# Managed by codex-peer-bridge\n'
 SERVICES = ('codex-peer-notify.service', 'codex-peer-bridge.service')
 
-FILES = ('session.py', 'codex_instructions.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md')
+FILES = ('CHANGELOG.md', 'session.py', 'codex_instructions.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md')
 
 
 def unit_arg(value):
