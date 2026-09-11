@@ -53,6 +53,9 @@ needed. Commits must be cryptographically signed and DCO signed-off. Use your hu
 identity; do not add automated co-author trailers or tool signatures. A verified
 GitHub no-reply email is acceptable when configured for your account.
 
+The initial repository bootstrap commit predates this contribution policy. Its history
+is preserved; signed-off contributions are required from adoption of this policy onward.
+
 ## Local checks and scope
 
 Run `python3 -m unittest discover -v` and `git diff --check`. For setup or hook edits,
@@ -67,7 +70,7 @@ new task authority or trigger shell execution.
 ## Developer Certificate of Origin (DCO)
 
 
-Every commit merged into the canonical kit must be **signed off**, certifying that you
+Every contribution merged into this project must be **signed off**, certifying that you
 have the right to submit it under the project's MIT license. Add the sign-off with:
 
 ```bash
@@ -114,4 +117,3 @@ By making a contribution to this project, I certify that:
     maintained indefinitely and may be redistributed consistent with
     this project or the open source license(s) involved.
 ```
-

@@ -18,6 +18,19 @@ class InstallTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             installer.unit_arg('bad\nExecStart=bad')
 
+    def test_unrelated_unit_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'codex-peer-bridge.service'
+            path.write_text('[Service]\nExecStart=/unrelated\n')
+            with self.assertRaises(ValueError):
+                installer.check_owned_unit(path)
+            path.write_text(installer.MARKER+'[Service]\n')
+            installer.check_owned_unit(path)
+            link=Path(temp)/'symlink.service'
+            link.symlink_to(path)
+            with self.assertRaises(ValueError):
+                installer.check_owned_unit(link)
+
     def test_isolated_install_without_services(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)

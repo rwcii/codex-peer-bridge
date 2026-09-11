@@ -8,6 +8,9 @@ import shutil
 import subprocess
 import sys
 
+MARKER = '# Managed by codex-peer-bridge\n'
+SERVICES = ('codex-peer-notify.service', 'codex-peer-bridge.service')
+
 FILES = ('bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md')
 
 
@@ -24,9 +27,36 @@ def units(prefix, state, thread, name, repo, python, codex):
                '--name', name, '--repo', repo, '--codex', codex]
     common = '\nRestart=on-failure\nRestartSec=5\nUMask=0077\n\n[Install]\nWantedBy=default.target\n'
     return {
-        'codex-peer-bridge.service': '[Unit]\nDescription=Local Codex peer messaging bridge\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,base)) + common,
-        'codex-peer-notify.service': '[Unit]\nDescription=Codex peer inbox notifications\nRequires=codex-peer-bridge.service\nAfter=codex-peer-bridge.service\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,watcher)) + common,
+        'codex-peer-bridge.service': MARKER + '[Unit]\nDescription=Local Codex peer messaging bridge\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,base)) + common,
+        'codex-peer-notify.service': MARKER + '[Unit]\nDescription=Codex peer inbox notifications\nRequires=codex-peer-bridge.service\nAfter=codex-peer-bridge.service\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,watcher)) + common,
     }
+
+
+def check_owned_unit(path):
+    if path.is_symlink():
+        raise ValueError(f'refusing symlinked service file: {path}')
+    if path.exists() and (not path.is_file() or path.stat().st_uid != os.getuid()
+                          or not path.read_text().startswith(MARKER)):
+        raise ValueError(f'refusing unrelated service file: {path}')
+
+
+def active_units(unit_dir):
+    existing = []
+    for name in SERVICES:
+        local = unit_dir/name
+        check_owned_unit(local)
+        result = subprocess.run(['systemctl','--user','show',name,'--property=FragmentPath',
+                                 '--value'],check=True,capture_output=True,text=True)
+        fragment = result.stdout.strip()
+        if fragment:
+            actual = Path(fragment)
+            if actual != local:
+                raise ValueError(f'refusing service outside selected unit directory: {name}')
+            check_owned_unit(actual)
+            existing.append(name)
+        elif local.exists():
+            existing.append(name)
+    return existing
 
 
 def main():
@@ -49,10 +79,14 @@ def main():
     if checkpoint.exists() and json.loads(checkpoint.read_text())['thread'] != a.thread:
         p.error('existing state belongs to a different thread; select another state directory')
     rendered = units(a.prefix,a.state_dir,a.thread,a.name,str(Path(a.repo).resolve()),sys.executable,a.codex)
+    for name in SERVICES:
+        check_owned_unit(a.unit_dir/name)
     if not a.no_start:
         # Fail before modifying installation if the user manager is unavailable.
         subprocess.run(['systemctl','--user','show-environment'],check=True,stdout=subprocess.DEVNULL)
-        subprocess.run(['systemctl','--user','stop','codex-peer-notify.service','codex-peer-bridge.service'],check=False)
+        existing = active_units(a.unit_dir)
+        if existing:
+            subprocess.run(['systemctl','--user','stop',*existing],check=True)
     os.umask(0o077)
     a.prefix.mkdir(parents=True,exist_ok=True)
     a.unit_dir.mkdir(parents=True,exist_ok=True)
