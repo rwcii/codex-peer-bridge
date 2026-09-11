@@ -1,8 +1,12 @@
 # AGENTS.md — Codex Peer Bridge
 
-This is a Linux, Python-standard-library bridge between local Claude peer sockets
-and an explicitly selected Codex thread. Read README.md, PROTOCOL.md, and
-CONTRIBUTING.md before changing it.
+This is a Linux and macOS, Python-standard-library bridge between local Claude peer
+sockets and an explicitly selected participant session (a Codex thread, or a DeepSeek
+harness session). Read README.md, PROTOCOL.md, and CONTRIBUTING.md before changing it.
+
+Platform differences belong in `platform_support.py`; do not add `sys.platform` checks
+elsewhere. Peer addresses and registry socket paths must stay unresolved, because the peer
+key filename is derived from the literal path.
 
 Work on feature/fix/chore branches off develop. Squash PRs into develop; promote
 through a merge PR to main. Never commit directly to either long-lived branch.
@@ -23,22 +27,27 @@ Read `docs/INSTALL.md` before installation. Installing files and enabling a user
 requires the user's authorization; requests to install or configure this bridge provide
 that scope. Do not send test messages to other agents unless communication is authorized.
 
-1. Verify Linux, Python 3.11+, and `codex queue --help`. Resolve the installed Codex CLI;
-   do not assume an API key or another daemon gives access to the current conversation.
+1. Verify Linux or macOS, Python 3.11+, and `codex queue --help` for a Codex participant.
+   Resolve the installed Codex CLI; do not assume an API key or another daemon gives access
+   to the current conversation. A DeepSeek participant needs the running harness instead,
+   which exports `DSH_HOME`, `DSH_SESSION_ID` and `DSH_WEB_URL` to a session's shell.
 2. Determine the exact intended Codex thread. Inspect `CODEX_THREAD_ID` from that
    session's shell when available. If absent, ask the user for the target thread; do not
    guess or create a replacement conversation. Confirm a harmless queue test reaches it.
 3. Select a descriptive peer name and the intended project path. Check for an existing
    bridge, its target thread, state directory, and services before replacing anything.
    Preserve unrelated running bridges and all inbox state.
-4. For a user with systemd, run `python3 scripts/install.py --thread THREAD_ID --name
+4. For a user with systemd on Linux, run `python3 scripts/install.py --thread THREAD_ID --name
    PEER_NAME --repo PROJECT_PATH`. Use argument arrays or correct shell quoting.
    That explicit legacy mode manages one service pair. Prefer `--configure-codex` for
    multiple conversations: install managed global guidance, then run `session.py ensure`
-   with the current CODEX_THREAD_ID. Each thread gets an isolated supervisor instance.
+   with the current CODEX_THREAD_ID, or `session.py ensure --agent deepseek` in a harness
+   session. Each session gets an isolated supervisor instance.
    For an isolated preview use `--no-start` plus temporary prefix, state, and unit paths.
-5. Without a user systemd manager, use the manual two-process setup in the installation
-   guide. Do not silently introduce sudo, system services, lingering, or permission changes.
+5. Without a user systemd manager — which includes every macOS host — use the manual
+   two-process setup in the installation guide. On macOS `install.py` refuses the service
+   path and `session.py ensure` reports `manual_required` with a start command. Do not
+   silently introduce sudo, system services, lingering, or permission changes.
 6. Verify both services, the bridge status, and the registry's bare filesystem socket path.
    When authorized, ask a peer to refresh its listing and send one short test by name.
    Verify inbox receipt and arrival of the queued notice in the selected Codex thread.

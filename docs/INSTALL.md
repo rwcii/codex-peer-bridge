@@ -2,13 +2,73 @@
 
 ## Requirements
 
-Linux, Python 3.11+, Claude Code with local peer messaging, and a Codex CLI that
-supports `codex queue --thread ... --message ...`. Agents must run under the same
-OS user. Verify `codex queue --help` and `python3 --version`.
+Linux or macOS, Python 3.11+, Claude Code with local peer messaging, and — for a Codex
+participant — a Codex CLI that supports `codex queue --thread ... --message ...`. Agents
+must run under the same OS user. Verify `codex queue --help` and `python3 --version`.
 
-The bridge targets an existing Codex conversation. A standalone API key or unrelated
+A DeepSeek (DSH) participant needs no Codex CLI. It needs the running harness, which
+exports `DSH_HOME`, `DSH_SESSION_ID` and `DSH_WEB_URL` to a session's shell.
+
+On macOS the system `python3` is often 3.9, which is below the floor; use a 3.11+
+interpreter explicitly, for example `python3.12`.
+
+The bridge targets an existing conversation. A standalone API key or unrelated
 Codex daemon does not provide access to that conversation. Hosted clients without
 local shell/queue access are not automatically supported.
+
+## macOS
+
+There is no systemd on macOS, so the service path is unavailable. Install the runtime
+and managed guidance, then start each session's supervisor in a persistent session:
+
+```sh
+python3.12 scripts/install.py --configure-codex --no-start
+python3.12 session.py ensure                    # in a Codex session: uses CODEX_THREAD_ID
+python3.12 session.py ensure --agent deepseek   # in a harness session: uses DSH_SESSION_ID
+```
+
+`ensure` reports `manual_required` with an exact `start_command` on macOS. Run that
+command in a persistent terminal or managed tool session and keep it alive while using
+the bridge. `install.py` refuses the systemd path on macOS rather than writing units that
+nothing would load.
+
+### Recovering from a killed instance
+
+A start binds exclusively and never removes a socket it did not create, so a bridge killed
+with `SIGKILL` leaves its socket behind and blocks the next start. The failure names the
+path:
+
+```text
+OSError: cannot bind /tmp/cc-socks/<hash>-control.sock: [Errno 48] Address already in use
+```
+
+Proving the owner is gone cannot be done by connecting. A live listener whose accept queue
+is full refuses a connection on macOS exactly as a dead owner does, so a refusal is not
+evidence. Use `lsof`, which shows the owning process only when one exists:
+
+```sh
+lsof /tmp/cc-socks/<hash>-control.sock    # no output means nothing holds it
+rm /tmp/cc-socks/<hash>-control.sock      # remove that one path
+```
+
+If `lsof` does print a process, the bridge is still running: stop it with `session.py stop`
+or `bridge.py stop` rather than deleting the file. Then the same for the peer socket if its
+error was reported too.
+
+Remove only the specific path from the error. Never clear `/tmp/cc-socks` or the session
+registry wholesale, and never remove a socket `lsof` reports as held.
+
+The `<hash>` name appears when the state directory is too deep for a Unix socket path.
+It is the first 16 hex characters of `sha256` of the **resolved** state directory, and it
+can also be read directly:
+
+```sh
+python3 -c "import bridge,platform_support,pathlib;print(platform_support.control_socket_path(pathlib.Path('<state-dir>')))"
+```
+
+For a shorter state directory the control socket sits at `<state-dir>/control.sock` and the
+same procedure applies. macOS has no automatic temporary-directory cleanup, so a leftover
+socket stays in the way until it is removed by hand.
 
 ## Recommended: configure Codex once
 
@@ -17,6 +77,20 @@ git clone https://github.com/rwcii/codex-peer-bridge.git
 cd codex-peer-bridge
 python3 scripts/install.py --configure-codex
 ```
+
+For a DeepSeek (DSH) participant, install the harness guidance instead of, or as well as,
+the Codex guidance:
+
+```sh
+python3 scripts/install.py --configure-deepseek            # uses $DSH_HOME
+python3 scripts/install.py --configure-deepseek --dsh-home /path/to/harness
+```
+
+This manages a clearly marked DeepSeek section in `$DSH_HOME/AGENTS.md`, leaving all other
+content untouched. Each participant has its own delimited section and markers, so the two
+can be installed and removed independently. Repeated configuration retains previously
+registered participants and uses their recorded homes when home flags are omitted.
+Uninstallation removes every managed section recorded by the installation.
 
 This installs runtime files in `~/.local/share/codex-peer-bridge` and adds a clearly
 marked section to `$CODEX_HOME/AGENTS.md` (normally `~/.codex/AGENTS.md`). If a global
@@ -28,10 +102,11 @@ without restoring an old backup over subsequent user edits.
 The section instructs each Codex conversation to run `session.py ensure` using its
 own `CODEX_THREAD_ID`. It never embeds a fixed thread ID. Each thread gets:
 
-- an isolated directory under `~/.local/state/codex-peer-bridge/sessions/<thread-hash>`;
-- a fleet-style peer name, `codex-<repo-short-name>-<two-hex>`, stable for the session;
+- an isolated directory under `~/.local/state/codex-peer-bridge/sessions/<session-hash>`;
+- a fleet-style peer name, `codex-<repo-short-name>-<two-hex>`, stable for the session
+  (a DeepSeek participant uses `deepseek-<model>-<repo-short-name>-<two-hex>`);
 - its own bridge process, socket, watcher, and notification checkpoint;
-- its own systemd supervisor service when a user manager is available.
+- its own systemd supervisor service when a user manager is available (Linux only).
 
 Repeated registration reuses a healthy instance. Concurrent Codex sessions do not
 share inboxes or replace each other's configuration. The initial name/project are

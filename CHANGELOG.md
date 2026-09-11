@@ -11,6 +11,50 @@ into a dated release section when promoted to `main`.
   notifications, and managed session instructions, separate from peer message content.
 - Updated inbox CLI adds guidance when reading from an older running bridge, allowing
   current sessions to receive it without a server restart.
+- macOS support. Peer credentials, the process start marker, the peer domain, the socket
+  allowlist, and the AF_UNIX address-length fallback are resolved in one platform module.
+- A DeepSeek (DSH) participant alongside Codex. It reads and acknowledges the same inbox
+  and sends through the same control socket, and the watcher delivers notices to a selected
+  harness session over the harness's local RPC, the analogue of `codex queue`.
+- `--agent` and `--model` on `session.py`. A DeepSeek peer advertises the harness's
+  configured default model in its peer name, such as `deepseek-v4-pro-<repo>-a3`.
+- `install.py --configure-deepseek`, which writes a managed DeepSeek section into the
+  harness home's `AGENTS.md` so a harness session registers itself and reads its inbox,
+  the same way the Codex section already does. Each participant gets its own delimited
+  section with its own markers, so either can be added or removed without disturbing the
+  other or the user's own guidance. Uninstallation removes exactly the sections the
+  installation recorded, so a DeepSeek section is not left behind pointing at a removed
+  runtime.
+
+### Fixed
+
+- Repository setup requires the six OS/Python matrix checks, replacing obsolete
+  Python-only names that left pull requests waiting for nonexistent jobs.
+
+- Control socket paths use filesystem byte lengths, so Unicode state paths also
+  select the short fallback before exceeding the kernel limit.
+
+- Repeated participant configuration preserves registered participants and home paths,
+  so uninstall removes all managed guidance, including after a Codex-only upgrade.
+
+- Harness notice delivery refuses redirects and ignores environment proxies to keep
+  authentication cookies on the validated loopback destination.
+
+- `peers()` returned no peers on macOS. A missing `/proc/<pid>/stat` raised inside a broad
+  handler, so discovery reported an empty list even with live peers present; the same
+  omission made a notifier fail at startup and left `session.py status` permanently
+  reporting `repair_required`.
+- The bridge could not start when a state directory was too deep for `sockaddr_un`, which
+  macOS's long temporary paths reach easily. The control socket now falls back to a short
+  path in the peer socket directory, which also fixes over-long Linux state paths.
+- A peer connection that raised `AttributeError` was dropped without a trace; the handler
+  now reports it.
+
+### Changed
+
+- Notice delivery is dispatched per participant. The Codex path, including generated
+  systemd units and the manual start command, is unchanged.
+- CI runs on Linux and macOS.
 
 ## 2026-09-11 — Codex-wide registration
 

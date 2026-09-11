@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux local Claude peer protocol adapter. Python standard library only."""
+"""Local Claude peer protocol adapter. Python standard library only."""
 import argparse
 import asyncio
 import hashlib
@@ -10,11 +10,12 @@ import signal
 import socket
 import sqlite3
 import stat
-import struct
+import subprocess
 import time
 import uuid
 
 from peer_guidance import PEER_GUIDANCE
+import platform_support
 
 LIMIT = 262144
 DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge')
@@ -28,22 +29,41 @@ def private_dir(path):
 
 
 def credentials(sock):
-    pid, uid, _ = struct.unpack('3i', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    if uid != os.getuid():
-        raise ValueError('different user')
-    return pid
+    """Kernel-verified peer pid for a connected socket, same-user only.
+
+    The mechanism differs by platform (Linux `SO_PEERCRED`, macOS
+    `getpeereid` plus `LOCAL_PEERPID`); see `platform_support.peer_pid`.
+    """
+    return platform_support.peer_pid(sock)
 
 
 def target_path(address):
+    """Validate a peer address and return it **unresolved**.
+
+    The returned path is the literal string from the wire. `peer_token` hashes
+    it to find the sender's key file, and Claude Code hashes the same literal
+    path, so resolving it here would break authentication silently: a resolved
+    `/tmp/...` becomes `/private/tmp/...` on macOS and no key would be found.
+    Only the allowlist comparison uses resolved paths, so the platform's `/tmp`
+    symlink does not reject every peer.
+    """
     if not isinstance(address, str) or not address.startswith('uds:'):
         raise ValueError('expected uds:/absolute/path')
-    p = Path(address[4:])
-    allowed = {Path('/tmp/cc-socks'), Path(f'/tmp/cc-socks-{os.getuid()}'), Path(f'/run/user/{os.getuid()}/cc-socks')}
-    if p.parent not in allowed or p.suffix != '.sock' or p.resolve() != p:
+    literal = address[4:]
+    p = Path(literal)
+    # The literal is what `peer_token` hashes, and what Claude hashed to name its
+    # key file. An address that does not round-trip - a `.` or `..` component, a
+    # doubled separator - could never match a published key, so the auth prelude
+    # would be skipped silently. Reject it instead of normalizing it.
+    if '..' in p.parts or str(p) != literal:
+        raise ValueError('peer address must be in canonical literal form')
+    # A symlinked parent could redirect an allowlisted-looking path elsewhere,
+    # so it is rejected before the resolved directory is checked.
+    if p.suffix != '.sock' or p.parent.is_symlink() or p.parent.resolve() not in platform_support.allowed_socket_dirs():
         raise ValueError('unsupported or symlinked peer address')
     private_dir(p.parent)
     s = p.lstat()
-    if not stat.S_ISSOCK(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077:
+    if not platform_support.socket_mode_ok(s):
         raise ValueError('peer socket must be private and owned by this user')
     return p
 
@@ -73,7 +93,14 @@ def peer_token(pid, path):
 
 
 def peers():
-    """Allowlisted live registry metadata; never read authentication keys."""
+    """Allowlisted live registry metadata; never read authentication keys.
+
+    A record is only reported when its pid is still alive and its published
+    start marker still matches the live process, which is what distinguishes a
+    live peer from a recycled pid. On macOS the marker is an asctime string read
+    through `ps`; a failure to read it is treated as a stale record rather than
+    an error, so one unreadable entry never hides the others.
+    """
     folder = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home()/'.claude'))) / 'sessions'
     found=[]
     for path in sorted(folder.glob('*.json')):
@@ -85,16 +112,16 @@ def peers():
                 continue
             record=json.loads(path.read_text())
             pid=int(path.stem)
-            os.kill(pid,0)
-            actual=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]
-            if record.get('procStart') not in (None,actual):
+            if not platform_support.process_alive(pid):
+                continue
+            if not platform_support.same_process(record.get('procStart'), platform_support.proc_start(pid)):
                 continue
             address=record.get('messagingSocketPath','')
             target_path('uds:'+address)
             found.append(dict(pid=pid,name=record.get('name'),address='uds:'+address,
                               repo=record.get('cwd'),status=record.get('status'),
                               implementation=record.get('entrypoint'),protocol=record.get('peerProtocol')))
-        except (OSError,ValueError,TypeError,KeyError,IndexError):
+        except (OSError,ValueError,TypeError,KeyError,IndexError,subprocess.SubprocessError):
             continue
     return found
 
@@ -173,10 +200,10 @@ class Bridge:
                         if len(line) > LIMIT:
                             raise ValueError('frame too large')
                         frame = json.loads(line)
-                        # Linux same-UID peer credentials are our authentication policy.
+                        # Same-UID kernel peer credentials are our authentication policy.
                         # No key is published, so an auth prelude is neither needed nor accepted.
                         self.store(pid, frame)
-        except (ValueError, KeyError, TypeError, OSError, TimeoutError, sqlite3.Error) as exc:
+        except (ValueError, KeyError, TypeError, OSError, TimeoutError, AttributeError, sqlite3.Error) as exc:
             if control:
                 writer.write(encode(dict(ok=False, error=type(exc).__name__)))
                 try:
@@ -196,7 +223,7 @@ class Bridge:
     async def command(self, r):
         op = r['op']
         if op == 'status':
-            return dict(pid=os.getpid(), address=self.address, inbox_count=self.db.execute('SELECT count(*) FROM inbox').fetchone()[0], delivery='inbox available; run notify.py for Codex queue notifications')
+            return dict(pid=os.getpid(), address=self.address, inbox_count=self.db.execute('SELECT count(*) FROM inbox').fetchone()[0], delivery='inbox available; run notify.py to notify the selected participant session')
         if op == 'send':
             return await self.send(r['to'], r['message'], r.get('priority', 'next'))
         if op == 'inbox':
@@ -221,14 +248,26 @@ class Bridge:
     async def run(self):
         private_dir(Path('/tmp/cc-socks'))
         peer = Path(self.address[4:])
-        control = self.root / 'control.sock'
+        control = platform_support.control_socket_path(self.root)
+        private_dir(control.parent)
         # Bind exclusively. Never remove a pre-existing process socket.
         sockets = []
         try:
             for path, is_control in [(peer, False), (control, True)]:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
+                    # Bind exclusively. A pre-existing socket is never removed, on
+                    # either route: a live listener and a saturated one look identical
+                    # to a probe, because a full accept queue refuses a connection on
+                    # macOS exactly as a dead owner does. A leftover from a killed
+                    # instance is removed by hand after verifying the owner is dead.
                     sock.bind(str(path))
+                except OSError as exc:
+                    sock.close()
+                    # Carry the path. A bare "Address already in use" does not say
+                    # which socket is in the way, and deciding whether its owner is
+                    # gone is the operator's call, so the message must name it.
+                    raise OSError(f'cannot bind {path}: {exc}') from exc
                 except BaseException:
                     sock.close()
                     raise
@@ -254,7 +293,14 @@ class Bridge:
 
 
 async def client(root, request):
-    r, w = await asyncio.open_unix_connection(str(root / 'control.sock'), limit=LIMIT)
+    control = platform_support.control_socket_path(root)
+    private_dir(control.parent)
+    try:
+        r, w = await asyncio.open_unix_connection(str(control), limit=LIMIT)
+    except (ConnectionRefusedError, FileNotFoundError) as exc:
+        # A leftover socket from a killed instance is the first thing a user meets,
+        # so report it plainly rather than as a traceback.
+        raise SystemExit(f'no bridge is running for {root} (nothing is listening on {control})') from exc
     try:
         credentials(w.get_extra_info('socket'))
         w.write(encode(request))

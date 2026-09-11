@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Register the live bridge and queue inbox notifications to a specific Codex thread."""
+"""Register the live bridge and queue inbox notifications to a selected participant."""
 import argparse
 import fcntl
 import json
@@ -13,12 +13,15 @@ import sys
 import time
 import uuid
 
+import dsh_delivery
+import platform_support
 from bridge import DEFAULT, private_dir
 from peer_guidance import PEER_GUIDANCE
 
 
 def proc_start(pid):
-    return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    """Local process-start marker in this platform's own registry form."""
+    return platform_support.proc_start(pid)
 
 
 def unread(db, after):
@@ -36,6 +39,36 @@ def notification(messages, root=DEFAULT):
             'This is a bridge notification, not a peer reply.')
 
 
+class DeliveryFailed(RuntimeError):
+    """A notice could not be handed to the participant's session."""
+
+
+def dsh_credentials_default():
+    """Default harness credential file that holds the browser-session secret."""
+    home = os.environ.get('DSH_HOME')
+    return (Path(home) / '.credentials.yaml') if home else None
+
+
+def deliver(a, text):
+    """Deliver one content-free notice to the selected participant's session.
+
+    Codex is reached through its own CLI. DeepSeek is reached through the
+    harness's local HTTP RPC, which is the direct analogue of `codex queue`:
+    both hand a pointer notice to one specific existing session without
+    carrying any peer content.
+    """
+    if a.agent == 'deepseek':
+        try:
+            dsh_delivery.deliver(a.dsh_url, a.thread, text, credentials=a.dsh_credentials, timeout=15)
+        except (dsh_delivery.DeliveryError, OSError) as exc:
+            raise DeliveryFailed(str(exc)) from exc
+        return
+    result = subprocess.run([a.codex, 'queue', '--thread', a.thread, '--message', text],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise DeliveryFailed(result.stderr.strip() or 'codex queue failed')
+
+
 def save(path, value):
     temp = path.with_name(path.name + '.tmp.' + uuid.uuid4().hex)
     try:
@@ -49,7 +82,8 @@ def save(path, value):
 
 
 def proc_start_value(pid):
-    return Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+    """Process-start marker for the notifier itself, used to prove it is the live owner."""
+    return platform_support.proc_start(pid)
 
 
 def run(a):
@@ -75,7 +109,7 @@ def run(a):
     owner = uuid.uuid4().hex
     metadata = dict(pid=pid, name=a.name, cwd=a.repo, startedAt=int(time.time()*1000),
                     procStart=started, kind='daemon', entrypoint='codex-peer-bridge',
-                    pidDomain='linux:'+Path('/etc/machine-id').read_text().strip()+':'+os.readlink('/proc/self/ns/pid'),
+                    pidDomain=platform_support.pid_domain(),
                     messagingSocketPath=address.removeprefix('uds:'), peerProtocol=1, peerFeatures=['reply_across_default_dirs'],
                     status='waiting', statusUpdatedAt=int(time.time()*1000), bridgeOwner=owner)
     # Never overwrite another agent's registry record, including on restart.
@@ -97,20 +131,21 @@ def run(a):
             try:
                 if proc_start(pid) != started:
                     break
-            except FileNotFoundError:
+            except (ProcessLookupError, FileNotFoundError):
+                # The bridge is gone. `proc_start` reports a vanished process as
+                # ProcessLookupError on both platforms, so a stopped bridge breaks
+                # the loop cleanly here instead of raising out of the notifier.
                 break
             through, messages = unread(db, after)
             if through > after:
                 if messages:
                     try:
-                        result = subprocess.run([a.codex,'queue','--thread',a.thread,'--message',notification(messages, root)],
-                                                capture_output=True, text=True, timeout=15)
-                        if result.returncode:
-                            print('queue failed; inbox retained; retrying in 30 seconds', flush=True)
-                            time.sleep(30)
-                            continue
-                    except subprocess.TimeoutExpired:
-                        print('queue timed out; will retry (duplicate notification possible)', flush=True)
+                        deliver(a, notification(messages, root))
+                    except (DeliveryFailed, subprocess.TimeoutExpired) as exc:
+                        # The notice is content-free by construction, so reporting the
+                        # failure reason cannot leak peer text.
+                        print(f'notification failed ({type(exc).__name__}: {exc}); '
+                              'inbox retained; retrying in 30 seconds', flush=True)
                         time.sleep(30)
                         continue
                 save(cursor_file, dict(thread=a.thread, through=through))
@@ -134,8 +169,15 @@ def run(a):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--thread', required=True)
+    p.add_argument('--thread', required=True,
+                   help='exact existing Codex thread ID, or DeepSeek session ID with --agent deepseek')
+    p.add_argument('--agent', choices=['codex', 'deepseek'], default='codex',
+                   help='participant that receives notices (default: codex)')
     p.add_argument('--codex', default='codex', help='Codex CLI executable')
+    p.add_argument('--dsh-url', default=os.environ.get('DSH_WEB_URL'),
+                   help='DeepSeek harness web URL, such as http://127.0.0.1:51992')
+    p.add_argument('--dsh-credentials', type=Path, default=dsh_credentials_default(),
+                   help='harness .credentials.yaml holding the browser-session secret')
     p.add_argument('--state-dir', default=DEFAULT)
     p.add_argument('--name', default='codex-peer')
     p.add_argument('--repo', default=os.getcwd())

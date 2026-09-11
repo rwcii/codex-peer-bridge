@@ -28,7 +28,9 @@ print(json.dumps({
             'allowed_merge_methods': [method]}},
         {'type': 'required_status_checks', 'parameters': {
             'strict_required_status_checks_policy': True,
-            'required_status_checks': [{'context': f'test ({v})'} for v in ('3.11','3.12','3.13')]}},
+            'required_status_checks': [{'context': f'test ({os}, {v})'}
+                                       for os in ('ubuntu-latest', 'macos-latest')
+                                       for v in ('3.11', '3.12', '3.13')]}},
         {'type': 'non_fast_forward'}, {'type': 'deletion'}
     ]
 }))

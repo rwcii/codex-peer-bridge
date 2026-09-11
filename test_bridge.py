@@ -8,6 +8,7 @@ import socket
 import tempfile
 import unittest
 import bridge
+import platform_support
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -135,6 +136,25 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await server.wait_closed()
         with self.assertRaises(ValueError):
             await self.b.send('uds:/tmp/no.sock', '')
+
+    async def test_non_canonical_peer_address_is_refused(self):
+        # The literal is hashed to find the peer's key file, so an address that
+        # does not round-trip could never match a published key and would skip the
+        # auth prelude silently. Rejected rather than normalized.
+        for address in ('uds:/tmp/cc-socks/../cc-socks/123.sock',
+                        'uds:/tmp/cc-socks/./123.sock',
+                        'uds:/tmp//cc-socks/123.sock',
+                        'uds:/tmp/cc-socks/sub/../123.sock'):
+            with self.assertRaises(ValueError):
+                bridge.target_path(address)
+
+    async def test_control_socket_uses_the_short_fallback_only_when_needed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertEqual(platform_support.control_socket_path(Path(temp)),
+                             Path(temp) / 'control.sock')
+            deep = Path(temp) / ('d' * 120)
+            self.assertNotEqual(platform_support.control_socket_path(deep),
+                                deep / 'control.sock')
 
 if __name__ == '__main__':
     unittest.main()

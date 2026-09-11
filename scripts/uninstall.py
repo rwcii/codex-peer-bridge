@@ -38,7 +38,15 @@ def main():
     if config:
         sys.path.insert(0,str(prefix))
         from codex_instructions import update
-        update(Path(config['codex_home']),prefix,remove=True)
+        # Remove the managed section for every participant this installation
+        # configured, not just Codex: a harness section left behind would keep
+        # telling sessions to register against a runtime that is gone. Older
+        # installations recorded no participant list and were Codex-only.
+        homes = {'codex': config.get('codex_home'), 'deepseek': config.get('dsh_home')}
+        for agent in config.get('participants', ['codex']):
+            home = homes.get(agent)
+            if home:
+                update(Path(home),prefix,remove=True,agent=agent)
     for file in FILES:
         (prefix/file).unlink(missing_ok=True)
     config_path.unlink(missing_ok=True)

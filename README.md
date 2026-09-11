@@ -1,8 +1,24 @@
 # Codex Peer Bridge
 
-A local bridge that lets a Codex session exchange messages with Claude Code peers on the same Linux machine. Claude discovers the bridge by name; a watcher notifies the selected Codex thread when messages arrive.
+A local bridge that lets an agent session exchange messages with Claude Code peers on the same machine. Claude discovers the bridge by name; a watcher notifies the selected participant session when messages arrive.
 
 Python standard library only. No pip dependencies, cloud relay, or repository-specific integration.
+
+## Participants
+
+The bridge speaks Claude's peer protocol on one side and hands notices to a
+selected participant session on the other. Two participant kinds are supported:
+
+| Participant | Session identity | Notice delivery |
+| --- | --- | --- |
+| Codex | `CODEX_THREAD_ID` | `codex queue --thread ... --message ...` |
+| DeepSeek (DSH) | `DSH_SESSION_ID` | `session/prompt` with `mode: "queue"` on the harness's local HTTP RPC |
+
+Both deliveries hand the session a content-free pointer notice that names the
+inbox and sequence range to read; neither carries peer text. A DeepSeek peer
+advertises the harness's configured default model in its peer name, such as
+`deepseek-v4-pro-<repo>-a3`, and the model can be named explicitly with
+`session.py --model`.
 
 ## How it works
 
@@ -12,21 +28,24 @@ flowchart LR
     Bridge --> Inbox[(SQLite inbox)]
     Inbox --> Watcher[notify.py]
     Watcher -->|codex queue| Codex[Selected Codex thread]
+    Watcher -->|session/prompt| DSH[Selected DeepSeek session]
     Codex -->|inbox / send commands| Bridge
+    DSH -->|inbox / send commands| Bridge
     Watcher --> Registry[Claude local peer registry]
 ```
 
-The bridge's server process originates outgoing connections as well as receiving incoming messages. This preserves the process identity Claude checks when routing replies. A separate private control socket lets Codex read the inbox and send messages through that process.
+The bridge's server process originates outgoing connections as well as receiving incoming messages. This preserves the process identity Claude checks when routing replies. A separate private control socket lets a participant read the inbox and send messages through that process.
 
-The watcher registers the live bridge as a named peer and queues a content-free notice to an explicitly selected Codex thread. The notification asks Codex to read the inbox; peer text remains external input, not a new user instruction.
+The watcher registers the live bridge as a named peer and queues a content-free notice to an explicitly selected session. The notification asks the participant to read the inbox; peer text remains external input, not a new user instruction.
 
 ## Requirements and compatibility
 
-- Linux, Python 3.11 or newer, and Unix-domain sockets with `SO_PEERCRED`.
+- Linux or macOS, Python 3.11 or newer, and Unix-domain sockets carrying peer credentials (`SO_PEERCRED` on Linux, `getpeereid` plus `LOCAL_PEERPID` on macOS).
 - Codex CLI with `codex queue --thread ... --message ...`, connected to the intended existing session.
+- For a DeepSeek participant, the running DSH harness, which exports `DSH_HOME`, `DSH_SESSION_ID` and `DSH_WEB_URL` to a session's shell.
 - Claude Code with local peer messaging enabled, running as the same OS user.
 
-Verified with Codex CLI 0.154.0 and Claude Code 2.1.267: address delivery, replies, discovery and delivery by name, queued notifications, and subsequent notification arrival in the targeted Codex conversation. Claude's protocol and registry are inspected internal interfaces, not a documented compatibility guarantee. Check your installed CLI's help before use.
+Verified with Codex CLI 0.154.0 and Claude Code 2.1.267 on Linux, and with Claude Code 2.1.268 on macOS: address delivery, replies, discovery and delivery by name, queued notifications, and subsequent notification arrival in the targeted conversation. Claude's protocol and registry are inspected internal interfaces, not a documented compatibility guarantee. Check your installed CLI's help before use.
 
 ## Install and enable
 
@@ -101,7 +120,7 @@ The watcher checks every two seconds and batches new user messages into a notice
 
 ## Lifecycle
 
-Both processes must remain running. The optional installer supplies systemd user services; see [installation](docs/INSTALL.md). Stop the watcher with Ctrl-C or SIGTERM; `bridge.py stop` stops the server and causes the watcher to exit. Graceful cleanup removes only the process's own sockets and registry entry. SQLite and checkpoints remain for restart.
+Both processes must remain running. The optional installer supplies systemd user services on Linux; see [installation](docs/INSTALL.md). macOS has no systemd, so it uses the managed supervisor instead (`session.py ensure` reports `manual_required` with a start command, and `session.py run` owns both children in one persistent session). Stop the watcher with Ctrl-C or SIGTERM; `bridge.py stop` stops the server and causes the watcher to exit. Graceful cleanup removes only the process's own sockets and registry entry. SQLite and checkpoints remain for restart.
 
 Socket addresses change with the server PID. The watcher publishes `<bridge-pid>.json` in `${CLAUDE_CONFIG_DIR:-~/.claude}/sessions` and refuses to overwrite a pre-existing record. Its process-start marker protects against PID reuse. A forced kill may leave stale sockets or a registry record: verify that the old process is dead and socket connections are refused before removing those specific stale files. Never clear the shared socket or registry directory.
 
@@ -109,7 +128,11 @@ Socket addresses change with the server PID. The watcher publishes `<bridge-pid>
 
 This is a **same-user trust boundary**, not isolation between agents running as the same user. Directories use 0700 and socket/data files use 0600. Both peer and control connections require matching kernel UID. Same-user processes can access the control socket too.
 
-Outbound connections are restricted to private, owned sockets in recognized Claude directories, with symlink checks. Published peer tokens are read privately for the connected server PID and socket hash when available; child credentials are not read. The bridge itself uses Linux same-UID authentication, publishes no token, and rejects auth frames rather than advertising token support.
+Outbound connections are restricted to private, owned sockets in recognized Claude directories, with symlink checks. Published peer tokens are read privately for the connected server PID and socket hash when available; child credentials are not read. The bridge itself uses same-UID kernel authentication (`SO_PEERCRED` on Linux, `getpeereid` with `LOCAL_PEERPID` on macOS), publishes no token, and rejects auth frames rather than advertising token support.
+
+Authenticated delivery disables HTTP redirects and environment proxies so each connection stays on a validated loopback address.
+
+A DeepSeek participant additionally reads the harness signing secret at `$DSH_HOME/.credentials.yaml` to mint a short-lived cookie for the harness's loopback RPC. That file is checked for ownership, mode and regularity before use, and the secret is never logged or republished. Before the secret is read, the destination must pass a loopback check, and the URL authority must be in canonical form — a netloc carrying userinfo or any spelling whose host differs from the host that would be connected to is refused, so the credential cannot be addressed anywhere but the local loopback interface.
 
 Incoming controls are stored as inert data. Message bodies never execute shell commands. Attachment metadata may be stored, but attachments are never fetched. Notices omit peer bodies and are submitted using subprocess argument arrays, without a shell.
 
@@ -121,7 +144,7 @@ Limits: 16 active connections, six-second handler deadline, 32 frames per incomi
 python3 -m unittest discover -v
 ```
 
-Tests cover fragmented and EOF-delimited messages, malformed and oversized input, inert controls, outgoing socket identity, persistent storage, local control requests, notification filtering, and checkpoints. CI runs on Linux with Python 3.11–3.13. Tests use synthetic peers and never message live Claude sessions.
+Tests cover fragmented and EOF-delimited messages, malformed and oversized input, inert controls, outgoing socket identity, persistent storage, local control requests, notification filtering, checkpoints, platform process and socket facts, participant peer naming, and DeepSeek notice delivery. CI runs on Linux and macOS with Python 3.11–3.13. Tests use synthetic peers and never message live Claude sessions.
 
 See [PROTOCOL.md](PROTOCOL.md) for the implemented wire format and discovery details.
 
