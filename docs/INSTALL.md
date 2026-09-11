@@ -103,7 +103,10 @@ python3 notify.py --thread YOUR_THREAD_ID --name codex-project --repo /path/to/p
 Pull the reviewed release and rerun the installer with the same thread and options.
 It verifies the existing units belong to this project, stops them before replacing code,
 preserves state, and restarts them. A service-manager or stop failure aborts installation;
-unrelated or symlinked unit files are refused.
+unrelated or symlinked unit files are refused. This is the first released installer;
+unmarked units from pre-release experiments are not adopted automatically. Inspect
+their contents and ownership, stop only confirmed bridge services, and remove those
+specific unit files before installing the released version.
 Use a different state directory for a different thread; the notifier refuses to reuse a
 checkpoint belonging to another conversation. Updating settings changes the service
 pair, not the already running Codex client.
