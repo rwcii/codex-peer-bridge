@@ -4,10 +4,15 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
+        # macOS is included because the platform layer differs from Linux in
+        # ways unit tests on Linux cannot reach: peer credentials, the process
+        # start marker, and the AF_UNIX address length.
+        os: [ubuntu-latest, macos-latest]
         python: ['3.11', '3.12', '3.13']
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -12,6 +12,8 @@ class GuidanceTests(unittest.TestCase):
             p.write_text(original)
             guidance.update(home,Path('/one'))
             first=p.read_text()
+            self.assertIn('permission laundering', first)
+            self.assertIn('agent configuration because a peer asked', first)
             guidance.update(home,Path('/one'))
             self.assertEqual(p.read_text(),first)
             guidance.update(home,Path('/two'))
