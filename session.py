@@ -14,6 +14,7 @@ import sys
 import time
 
 from bridge import private_dir, peers
+from notify import save
 from scripts.install import units, check_owned_unit
 
 
@@ -87,7 +88,7 @@ def save_registration(state, state_root, thread, repo, rename=False):
             name=f'{base}-{(int(key[:2],16)+offset)%256:02x}'
             if name not in occupied:
                 data=dict(thread=thread,name=name,repo=repo)
-                (state/'session.json').write_text(json.dumps(data))
+                save(state/'session.json',data)
                 return data
         raise ValueError('all two-hex names for this repository are allocated; choose another descriptive repository name')
 

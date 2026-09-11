@@ -43,6 +43,26 @@ class SessionTests(unittest.TestCase):
             self.assertNotEqual(second['name'],taken)
             self.assertNotEqual(first['name'],second['name'])
 
+    def test_rename_preserves_state_on_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            state=root/'sessions'/session.identity('thread-a')
+            state.mkdir(parents=True)
+            inbox=state/'inbox.sqlite3'
+            inbox.write_bytes(b'preserved inbox fixture')
+            with patch('session.peers',return_value=[]):
+                original=session.save_registration(state,root,'thread-a','/old-repo')
+            all_names=[{'name':f'codex-new-repo-{i:02x}'} for i in range(256)]
+            with patch('session.peers',return_value=all_names):
+                with self.assertRaises(ValueError):
+                    session.save_registration(state,root,'thread-a','/new-repo',rename=True)
+            self.assertEqual(json.loads((state/'session.json').read_text()),original)
+            with patch('session.peers',return_value=[]):
+                renamed=session.save_registration(state,root,'thread-a','/new-repo',rename=True)
+            self.assertEqual(renamed['thread'],original['thread'])
+            self.assertEqual(renamed['repo'],'/new-repo')
+            self.assertEqual(inbox.read_bytes(),b'preserved inbox fixture')
+
     def test_two_live_sessions_and_idempotence(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)

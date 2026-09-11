@@ -42,7 +42,9 @@ repo name, registration reports that limit instead of creating an ambiguous labe
 
 To change a name explicitly, stop the thread, run `session.py rename --repo /path/to/repo`,
 then run `ensure` again. This preserves its inbox and internal identity. Existing names
-are not silently rewritten by an upgrade.
+are not silently rewritten by an upgrade. Atomic name assignment is coordinated within
+one installation/state root. Independent installations consult live peers but do not
+share dormant reservations; use distinct repo labels if running separate installations.
 
 **This is instruction-driven setup, not a guaranteed executable startup hook.** Codex
 must load and follow the managed section. Start a new conversation or reload global
