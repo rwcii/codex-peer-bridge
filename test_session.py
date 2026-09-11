@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 import session
+from unittest.mock import patch
 from scripts.install import units
 
 class SessionTests(unittest.TestCase):
@@ -23,6 +24,24 @@ class SessionTests(unittest.TestCase):
         self.assertIn('session.py',next(iter(ua.values())))
         for invalid in ('','../../bad','thread\nvalue'):
             with self.assertRaises(ValueError): session.identity(invalid)
+
+    def test_short_name_collision_keeps_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            a=root/'sessions'/session.identity('thread-a')
+            b=root/'sessions'/session.identity('thread-b')
+            a.mkdir(parents=True)
+            b.mkdir(parents=True)
+            with patch('session.peers',return_value=[]):
+                first=session.save_registration(a,root,'thread-a','/unify-ui')
+            suffix=session.identity('thread-b')[:2]
+            taken=f'codex-unify-ui-{suffix}'
+            with patch('session.peers',return_value=[{'name':taken}]):
+                second=session.save_registration(b,root,'thread-b','/unify-ui')
+            self.assertRegex(first['name'],r'^codex-unify-ui-[a-f0-9]{2}$')
+            self.assertRegex(second['name'],r'^codex-unify-ui-[a-f0-9]{2}$')
+            self.assertNotEqual(second['name'],taken)
+            self.assertNotEqual(first['name'],second['name'])
 
     def test_two_live_sessions_and_idempotence(self):
         with tempfile.TemporaryDirectory() as d:

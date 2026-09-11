@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 
-from bridge import private_dir
+from bridge import private_dir, peers
 from scripts.install import units, check_owned_unit
 
 
@@ -66,7 +66,30 @@ def details(prefix, config, thread, repo):
     key = identity(thread)
     state = Path(config['state_root'])/'sessions'/key
     label = re.sub(r'[^a-z0-9-]+','-',Path(repo).name.lower()).strip('-')[:32] or 'session'
-    return state, f'codex-{label}-{key}', key
+    return state, f'codex-{label}-{key[:2]}', key
+
+
+def save_registration(state, state_root, thread, repo, rename=False):
+    # Serialize name assignment across threads in this installation. Internal identity
+    # remains the full digest; only the human-facing label uses the fleet suffix.
+    private_dir(state_root)
+    with (state_root/'names.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        occupied={p['name'] for p in peers() if isinstance(p.get('name'),str)}
+        for path in (state_root/'sessions').glob('*/session.json'):
+            if path == state/'session.json':
+                continue
+            other=json.loads(path.read_text())
+            occupied.add(other['name'])
+        _, candidate, key=details(Path('.'),{'state_root':str(state_root)},thread,repo)
+        base=candidate.rsplit('-',1)[0]
+        for offset in range(256):
+            name=f'{base}-{(int(key[:2],16)+offset)%256:02x}'
+            if name not in occupied:
+                data=dict(thread=thread,name=name,repo=repo)
+                (state/'session.json').write_text(json.dumps(data))
+                return data
+        raise ValueError('all two-hex names for this repository are allocated; choose another descriptive repository name')
 
 
 def start_command(prefix, thread, repo):
@@ -134,7 +157,7 @@ def supervisor(prefix, config, state, thread, repo, name):
 def main():
     os.umask(0o077)
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action',choices=['ensure','run','status','stop'])
+    p.add_argument('action',choices=['ensure','run','status','stop','rename'])
     p.add_argument('--thread',default=os.environ.get('CODEX_THREAD_ID'))
     p.add_argument('--repo',default=os.getcwd())
     a=p.parse_args()
@@ -150,10 +173,19 @@ def main():
             saved=json.loads(registration.read_text())
             if saved['thread'] != a.thread:
                 raise ValueError('thread identity collision')
-            name,repo=saved['name'],saved['repo']
+            name=saved['name']
+            if a.action != 'rename':
+                repo=saved['repo']
         else:
-            registration.write_text(json.dumps(dict(thread=a.thread,name=name,repo=repo)))
+            saved=save_registration(state,Path(config['state_root']),a.thread,repo)
+            name=saved['name']
         active=bridge_status(prefix,state)
+        if a.action=='rename':
+            if active:
+                raise ValueError('stop this thread before explicitly renaming it')
+            saved=save_registration(state,Path(config['state_root']),a.thread,repo,rename=True)
+            print(json.dumps(saved))
+            return
         healthy=notifier_ready(state,active)
         if a.action=='status' or (a.action=='ensure' and active):
             data=result(prefix,state,name,a.thread,repo,'running' if healthy else ('repair_required' if active else 'stopped'))

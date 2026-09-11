@@ -29,13 +29,20 @@ The section instructs each Codex conversation to run `session.py ensure` using i
 own `CODEX_THREAD_ID`. It never embeds a fixed thread ID. Each thread gets:
 
 - an isolated directory under `~/.local/state/codex-peer-bridge/sessions/<thread-hash>`;
-- a unique peer name based on its initial project directory and thread hash;
+- a fleet-style peer name, `codex-<repo-short-name>-<two-hex>`, stable for the session;
 - its own bridge process, socket, watcher, and notification checkpoint;
 - its own systemd supervisor service when a user manager is available.
 
 Repeated registration reuses a healthy instance. Concurrent Codex sessions do not
 share inboxes or replace each other's configuration. The initial name/project are
-retained when the same thread later changes working directories.
+retained when the same thread later changes working directories. The full thread hash
+is internal; short-name allocation checks saved sessions and the live peer roster,
+trying another two-hex suffix on collision. If all 256 suffixes are allocated for one
+repo name, registration reports that limit instead of creating an ambiguous label.
+
+To change a name explicitly, stop the thread, run `session.py rename --repo /path/to/repo`,
+then run `ensure` again. This preserves its inbox and internal identity. Existing names
+are not silently rewritten by an upgrade.
 
 **This is instruction-driven setup, not a guaranteed executable startup hook.** Codex
 must load and follow the managed section. Start a new conversation or reload global
