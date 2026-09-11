@@ -48,6 +48,10 @@ def save(path, value):
         temp.unlink(missing_ok=True)
 
 
+def proc_start_value(pid):
+    return Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+
+
 def run(a):
     os.umask(0o077)
     root = Path(a.state_dir).absolute()
@@ -84,6 +88,9 @@ def run(a):
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, stop)
     db = sqlite3.connect((root / 'inbox.sqlite3').as_uri() + '?mode=ro', uri=True)
+    ready = root/'notify-ready.json'
+    save(ready,dict(owner=owner,bridge_pid=pid,notifier_pid=os.getpid(),
+                    proc_start=proc_start_value(os.getpid())))
     print(json.dumps(dict(registered=address, name=a.name, thread=a.thread)), flush=True)
     try:
         while not stopped:
@@ -112,6 +119,11 @@ def run(a):
             time.sleep(2)
     finally:
         db.close()
+        try:
+            if json.loads(ready.read_text()).get('owner') == owner:
+                ready.unlink()
+        except FileNotFoundError:
+            pass
         try:
             if json.loads(record.read_text()).get('bridgeOwner') == owner:
                 record.unlink()

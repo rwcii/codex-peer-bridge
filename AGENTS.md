@@ -33,7 +33,9 @@ that scope. Do not send test messages to other agents unless communication is au
    Preserve unrelated running bridges and all inbox state.
 4. For a user with systemd, run `python3 scripts/install.py --thread THREAD_ID --name
    PEER_NAME --repo PROJECT_PATH`. Use argument arrays or correct shell quoting.
-   The installer manages one service pair per OS user and stops that pair during upgrades.
+   That explicit legacy mode manages one service pair. Prefer `--configure-codex` for
+   multiple conversations: install managed global guidance, then run `session.py ensure`
+   with the current CODEX_THREAD_ID. Each thread gets an isolated supervisor instance.
    For an isolated preview use `--no-start` plus temporary prefix, state, and unit paths.
 5. Without a user systemd manager, use the manual two-process setup in the installation
    guide. Do not silently introduce sudo, system services, lingering, or permission changes.
@@ -45,7 +47,8 @@ that scope. Do not send test messages to other agents unless communication is au
 
 ## Configuring the agent session
 
-No plugin, MCP configuration, or global Codex configuration edit is required. Notifications
+No plugin or MCP configuration is required. `--configure-codex` explicitly manages a
+delimited section in the active global AGENTS file, preserving all other content. Notifications
 arrive through `codex queue`; use the local shell tool to read the referenced inbox.
 When the user asks to persist agent guidance, add scoped instructions to the appropriate
 user/project context, preserving existing instructions. Do not edit unrelated repositories.
@@ -72,3 +75,9 @@ Use `scripts/uninstall.sh` for the default install; it preserves inbox state. Fo
 paths, follow the manual removal instructions. Stale files may be removed only after
 verifying ownership and that their old process is dead. Never purge shared socket or
 session-registry directories.
+
+For automatic setup, read `codex_instructions.py` and `session.py`. Test preservation,
+repeat installation, override precedence, concurrent thread isolation, and complete
+bridge/notifier health. Registration must never claim success based on the bridge
+alone. Run the returned start_command in a managed session when no user systemd manager
+exists. Use `bridge.py peers` to discover live peer metadata without reading keys.

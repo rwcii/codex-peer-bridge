@@ -70,6 +70,33 @@ def peer_token(pid, path):
     return token
 
 
+def peers():
+    """Allowlisted live registry metadata; never read authentication keys."""
+    folder = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home()/'.claude'))) / 'sessions'
+    found=[]
+    for path in sorted(folder.glob('*.json')):
+        if not path.stem.isdigit() or path.is_symlink():
+            continue
+        try:
+            info=path.stat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > 65536:
+                continue
+            record=json.loads(path.read_text())
+            pid=int(path.stem)
+            os.kill(pid,0)
+            actual=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+            if record.get('procStart') not in (None,actual):
+                continue
+            address=record.get('messagingSocketPath','')
+            target_path('uds:'+address)
+            found.append(dict(pid=pid,name=record.get('name'),address='uds:'+address,
+                              repo=record.get('cwd'),status=record.get('status'),
+                              implementation=record.get('entrypoint'),protocol=record.get('peerProtocol')))
+        except (OSError,ValueError,TypeError,KeyError,IndexError):
+            continue
+    return found
+
+
 class Bridge:
     def __init__(self, root):
         self.root = root
@@ -242,7 +269,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state-dir', default=DEFAULT)
     sub = p.add_subparsers(dest='op', required=True)
-    for op in ('serve','status','stop'):
+    for op in ('serve','status','stop','peers'):
         sub.add_parser(op)
     s = sub.add_parser('send')
     s.add_argument('to')
@@ -255,7 +282,9 @@ def main():
     a = vars(p.parse_args())
     root = Path(a.pop('state_dir')).absolute()
     private_dir(root)
-    if a['op'] == 'serve':
+    if a['op'] == 'peers':
+        print(json.dumps(peers(), indent=2))
+    elif a['op'] == 'serve':
         asyncio.run(Bridge(root).run())
     else:
         raise SystemExit(asyncio.run(client(root, a)))

@@ -7,3 +7,5 @@ __pycache__/
 run/
 notify-cursor.json
 notifier.lock
+install.json
+session.json
