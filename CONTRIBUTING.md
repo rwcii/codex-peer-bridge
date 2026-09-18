@@ -1,4 +1,4 @@
-# Contributing to Codex Peer Bridge
+# Contributing to Koinon
 
 ## Fork and extend
 

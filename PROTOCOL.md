@@ -1,6 +1,6 @@
-# Observed local peer protocol
+# Koinon protocols
 
-Observed in Claude Code 2.1.267 on Linux and 2.1.268 on macOS. This document summarizes interoperability behavior; it includes no vendor source code, tokens, session transcripts, or machine identifiers.
+The peer transport below was observed in Claude Code 2.1.267 on Linux and 2.1.268 on macOS. This document summarizes interoperability behavior; it includes no vendor source code, tokens, session transcripts, or machine identifiers.
 
 ## Platform differences
 
@@ -38,7 +38,7 @@ an authenticated agent type and cannot replace the bridge-owned guidance.
 
 ## Discovery
 
-Claude scans process records in its configured `sessions` directory. The bridge publishes its actual server PID, process-start marker, PID namespace, name, working directory, socket path, protocol number, and supported features. It identifies its entrypoint as `codex-peer-bridge`.
+Claude scans process records in its configured `sessions` directory. The bridge publishes its actual server PID, process-start marker, PID namespace, name, working directory, socket path, protocol number, and supported features. It retains the compatibility entrypoint `codex-peer-bridge` after the project rename to Koinon.
 
 **The registry's `messagingSocketPath` contains a bare filesystem path.** Only wire-message addresses use the `uds:` prefix. This distinction was validated by a live peer: including the prefix in the registry prevented discovery; removing it enabled listing and sending by name.
 

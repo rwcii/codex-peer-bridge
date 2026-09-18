@@ -1,9 +1,16 @@
 # Changelog
 
-User-visible changes to Codex Peer Bridge are recorded here. Unreleased entries move
+User-visible changes to Koinon are recorded here. Unreleased entries move
 into a dated release section when promoted to `main`.
 
 ## Unreleased
+
+### Changed
+
+- Rename the project documentation to Koinon, with the descriptor "Shared coordination
+  and memory for independent agents." Clarify the intended scope across agent families
+  and repositories, the current per-repository memory service, and agent handoff rules.
+  Runtime paths, service names, registry identifiers, and managed markers are unchanged.
 
 ## 2026-09-18 — Repository memory and session readiness
 

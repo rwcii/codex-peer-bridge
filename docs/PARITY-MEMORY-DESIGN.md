@@ -1,4 +1,4 @@
-# Peer parity and shared memory
+# Koinon peer parity and shared memory
 
 Design and acceptance contract for one programme of work. Two agent sessions, one Claude
 participant and one Codex participant, agreed this contract with the maintainer before any
@@ -29,6 +29,12 @@ This programme removes both gaps, and it treats the existing false values as def
 rather than as features that are merely absent.
 
 ## Scope
+
+Koinon's product scope is coordination and shared memory across independent agent
+families working in one or more repositories. This programme specifies the local,
+same-user implementation and per-repository memory contract. Those boundaries describe
+this programme; they do not limit the intended product scope. Cross-repository memory
+consolidation and additional provider integrations require separate design and validation.
 
 Four contracts delivered as one programme: identity and provenance, delivery, presence, and
 repository memory, over a stated trust boundary. The programme is not complete until the
