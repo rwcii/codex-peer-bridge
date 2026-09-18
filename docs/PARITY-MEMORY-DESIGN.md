@@ -227,16 +227,23 @@ answer, and the probe could only time out. Nothing in the request path may take 
 socket read, or a subprocess call. A reader blocked on a peer must not hold write access to the
 store.
 
-**Invariant 3: shutdown takes no lock, and removes only what it still owns.** A caller waiting for
-a service to exit must not hold a lock that the exit path needs, so the exit path takes none.
-Cleanup is made safe by ownership rather than by exclusion: the exiting service removes the socket
-and the ownership record only when the recorded generation is still its own. A successor that has
-already published its own record is therefore never clobbered by a predecessor's cleanup.
+**Invariant 3: endpoint publication and removal are one locked operation that never waits.**
+Ownership alone is not enough. Checking a generation and then unlinking the socket and the record
+separately is a race: a successor can bind and publish between the two unlinks, and the
+predecessor's second unlink then deletes it. Both publication and removal therefore take
+`start.lock`, they verify the generation inside it, and they perform no waiting at all while
+holding it. A missing record is not permission to delete; absence means another process has taken
+over the bookkeeping, so cleanup declines.
 
 **Invariant 4: a caller waits only for bounded work it does not itself block.** A start caller
 holds `start.lock` across the handshake and the bind, both bounded and neither requiring anything
-the caller holds. A stop caller sends its request, and waits for the service to disappear, without
-holding `start.lock`; it acquires that lock only afterwards, and only if residue remains.
+the caller holds. A stop caller sends its request and waits for the instance to go **without**
+holding the lock, because invariant 3 means the exit path needs it; only afterwards, and only if
+residue remains, does it acquire the lock. Completion is judged by the ownership record and the
+endpoint rather than by a refused connection: a service that has closed its listener and is still
+draining refuses connections while very much alive, so treating a failed handshake as exit would
+report success with work still in flight. A stop is bound to the generation it asked to stop, so a
+successor is never mistaken for it.
 
 **Wait graph.** A starting caller waits on the serving process answering a handshake. A stopping
 caller waits on the serving process exiting. The serving process waits on neither: it holds no
@@ -259,6 +266,12 @@ did not enforce.
 | Acknowledge | the snapshot's consumer | one | none | the acknowledgement, for replay | `ACK_RETENTION` |
 | Register a consumer | the consumer key | one | key plus row overhead | the cursor | `CONSUMER_TTL` idle, then a tombstone |
 | Retire a consumer | the service | one | tombstone row | the tombstone, reporting `consumer_retired` | `RETIRED_TTL` |
+
+Progress transitions — acknowledgement, page issuance and activity refresh — are bounded rather
+than admitted. They may never be refused for space: a reader that cannot acknowledge can never
+advance, so refusing one would make the store unreadable-forward exactly when it most needs
+draining. They add no rows a caller controls, and they relieve write-ahead log growth when the file
+approaches its limit.
 
 Reclamation is not a transition a caller makes. It removes only records already past the
 lifetime above, and it may never evict one still inside its window to make room: an

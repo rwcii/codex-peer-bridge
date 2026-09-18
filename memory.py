@@ -23,9 +23,11 @@ a defect in review:
 """
 import argparse
 import asyncio
+import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -104,6 +106,9 @@ ROW_WINDOW = 500
 # That window is precisely what a durability claim must survive, and a test that kills
 # the process after a successful response has not entered it.
 CRASH_AFTER_COMMIT = os.environ.get('MEMORY_TEST_CRASH_AFTER_COMMIT') == '1'
+# Test fixture only: hold a computed reply for this many seconds before sending it, so a
+# shutdown can be driven while a request is genuinely in flight.
+REPLY_DELAY = float(os.environ.get('MEMORY_TEST_REPLY_DELAY') or 0)
 
 SNAPSHOT_ORDER = {'directive': 0, 'decision': 1, 'gotcha': 2, 'handoff': 3, 'finding': 4, 'status': 5}
 SNAPSHOT_TAIL = {'finding': 25, 'handoff': 25, 'status': 10}
@@ -238,7 +243,10 @@ class Store:
         through = int(self.meta('indexed_through') or 0)
         if through == self.head():
             return
-        with self.db:
+        # A rebuild is bounded rather than admitted, like any progress transition:
+        # refusing it for space would leave search permanently wrong, and it adds no rows
+        # a caller controls, only an index over entries already admitted.
+        with self.progress():
             self.db.execute("INSERT INTO search(search) VALUES('delete-all')")
             for seq, body in self.db.execute('SELECT seq,body FROM entries ORDER BY seq'):
                 self.db.execute('INSERT INTO search(rowid,body) VALUES(?,?)', (seq, body))
@@ -330,6 +338,68 @@ class Store:
                 pass
         return total
 
+    def charge(self, **parts):
+        """The single cost calculation for a transition, in the units usage() reports."""
+        total = 0
+        for kind, values in parts.items():
+            if kind == 'entry':
+                total += sum(measure(v or '') for v in values) + ENTRY_OVERHEAD
+            elif kind == 'idem':
+                # Matches what usage() attributes to an idempotency row: the scoped key
+                # plus its metadata. A charge that differs from the measurement is not
+                # accounting, it is two opinions.
+                total += sum(measure(v or '') for v in values) + 64
+            elif kind == 'reader':
+                total += sum(measure(v or '') for v in values) + 64
+            elif kind == 'tombstone':
+                total += sum(measure(v or '') for v in values) + 64
+            elif kind == 'snapshot':
+                total += sum(measure(v or '') for v in values) + 96
+            elif kind == 'frozen':
+                total += sum(values) + 64 * len(values)
+        return total
+
+    @contextlib.contextmanager
+    def mutation(self, need=0, slots=0, control=False):
+        """Run a durable change under admission and end-of-transaction enforcement.
+
+        Every transition that can grow the store passes through here: appends, frozen
+        snapshots, consumer registration, retirement, page issuance, acknowledgement and
+        index maintenance. Checking only the append path left most growth unmeasured
+        while the advertised bound implied otherwise.
+        """
+        self.admit(need, slots, control)
+        with self.db:
+            yield
+            self.enforce(control, need)
+
+    @contextlib.contextmanager
+    def progress(self):
+        """A transition that records progress and may never be refused for space.
+
+        Acknowledgements, page issuance and activity refreshes cannot be rejected on
+        capacity: a reader that cannot acknowledge can never advance, and the store
+        would become unreadable-forward precisely when it most needs draining. They are
+        bounded instead of refused, by relieving write-ahead log growth when the file
+        approaches its limit, and they add no rows a caller controls.
+        """
+        with self.db:
+            yield
+        if self.physical() > MAX_PHYSICAL_BYTES - WAL_MARGIN:
+            self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+
+    def enforce(self, control, need=0):
+        """Verify real allocation, and logical usage when the change was a growth."""
+        self.enforce_physical(control)
+        if need:
+            cap = MAX_LOGICAL_BYTES if control else MAX_LOGICAL_BYTES - RESERVED_BYTES
+            logical = self.usage()['logical']
+            if logical > cap:
+                raise MemoryError_('capacity',
+                                   f'this mutation would leave {logical} logical bytes stored, '
+                                   f'above the {cap} byte limit; it was rolled back and stored '
+                                   'data is intact')
+
     def enforce_physical(self, control):
         """Check real allocation after a mutation, inside its transaction.
 
@@ -386,6 +456,11 @@ class Store:
         This runs at request boundaries, not merely after a capacity failure. A
         horizon that is enforced only when the store fills is not a lifetime; it is a
         side effect of pressure, and a caller cannot reason about it.
+
+        Removal is deliberately outside admission. Enforcing a budget here would refuse
+        the cleanup precisely when the store is over its limit, which is when it is most
+        needed; the only growth is a retirement tombstone, and registration reserves for
+        that when the consumer is admitted.
         """
         now = time.time()
         with self.db:
@@ -444,12 +519,6 @@ class Store:
                 'SELECT key FROM idem WHERE deadline < ? ORDER BY deadline LIMIT -1 OFFSET ?',
                 (now, MAX_IDEM_ROWS)).fetchall()
             self.db.executemany('DELETE FROM idem WHERE key=?', prunable)
-            # A tombstone's only job is to tell a returning consumer it was retired, so
-            # the oldest are droppable once the count is bounded. They are not recovery
-            # records promised to anyone still within a window.
-            excess = self.db.execute('SELECT consumer FROM retired ORDER BY at DESC '
-                                     'LIMIT -1 OFFSET ?', (MAX_RETIRED,)).fetchall()
-            self.db.executemany('DELETE FROM retired WHERE consumer=?', excess)
         # Deleting rows frees pages inside the file; without these the file never
         # shrinks and a store that reached its bound could never recover from it.
         # Both pragmas must be driven to completion; preparing them without stepping
@@ -501,31 +570,42 @@ class Store:
                                    'an idempotent write requires a retry deadline in absolute '
                                    'epoch seconds, chosen before the first send')
             now = time.time()
+            if not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+                raise MemoryError_('invalid_request',
+                                   'a retry deadline must be a finite number of epoch seconds')
             if deadline > now + IDEM_TTL:
                 raise MemoryError_('invalid_request',
                                    f'a retry deadline may not exceed {IDEM_TTL} seconds ahead, '
                                    'because deduplication state is not retained beyond that')
-            row = self.db.execute('SELECT fingerprint,seq FROM idem WHERE key=?', (scoped,)).fetchone()
+            # The clock decides expiry, not whether cleanup has run. Retained state can
+            # outlive its deadline by up to one expiry interval, and a retry deduplicated
+            # in that window would succeed past the boundary the caller was given.
+            if deadline <= now:
+                raise MemoryError_('retry_deadline_expired',
+                                   'this retry deadline has passed, so deduplication can no longer '
+                                   'be guaranteed; establish whether the earlier attempt landed, '
+                                   'then resend with a new key and deadline')
+            row = self.db.execute(
+                'SELECT fingerprint,seq,deadline FROM idem WHERE key=?', (scoped,)).fetchone()
             if row:
                 if row[0] != mark:
                     raise MemoryError_('idempotency_conflict',
                                        'this key is already used with different content')
-                return dict(seq=row[1], duplicate=True, deadline=deadline)
-            if deadline <= now:
-                # Refuse before writing. Appending here is exactly the silent duplicate
-                # the contract forbids, because the caller cannot know whether its first
-                # attempt landed.
-                raise MemoryError_('retry_deadline_expired',
-                                   'this retry deadline has passed and deduplication state is no '
-                                   'longer retained; establish whether the earlier attempt landed, '
-                                   'then resend with a new key and deadline')
-        variable = sum(measure(x) for x in (body, path or '', author or '',
-                                           scope_target or '', consumer, key or ''))
-        self.admit(variable + ENTRY_OVERHEAD, slots=1, control=bool(supersedes or revokes))
-        # One transaction. A failure anywhere inside rolls the whole write back, so a
-        # caller told the write failed never finds it committed by a later request.
+                if row[2] != deadline:
+                    # The deadline is part of the request's identity. Accepting a changed
+                    # one would let a caller extend deduplication indefinitely while the
+                    # service reported a horizon it never agreed to.
+                    raise MemoryError_('idempotency_conflict',
+                                       'this key was accepted with a different retry deadline; '
+                                       'repeat the original deadline or use a new key')
+                return dict(seq=row[1], duplicate=True, deadline=row[2])
+        need = self.charge(entry=(body, path, author, scope_target, consumer),
+                           **(dict(idem=(scoped,)) if scoped else {}))
+        # One transaction under the shared chokepoint. A failure anywhere inside rolls the
+        # whole write back, so a caller told the write failed never finds it committed by
+        # a later request.
         try:
-            with self.db:
+            with self.mutation(need, slots=1, control=bool(supersedes or revokes)):
                 revision, target, conflict = 1, supersedes or revokes, None
                 if target:
                     found = self.db.execute(
@@ -558,7 +638,6 @@ class Store:
                 if self.fts and int(self.meta('indexed_through') or 0) >= 0:
                     self.db.execute('INSERT INTO search(rowid,body) VALUES(?,?)', (seq, body))
                     self.set_meta('indexed_through', seq)
-                self.enforce_physical(bool(supersedes or revokes))
                 if scoped:
                     held = self.db.execute('SELECT count(*) FROM idem').fetchone()[0]
                     if held >= MAX_IDEM_ROWS:
@@ -651,8 +730,8 @@ def freeze(store, consumer):
     # A snapshot copies every member, so it is a durable mutation and is charged for.
     # Writing around admission is what let the store grow while the budget said
     # otherwise.
-    store.admit(sum(measure(p) for _, _, p in payloads) + len(payloads) * 64)
-    with store.db:
+    need = store.charge(frozen=[measure(p) for _, _, p in payloads], snapshot=(sid, consumer))
+    with store.mutation(need):
         store.db.execute(
             'INSERT INTO snapshots(id,consumer,head,created,items,issued,acked,acked_at) '
             'VALUES(?,?,?,?,?,0,NULL,NULL)', (sid, consumer, head, time.time(), len(ordered)))
@@ -702,6 +781,8 @@ class Service:
                 reply = dict(ok=True, result=self.command(request, pid))
                 if CRASH_AFTER_COMMIT and request.get('op') == 'note':
                     os._exit(70)
+                if REPLY_DELAY and request.get('op') == 'note':
+                    await asyncio.sleep(REPLY_DELAY)
         except MemoryError_ as exc:
             reply = dict(ok=False, code=exc.code, error=str(exc))
         except (ValueError, KeyError, TypeError, OSError, TimeoutError, sqlite3.Error) as exc:
@@ -775,10 +856,18 @@ class Service:
                                f'this consumer was retired after {CONSUMER_TTL} seconds idle at '
                                f'cursor {retired[0]}; re-register under a new consumer key, which '
                                'will resync from a snapshot')
-        with self.store.db:
-            if self.store.db.execute('SELECT count(*) FROM cursors').fetchone()[0] >= MAX_CONSUMERS:
-                raise MemoryError_('capacity', f'{MAX_CONSUMERS} consumers are registered')
-            self.store.admit(measure(consumer) + 128, slots=0)
+        live = self.store.db.execute('SELECT count(*) FROM cursors').fetchone()[0]
+        graves = self.store.db.execute('SELECT count(*) FROM retired').fetchone()[0]
+        if live >= MAX_CONSUMERS or live + graves >= MAX_CONSUMERS + MAX_RETIRED:
+            # Registration is bounded by live consumers *and* by the tombstones they will
+            # become. Bounding the tombstones by eviction instead would silently turn a
+            # returning retired consumer into a new one, contradicting the retention this
+            # service promises and the explicit result it owes that caller.
+            raise MemoryError_('capacity',
+                               f'{live} consumers and {graves} retirement records are held, at the '
+                               f'limit of {MAX_CONSUMERS} and {MAX_RETIRED}')
+        need = self.store.charge(reader=(consumer,), tombstone=(consumer,))
+        with self.store.mutation(need):
             self.store.db.execute(
                 'INSERT INTO cursors(consumer,seq,issued,snapshot,bootstrapped,resnapshot,'
                 'updated) VALUES(?,0,0,NULL,0,0,?)', (consumer, time.time()))
@@ -791,7 +880,7 @@ class Service:
 
     def touch(self, consumer):
         """Record activity on every request, so an active poller is never retired."""
-        with self.store.db:
+        with self.store.progress():
             self.store.db.execute('UPDATE cursors SET updated=? WHERE consumer=?',
                                   (time.time(), consumer))
 
@@ -809,7 +898,7 @@ class Service:
                 # put this consumer into snapshot mode. Without the flag, a bootstrapped
                 # reader whose cursor happens to sit above the floor would silently fall
                 # through to deltas and skip everything the snapshot would have carried.
-                with self.store.db:
+                with self.store.progress():
                     self.store.db.execute(
                         'UPDATE cursors SET snapshot=NULL,resnapshot=1 WHERE consumer=?',
                         (consumer,))
@@ -823,7 +912,7 @@ class Service:
         end = entries[-1]['seq'] if entries else seq
         head = self.store.head()
         if end > issued:
-            with self.store.db:
+            with self.store.progress():
                 self.store.db.execute('UPDATE cursors SET issued=? WHERE consumer=?',
                                       (end, consumer))
         return dict(kind='delta', entries=entries, cursor=seq, next_cursor=end,
@@ -864,7 +953,7 @@ class Service:
         page, more = bounded((size, json.loads(payload)) for _, payload, size in rows)
         nxt = token + len(page)
         if nxt > issued:
-            with self.store.db:
+            with self.store.progress():
                 self.store.db.execute('UPDATE snapshots SET issued=? WHERE id=?', (nxt, sid))
         return dict(kind='snapshot', snapshot_id=sid, head=head, entries=page, page_token=nxt,
                     total=items, more=more or nxt < items)
@@ -895,7 +984,7 @@ class Service:
                 raise MemoryError_('snapshot_incomplete',
                                    f'{given} of {items} pages were issued; page to the end before '
                                    'acknowledging')
-            with self.store.db:
+            with self.store.progress():
                 self.store.db.execute('UPDATE snapshots SET acked=1,acked_at=? WHERE id=?',
                                       (time.time(), sid))
                 self.store.db.execute(
@@ -915,7 +1004,7 @@ class Service:
             return dict(cursor=seq, ignored='not monotonic')
         if through > issued:
             raise MemoryError_('not_issued', f'cannot acknowledge {through}; {issued} was issued')
-        with self.store.db:
+        with self.store.progress():
             self.store.db.execute('UPDATE cursors SET seq=? WHERE consumer=?', (through, consumer))
         return dict(cursor=through)
 
@@ -1202,39 +1291,52 @@ def release(home, control, generation):
 
 
 def stop_service(home, repo, timeout=20):
-    """Ask the service to stop, then wait for it to go, then tidy residue.
+    """Stop one specific service instance and report only when it has gone.
 
-    The wait happens with no lock held, because the exit path removes the endpoint
-    under `start.lock` and a caller holding it would be waiting on a process that is
-    waiting on the caller. That is the wait cycle invariant 4 forbids, and it is the
-    shape of the readiness deadlock this project already shipped once.
+    Completion is bound to the generation that was asked to stop. A refused connection
+    is not evidence of exit: a service that has closed its listener and is still
+    draining refuses connections while very much alive, so waiting on a failed handshake
+    would report success while work was still in flight. The wait therefore watches the
+    ownership record and the endpoint, and it holds no lock, because the exit path takes
+    `start.lock` to remove them and a caller holding it would be waiting on a process
+    waiting on the caller.
     """
     control = platform_support.control_socket_path(Path(home))
+    target = read_owner(home)
+    if not target:
+        return dict(status='not_running', residue=control.exists())
+    if target.get('repo') != repo:
+        raise MemoryError_('wrong_repository',
+                           'the recorded owner serves another repository; refusing to stop it')
+    generation = target.get('generation')
     try:
-        reply = asyncio.run(request(home, dict(op='stop')))
-    except (ConnectionRefusedError, FileNotFoundError):
-        reply = dict(ok=True, result='not running')
+        asyncio.run(request(home, dict(op='stop'), timeout=5))
+    except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
+        # It may already be draining or gone. The wait below decides, not this call.
+        pass
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not control.exists():
-            return dict(status='stopped', residue=False)
-        try:
-            asyncio.run(request(home, dict(op='hello'), timeout=2))
-        except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
+        owner = read_owner(home)
+        if owner is None:
+            return dict(status='stopped', generation=generation, residue=control.exists())
+        if owner.get('generation') != generation:
+            # A successor already owns this endpoint, so the instance we asked to stop
+            # has gone and must not be confused with the one now running.
+            return dict(status='stopped', generation=generation, superseded=True)
+        if owner_is_dead(owner):
             break
         time.sleep(.05)
-    # Only now take the lock, and only to remove what a dead owner left behind.
     with (Path(home) / 'start.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         owner = read_owner(home)
-        if owner and owner_is_dead(owner) and owner.get('socket') == str(control):
+        if not owner or owner.get('generation') != generation:
+            return dict(status='stopped', generation=generation)
+        if owner_is_dead(owner) and owner.get('socket') == str(control):
             control.unlink(missing_ok=True)
             (Path(home) / 'owner.json').unlink(missing_ok=True)
-            return dict(status='stopped', residue=True, removed=True)
-        if control.exists():
-            return dict(status='stop_requested', residue=True, removed=False,
-                        detail='the service has not exited yet and its owner is not proven dead')
-    return dict(status='stopped', residue=False, reply=reply.get('result'))
+            return dict(status='stopped', generation=generation, residue=True, removed=True)
+        return dict(status='stop_requested', generation=generation, residue=True, removed=False,
+                    detail='the service has not exited within the timeout and is not proven dead')
 
 
 def main():

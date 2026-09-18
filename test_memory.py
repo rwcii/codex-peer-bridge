@@ -201,6 +201,13 @@ class WriteTests(Base):
             self.assertGreater(len(written), 5, 'the bound must not stop growth immediately')
             # Real allocation is what stopped, and it stopped below the hard limit.
             self.assertLessEqual(self.s.physical(), cap)
+            # Other transitions must also be bounded, not merely the append path.
+            with self.assertRaises(memory.MemoryError_) as e:
+                memory.freeze(self.s, 'a-reader-at-the-bound')
+            self.assertEqual(e.exception.code, 'capacity')
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.call(op='sync', consumer='another-reader-at-the-bound')
+            self.assertEqual(e.exception.code, 'capacity')
             stored = len(self.s.live())
             # The reserve is what keeps a withdrawal possible at the bound; without
             # reserved bytes a full store would pin a directive it can never retract.
@@ -239,6 +246,21 @@ class WriteTests(Base):
                 memory.freeze(self.s, 'another-reader')
             self.assertEqual(e.exception.code, 'capacity')
 
+    def test_an_empty_snapshot_and_a_keyed_write_are_both_charged(self):
+        before = self.s.usage()['logical']
+        memory.freeze(self.s, 'reader')
+        empty = self.s.usage()['logical']
+        # An empty snapshot still writes a header row; charging zero for it would let a
+        # reader grow the store without ever being accounted.
+        self.assertGreater(empty, before)
+        self.s.note('writer', 'finding', 'keyed', key='k1', deadline=time.time()+600)
+        self.assertGreater(self.s.usage()['logical'], empty + memory.measure('keyed'))
+
+    def test_registration_is_charged_for_its_eventual_tombstone(self):
+        before = self.s.usage()['logical']
+        self.call(op='sync', consumer='a-consumer-with-a-long-name')
+        self.assertGreater(self.s.usage()['logical'], before)
+
     def test_an_in_window_idempotency_key_is_never_evicted_to_make_room(self):
         with patch.object(memory,'MAX_IDEM_ROWS', 2):
             deadline = time.time() + 600
@@ -265,7 +287,7 @@ class WriteTests(Base):
         self.call(op='status')
         self.assertEqual(self.s.live(), [])
 
-    def test_retired_tombstones_are_bounded(self):
+    def test_retirement_records_expire_by_age(self):
         self.note('one')
         self.drain()
         self.s.db.execute('UPDATE cursors SET updated=?', (time.time()-memory.CONSUMER_TTL-1,))
@@ -276,6 +298,29 @@ class WriteTests(Base):
         self.s.db.commit()
         self.s.expire()
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM retired').fetchone()[0], 0)
+
+    def test_registration_is_bounded_by_consumers_and_their_tombstones(self):
+        """The count limit is enforced at admission, not by evicting a tombstone.
+
+        Evicting an in-window tombstone would silently turn a returning retired consumer
+        into a new one, contradicting the retention the service promises it.
+        """
+        with patch.object(memory, 'MAX_CONSUMERS', 2), patch.object(memory, 'MAX_RETIRED', 1):
+            for name in ('r1', 'r2'):
+                self.call(op='sync', consumer=name)
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.call(op='sync', consumer='r3')
+            self.assertEqual(e.exception.code, 'capacity')
+            # Retire one, leaving a tombstone. The combined bound still holds and the
+            # tombstone survives, so r1 is still told it was retired.
+            self.s.db.execute('UPDATE cursors SET updated=? WHERE consumer=?',
+                              (time.time()-memory.CONSUMER_TTL-1, 'r1'))
+            self.s.db.commit()
+            self.s.expire()
+            self.assertEqual(self.s.db.execute('SELECT count(*) FROM retired').fetchone()[0], 1)
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.call(op='sync', consumer='r1')
+            self.assertEqual(e.exception.code, 'consumer_retired')
 
     def test_deduplication_state_is_retained_only_to_its_deadline(self):
         self.note('kept', key='fresh', deadline=time.time()+600)
@@ -294,19 +339,36 @@ class WriteTests(Base):
         self.assertEqual(e.exception.code, 'invalid_request')
 
     def test_a_retry_after_its_deadline_is_refused_rather_than_appended(self):
-        """The caller that never saw a response is the one this protects."""
-        deadline = time.time() + 600
+        """Real time advances past one unchanged deadline; nothing is substituted."""
+        deadline = time.time() + 0.3
         first = self.s.note('writer', 'finding', 'uncertain outcome', key='k1', deadline=deadline)
         self.assertFalse(first['duplicate'])
-        # Its response was lost, the deadline lapsed, and the state was reclaimed.
-        self.s.db.execute('DELETE FROM idem')
-        self.s.db.commit()
+        while time.time() <= deadline:
+            time.sleep(0.05)
+        # The row may still be present, because cleanup runs on an interval. Expiry is
+        # decided by the clock, so the retry must be refused either way.
         with self.assertRaises(memory.MemoryError_) as e:
-            self.s.note('writer', 'finding', 'uncertain outcome', key='k1',
-                        deadline=time.time()-1)
+            self.s.note('writer', 'finding', 'uncertain outcome', key='k1', deadline=deadline)
         self.assertEqual(e.exception.code, 'retry_deadline_expired')
-        # Refused, not appended: one entry, not two.
         self.assertEqual(len(self.s.live()), 1)
+
+    def test_a_duplicate_carrying_a_changed_deadline_is_refused(self):
+        deadline = time.time() + 600
+        self.s.note('writer', 'finding', 'same content', key='k1', deadline=deadline)
+        with self.assertRaises(memory.MemoryError_) as e:
+            self.s.note('writer', 'finding', 'same content', key='k1', deadline=deadline + 60)
+        # Accepting it would let a caller extend deduplication indefinitely while the
+        # service reported a horizon it never agreed to.
+        self.assertEqual(e.exception.code, 'idempotency_conflict')
+        repeated = self.s.note('writer', 'finding', 'same content', key='k1', deadline=deadline)
+        self.assertTrue(repeated['duplicate'])
+        self.assertEqual(repeated['deadline'], deadline)
+
+    def test_a_deadline_must_be_a_finite_number(self):
+        for bad in (float('inf'), float('nan'), 'soon'):
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.s.note('writer', 'finding', 'body', key='kx', deadline=bad)
+            self.assertEqual(e.exception.code, 'invalid_request')
 
     def test_the_reported_author_is_part_of_the_content_fingerprint(self):
         deadline = time.time() + 600
@@ -924,6 +986,39 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(control.exists())
         service.wait(timeout=10)
         self.assertEqual(service.returncode, 0)
+
+    def test_a_request_in_flight_is_drained_before_the_store_closes(self):
+        """Stop must finish accepted work, and report only once the instance has gone."""
+        import threading
+        service = self.spawn('serve', env=dict(os.environ, MEMORY_TEST_REPLY_DELAY='2'))
+        control = self.wait_for_socket(pid=service.pid)
+        generation = memory.read_owner(self.home)['generation']
+        outcome = {}
+
+        def slow_write():
+            try:
+                outcome['reply'] = self.client(op='note', consumer='w', type='decision',
+                                               body='written while stopping')
+            except Exception as exc:                      # noqa: BLE001 - recorded, asserted below
+                outcome['error'] = exc
+
+        worker = threading.Thread(target=slow_write)
+        worker.start()
+        time.sleep(0.5)                                   # let it reach the delay
+        result = json.loads(self.cli('stop').stdout)
+        worker.join(timeout=30)
+        # The accepted request was answered rather than cut off by a closing store.
+        self.assertNotIn('error', outcome, outcome.get('error'))
+        self.assertTrue(outcome['reply']['ok'], outcome['reply'])
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual(result['generation'], generation)
+        self.assertFalse(control.exists())
+        service.wait(timeout=10)
+        # Restart: the drained write is durable, and the new instance is a new generation.
+        successor = self.spawn('serve')
+        self.wait_for_socket(pid=successor.pid)
+        self.assertEqual(self.client(op='status')['result']['usage']['entries'], 1)
+        self.assertNotEqual(memory.read_owner(self.home)['generation'], generation)
 
     def test_the_cli_can_continue_recall_and_status_pages(self):
         self.spawn('serve')
