@@ -348,7 +348,11 @@ rows they describe are one transaction. Split across two, an interruption left a
 tables and no identity, which could only be read as belonging to another repository; that state
 is now completed rather than refused, while a file holding entries without an identity is
 refused outright, because adopting it would take another store's data under this repository's
-name. The connection runs in autocommit and every transaction is opened explicitly, because the
+name. The test for completing an unfinished start is "no tables this store does not own",
+not "no metadata", so another application's database stays refused and is named in the error.
+A rolled-back initialisation leaves a nonempty file with no tables, because the pragmas applied
+at open write a database header; reading that as foreign made the rollback clean and the store
+permanently unopenable. The connection runs in autocommit and every transaction is opened explicitly, because the
 driver starts an implicit transaction only for `INSERT`, `UPDATE`, `DELETE` and `REPLACE` -- so
 DDL committed statement by statement whatever it was wrapped in.
 
@@ -368,7 +372,12 @@ Reads, status and stop stay available, and cleanup runs only ahead of operations
 so a failed cleanup cannot block the operations the error says remain reachable. Recovery obeys
 the precondition it restores: it resets the log and verifies the result before writing
 anything, keeps the block unless every postcondition holds, and is reachable as a `recover`
-subcommand as well as a service operation. The state
+subcommand as well as a service operation.
+
+A checkpoint or a `stat` that raises records the block too, because an exception has proved
+nothing; letting it propagate left the state unset and the next write proceeded as though the
+log had been proved empty. Only `FileNotFoundError` proves the log absent -- a permission or
+I/O error is a failed proof, not an empty log. The state
 lives in the running service rather than in the store, because a store that cannot be written
 cannot record that it cannot be written.
 

@@ -330,6 +330,20 @@ was several separately committed transactions until these boundaries were made e
 must be recorded inside it rather than by the caller's handler, as that handler is never
 reached.
 
+**An exception is a failed proof, not an absent problem.** A checkpoint or a `stat` that
+raises has established nothing, so it records the block exactly as a bad result does. Letting
+it propagate left the state unset, and once the condition cleared the next write proceeded as
+though the log had been proved empty. For the log file itself only `FileNotFoundError` proves
+absence: a permission or I/O error is a failure to obtain the proof and must not be read as an
+empty log.
+
+**A rolled-back initialisation must be completable.** The pragmas applied at open write a
+database header, so an initialisation that rolls back leaves a nonempty file with no tables.
+Reading that as a foreign store made the rollback clean and the store permanently unopenable.
+The test for adoption is therefore "no tables this store does not own", not "no metadata": an
+unfinished start is finished, a store holding entries without an identity is refused, and
+another application's database is refused and named in the error.
+
 Two pragmas run their own transactions rather than sitting inside one, because
 `incremental_vacuum` cannot usefully be wrapped. Both are bracketed by resets.
 
@@ -391,6 +405,10 @@ asserted by a test in `test_memory.StorageBoundTests`:
 | A failed recovery keeps the block and writes nothing | `ResetFailureTests.test_a_failed_recovery_keeps_the_block_and_writes_nothing` |
 | Recovery clears the block once the log can be reset | `ResetFailureTests.test_recovery_clears_the_block_once_the_log_can_be_reset` |
 | Recovery is reachable from the command line | `LifecycleTests.test_recovery_is_reachable_from_the_command_line` |
+| Another application's database is never adopted | `InitialisationBoundaryTests.test_another_application_database_is_never_adopted` |
+| A raising checkpoint holds writes until recovery | `CheckpointExceptionTests.test_a_raising_checkpoint_holds_writes_until_recovery` |
+| Only a missing log proves a missing log | `CheckpointExceptionTests.test_only_a_missing_log_proves_a_missing_log` |
+| An unreadable log is a failed proof | `CheckpointExceptionTests.test_a_real_unreadable_log_directory_is_a_failed_proof` |
 | A scan-mode store expires across batches without touching the index | `ScanModeExpiryTests.test_a_scan_mode_store_expires_across_batches_without_touching_the_index` |
 | Index maintenance that cannot fit invalidates and still removes the rows | `ScanModeExpiryTests.test_index_maintenance_that_cannot_fit_invalidates_and_still_removes_the_rows` |
 | A rebuild that cannot fit still opens the store in scan mode | `test_a_rebuild_that_cannot_fit_still_opens_the_store_in_scan_mode` |

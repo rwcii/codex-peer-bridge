@@ -70,6 +70,12 @@ CREATE TABLE IF NOT EXISTS entries(
     PRIMARY KEY(id, position))""",
 """CREATE INDEX IF NOT EXISTS entries_live ON entries(superseded_by, revoked_by, expires)""",
 )
+# Tables this schema owns. A file carrying only these, or none at all, may be initialised;
+# anything else is another application's database and is refused rather than adopted. FTS5
+# adds shadow tables under the `search` prefix, which belong to the index this store creates.
+SCHEMA_TABLES = frozenset(('meta', 'entries', 'idem', 'cursors', 'retired', 'snapshots',
+                           'snapshot_items'))
+
 TYPES = ('decision', 'finding', 'gotcha', 'handoff', 'status', 'directive')
 SCOPES = ('repo', 'task', 'session')
 
@@ -437,8 +443,9 @@ class Store:
         """
         try:
             busy, log_pages, residual = self.log_state()
-        except sqlite3.Error as exc:
-            self.block(f'recovery could not checkpoint the log ({type(exc).__name__})')
+        except (sqlite3.Error, OSError) as exc:
+            self.block(f'recovery could not prove the log reset '
+                       f'({type(exc).__name__}: {exc}); nothing was written')
             raise MemoryError_('storage_blocked', self.blocked) from exc
         if busy or log_pages or residual:
             self.block(f'recovery could not reset the write-ahead log (busy={busy}, '
@@ -449,8 +456,8 @@ class Store:
         try:
             self.db.execute('PRAGMA incremental_vacuum').fetchall()
             busy, log_pages, residual = self.log_state()
-        except sqlite3.Error as exc:
-            self.block(f'recovery could not reclaim pages ({type(exc).__name__})')
+        except (sqlite3.Error, OSError) as exc:
+            self.block(f'recovery could not reclaim pages ({type(exc).__name__}: {exc})')
             raise MemoryError_('storage_blocked', self.blocked) from exc
         if busy or log_pages or residual:
             self.block('recovery reclaimed pages but could not reset the log afterwards')
@@ -477,7 +484,15 @@ class Store:
         empty. Under exclusive locking no other process can hold a snapshot, so a busy
         result is a genuine recovery condition rather than ordinary contention.
         """
-        busy, log_pages, residual = self.log_state()
+        try:
+            busy, log_pages, residual = self.log_state()
+        except (sqlite3.Error, OSError) as exc:
+            # A checkpoint or a stat that raises has not proved anything. Letting it
+            # propagate left `blocked` unset, so once the condition cleared the next write
+            # proceeded without anyone having asked for recovery.
+            self.block(f'the write-ahead log could not be proved reset '
+                       f'({type(exc).__name__}: {exc}). No write was attempted')
+            raise MemoryError_('storage_blocked', self.blocked) from exc
         if busy or log_pages or residual:
             # The block is recorded here rather than by the caller. `transaction` resets
             # before its own try block, so a failure raised from here bypassed the handler
@@ -495,9 +510,22 @@ class Store:
             'PRAGMA wal_checkpoint(TRUNCATE)').fetchall()[0]
         try:
             residual = os.stat(str(self.path) + '-wal').st_size
-        except OSError:
+        except FileNotFoundError:
+            # Absence is proof that nothing is retained. Any other error -- a permission
+            # or I/O failure -- is a failure to obtain the proof, not evidence of an empty
+            # log, and it must not be read as one. It propagates to `reset_log`.
             residual = 0
         return busy, log_pages, residual
+
+    def user_tables(self):
+        """Tables in this file, excluding SQLite's own and the search index's shadows."""
+        try:
+            rows = self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'").fetchall()
+        except sqlite3.Error:
+            return set()
+        return {name for (name,) in rows if not name.startswith('search')}
 
     def uninitialised(self):
         """Does this file still need its schema and identity written?
@@ -509,6 +537,12 @@ class Store:
         state and is refused by `inspect`, because completing initialisation there would
         adopt another store's data under this repository's name.
         """
+        foreign = self.user_tables() - SCHEMA_TABLES
+        if foreign:
+            raise MemoryError_(
+                'incompatible_store',
+                f'this file holds tables this store does not own '
+                f'({", ".join(sorted(foreign)[:4])}); it was left untouched')
         try:
             self.db.execute('SELECT 1 FROM meta LIMIT 1').fetchone()
         except sqlite3.Error:
@@ -538,8 +572,17 @@ class Store:
                     'connection so that its storage bound holds, so a second reader is '
                     'refused rather than admitted; reach it through the control socket. '
                     'Nothing was written') from exc
+            # The metadata table may be missing because nothing was ever written: the
+            # pragmas applied at open write a database header, so an initialisation that
+            # rolled back leaves a nonempty file with no tables at all. That is this
+            # runtime's own unfinished work and must be completable, not condemned.
+            foreign = self.user_tables() - SCHEMA_TABLES
+            if not foreign:
+                return
             raise MemoryError_('incompatible_store',
-                               f'this file is not a memory store ({type(exc).__name__}); it was '
+                               f'this file holds tables this store does not own '
+                               f'({", ".join(sorted(foreign)[:4])}), so it is another '
+                               f'application\'s database ({type(exc).__name__}); it was '
                                'left untouched') from exc
         if not rows:
             # Nothing recorded yet. `uninitialised` decides whether that is recoverable;

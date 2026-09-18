@@ -1721,6 +1721,38 @@ class InitialisationBoundaryTests(unittest.TestCase):
         self.assertEqual(self.tables(real), [],
                          'an interrupted initialisation left tables behind')
 
+        # Rolling back is only half of it. The pragmas applied at open write a database
+        # header, so the file is left nonempty with no tables, and `inspect` read that as a
+        # foreign store: the rollback was clean and the store could still never be reopened.
+        self.assertGreater(real.stat().st_size, 0, 'the premise is a nonempty file')
+        store = memory.Store(real, REPO)
+        self.addCleanup(store.close)
+        self.assertEqual(store.meta('repo'), REPO)
+        self.assertTrue(store.note('writer', 'finding', 'usable after a rolled-back start'))
+
+    def test_another_application_database_is_never_adopted(self):
+        """Completing initialisation must not be a way to take over any nonempty file.
+
+        The rule that lets an unfinished start be finished is "no tables this store does not
+        own", not "no metadata", so a database belonging to something else stays refused.
+        """
+        foreign = self.home/'foreign.sqlite3'
+        db = sqlite3.connect(foreign, isolation_level=None)
+        db.execute('PRAGMA auto_vacuum=INCREMENTAL')
+        db.execute('PRAGMA page_size=4096')
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT)')
+        db.execute("INSERT INTO customers(name) VALUES('someone else')")
+        db.close()
+        with self.assertRaises(memory.MemoryError_) as e:
+            memory.Store(foreign, REPO)
+        self.assertEqual(e.exception.code, 'incompatible_store')
+        self.assertIn('customers', str(e.exception))
+        db = sqlite3.connect(foreign)
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute('SELECT count(*) FROM customers').fetchone()[0], 1,
+                         'the refusal must leave the other database untouched')
+
     def test_a_store_with_tables_but_no_identity_completes_initialisation(self):
         """The state an older split initialisation could leave must be recoverable.
 
@@ -1888,3 +1920,76 @@ class ScanModeExpiryTests(Base):
             'SELECT count(*) FROM entries WHERE expires IS NOT NULL').fetchone()[0], 0)
         # And the service still answers, from the scan.
         self.assertIn('entries', self.call(op='recall', query='scan'))
+
+
+class CheckpointExceptionTests(Base):
+    """A checkpoint that raises has proved nothing, and must be treated as a failed proof."""
+
+    def raising_checkpoint(self, exc):
+        def boom(_self):
+            raise exc
+        return patch.object(memory.Store, 'log_state', boom)
+
+    def test_a_raising_checkpoint_holds_writes_until_recovery(self):
+        """Only a returned tuple used to record the block, so an exception escaped it.
+
+        `reset_log` let the exception propagate with `blocked` still unset, so once the
+        condition cleared the next write proceeded as though the log had been proved empty
+        and nobody had asked for recovery.
+        """
+        seq = self.note('before the failure')
+        with self.raising_checkpoint(sqlite3.OperationalError('disk I/O error')):
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.note('during the failure')
+            self.assertEqual(e.exception.code, 'storage_blocked')
+            self.assertIsNotNone(self.s.blocked)
+            self.assertIn('OperationalError', self.s.blocked)
+
+            # Reads stay available while writes are held.
+            self.assertIsNotNone(self.call(op='status')['blocked'])
+            found = self.call(op='recall', query='before')
+            self.assertEqual([x['seq'] for x in found['entries']], [seq])
+
+            # Recovery cannot succeed while the checkpoint still raises, and must not write.
+            pages_before = self.s.pages()
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.s.recover()
+            self.assertEqual(e.exception.code, 'storage_blocked')
+            self.assertEqual(self.s.pages(), pages_before)
+            self.assertIsNotNone(self.s.blocked)
+
+        # The condition has cleared, but the block outlives it: writes stay held until
+        # recovery is asked for explicitly.
+        with self.assertRaises(memory.MemoryError_) as e:
+            self.note('after the condition cleared')
+        self.assertEqual(e.exception.code, 'storage_blocked')
+
+        self.assertTrue(self.s.recover()['recovered'])
+        self.assertIsNone(self.s.blocked)
+        self.assertTrue(self.note('writes resume after recovery'))
+
+    def test_only_a_missing_log_proves_a_missing_log(self):
+        """A stat that fails for any other reason has not shown the log to be empty."""
+        with self.raising_checkpoint(PermissionError('write-ahead log not readable')):
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.note('while the log cannot be examined')
+            self.assertEqual(e.exception.code, 'storage_blocked')
+            self.assertIn('PermissionError', self.s.blocked)
+        self.assertTrue(self.s.recover()['recovered'])
+
+    def test_a_real_unreadable_log_directory_is_a_failed_proof(self):
+        """Drive the stat failure itself rather than only a substituted exception."""
+        self.note('seed')
+        real = memory.Store.log_state
+
+        def clean_checkpoint_unreadable_file(self_):
+            busy, log_pages, _ = real(self_)
+            # The checkpoint succeeded; the log file cannot be examined to confirm it.
+            raise PermissionError(f'cannot stat {self_.path}-wal')
+
+        with patch.object(memory.Store, 'log_state', clean_checkpoint_unreadable_file):
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.note('unverifiable')
+            self.assertEqual(e.exception.code, 'storage_blocked')
+        self.assertTrue(self.s.recover()['recovered'])
+        self.assertTrue(self.note('resumed'))
