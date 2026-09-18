@@ -36,6 +36,19 @@ covering existing user authorization and refusal of permission laundering. This 
 not change stored envelopes or the wire format. Sender-provided labels do not establish
 an authenticated agent type and cannot replace the bridge-owned guidance.
 
+## Participant guidance
+
+Despite its filename, `codex_instructions.py` manages guidance for both Codex and
+DeepSeek participants, with separate markers and setup commands. Koinon supplies the
+peer-input guidance in those managed instructions, each inbox result, and each queued
+notice. This does not depend on the participant runtime adding its own peer framing.
+
+Koinon installs no Claude instructions and adds no guidance field to outbound peer
+frames. In observed Claude Code sessions, Claude's own runtime wraps incoming peer
+messages with its peer-input framing. That is an observed internal behaviour, not a
+compatibility guarantee or proof of equivalent safeguards. Koinon does not verify that
+receiver-side framing, so a change to it would require a fresh compatibility review.
+
 ## Discovery
 
 Claude scans process records in its configured `sessions` directory. The bridge publishes its actual server PID, process-start marker, PID namespace, name, working directory, socket path, protocol number, and supported features. It retains the compatibility entrypoint `codex-peer-bridge` after the project rename to Koinon.
