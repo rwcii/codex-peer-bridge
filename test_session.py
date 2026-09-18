@@ -123,7 +123,16 @@ class SystemdStartupTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        # Reach the root through a symlink on every platform. macOS puts temporary
+        # directories under /var, which is a symlink to /private/var, so a path the
+        # runtime resolves differs there from the one the test passed in. Reproducing
+        # that on Linux too keeps the resolution expectations below honest rather than
+        # platform-dependent.
+        real = Path(temporary.name)/'real'
+        real.mkdir()
+        link = Path(temporary.name)/'link'
+        link.symlink_to(real, target_is_directory=True)
+        self.root = link
         self.app = self.root/'app'
         self.env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.root/'claude'))
         subprocess.run([sys.executable, 'scripts/install.py', '--configure-codex', '--no-start',
@@ -141,7 +150,10 @@ class SystemdStartupTests(unittest.TestCase):
         self.env['PATH'] = str(binaries)+os.pathsep+os.environ.get('PATH', '')
         self.config = session.read_config(self.app)
         self.thread = 'startup-test-thread'
-        self.repo = str(self.root/'project')
+        # `session.py` resolves --repo before recording it, so the test compares the
+        # same form. On macOS the temporary root is under /var, a symlink to
+        # /private/var, and an unresolved expectation fails there and only there.
+        self.repo = str((self.root/'project').resolve())
         self.state, _, _ = session.details(self.app, self.config, self.thread, self.repo)
         self.processes = []
         self.starts = 0
