@@ -123,6 +123,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
         server = await asyncio.start_unix_server(older_server, str(Path(self.tmp.name)/'control.sock'))
+        # Real released bridge servers make their control sockets private too.
+        os.chmod(Path(self.tmp.name)/'control.sock', 0o600)
         try:
             output = io.StringIO()
             with redirect_stdout(output):

@@ -973,7 +973,9 @@ class LifecycleTests(unittest.TestCase):
         record = memory.read_owner(self.home)
         for field, value in (('generation', 'not-the-running-one'),
                              ('socket', '/tmp/somewhere-else.sock'),
-                             ('repo', 'f'*16)):
+                             ('repo', 'f'*16),
+                             ('proc_start', None), ('proc_start', ''),
+                             ('generation', None), ('protocol', True)):
             tampered = dict(record, **{field: value})
             (self.home/'owner.json').write_text(json.dumps(tampered))
             with self.assertRaises(memory.MemoryError_) as e:

@@ -4,6 +4,7 @@ Protocol policy, request lifetimes, persistence and delivery stay with callers.
 Messaging paths remain literal for peer-token lookup. Platform differences live
 in platform_support.
 """
+import asyncio
 import hashlib
 import json
 import os
@@ -34,11 +35,9 @@ def credentials(sock):
 def target_path(address):
     """Validate a peer address and return it **unresolved**.
 
-    This applies the existing messaging-address path checks, not service-endpoint
-    validation. Do not use it to validate a service control endpoint or to prove
-    an endpoint's role: a long control path can fall back to an allowed directory
-    as `<digest>-control.sock` and pass these structural checks. Service callers
-    need their own endpoint validation and binding checks.
+    Known control endpoint names are excluded even when a long control path falls
+    back into a messaging directory. This is a messaging validator, not proof of
+    a service binding. Service callers use service_path and a verified handshake.
 
     The returned path is the literal string from the wire. `peer_token` hashes
     it to find the sender's key file, and Claude Code hashes the same literal
@@ -57,6 +56,8 @@ def target_path(address):
     # would be skipped silently. Reject it instead of normalizing it.
     if '..' in p.parts or str(p) != literal:
         raise ValueError('peer address must be in canonical literal form')
+    if p.name == 'control.sock' or p.name.endswith('-control.sock'):
+        raise ValueError('service control endpoint is not a messaging address')
     # A symlinked parent could redirect an allowlisted-looking path elsewhere,
     # so it is rejected before the resolved directory is checked.
     if p.suffix != '.sock' or p.parent.is_symlink() or p.parent.resolve() not in platform_support.allowed_socket_dirs():
@@ -92,3 +93,65 @@ def peer_token(pid, path):
     return token
 
 
+
+
+def service_path(root):
+    """Validate the control endpoint derived from an explicitly configured root.
+
+    Service roots are filesystem configuration, not peer addresses. They are not
+    discovered from peer registry claims and never use peer-token authentication.
+    A valid socket path does not prove service identity; callers must also check
+    the connected kernel PID and the service's owner/generation handshake.
+    """
+    root = Path(root)
+    if not root.is_absolute():
+        raise ValueError('service root must be absolute')
+    control = platform_support.control_socket_path(root)
+    # A client must not create directories while a service is starting. In
+    # particular, mkdir(parents=True) can create intermediate state directories
+    # with the client umask before the owner applies its private-mode policy.
+    info = control.parent.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or
+            info.st_mode & 0o077):
+        raise ValueError('service directory must be private and owned by this user')
+    if not platform_support.socket_mode_ok(control.lstat()):
+        raise ValueError('service socket must be private and owned by this user')
+    return control
+
+
+class NoControlReply(ValueError):
+    """The service closed without a response; a mutation may still have committed."""
+
+
+async def control_exchange(root, payload, timeout=10):
+    """One bounded control exchange, returning the reply and kernel peer PID.
+
+    The timeout covers connection, request writing and response reading. Cleanup
+    gets its own one-second allowance, then aborts a stuck transport. No reply is
+    not proof of rollback. The caller owns protocol and service identity checks.
+    """
+    path = service_path(root)
+    data = encode(payload)
+    writer = None
+    try:
+        async with asyncio.timeout(timeout):
+            reader, writer = await asyncio.open_unix_connection(str(path), limit=LIMIT)
+            pid = credentials(writer.get_extra_info('socket'))
+            writer.write(data)
+            await writer.drain()
+            line = await reader.readline()
+            if not line:
+                raise NoControlReply('service closed without a reply')
+            if len(line) > LIMIT:
+                raise ValueError('frame too large')
+            reply = json.loads(line)
+            if not isinstance(reply, dict):
+                raise ValueError('expected control response object')
+            return reply, pid
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), 1)
+            except (OSError, TimeoutError):
+                writer.transport.abort()

@@ -7,6 +7,9 @@ into a dated release section when promoted to `main`.
 
 ### Added
 
+- Separate control endpoint validation and bounded exchanges for bridge and memory
+  clients. Control sockets are excluded from generic messaging and discovery; memory
+  reuse verifies the connected process, its start marker and current generation.
 - Account-local notifier ownership across state directories. Duplicate provider/session
   targets fail before registration; conflict diagnostics and session status expose a
   matching digest. Persistent Koinon lock paths do not depend on agent home overrides,

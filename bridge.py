@@ -16,7 +16,7 @@ import uuid
 from peer_guidance import PEER_GUIDANCE
 import platform_support
 
-from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path
+from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange
 DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge')
 
 
@@ -222,27 +222,17 @@ class Bridge:
 
 async def client(root, request):
     control = platform_support.control_socket_path(root)
-    private_dir(control.parent)
     try:
-        r, w = await asyncio.open_unix_connection(str(control), limit=LIMIT)
+        result, _pid = await control_exchange(root, request)
     except (ConnectionRefusedError, FileNotFoundError) as exc:
-        # A leftover socket from a killed instance is the first thing a user meets,
-        # so report it plainly rather than as a traceback.
+        # Keep the existing CLI diagnostic for a missing or stale endpoint.
         raise SystemExit(f'no bridge is running for {root} (nothing is listening on {control})') from exc
-    try:
-        credentials(w.get_extra_info('socket'))
-        w.write(encode(request))
-        await w.drain()
-        result = json.loads(await asyncio.wait_for(r.readline(), 10))
-        if request['op'] == 'inbox' and result.get('ok'):
-            # Also protect reads from servers started before a runtime upgrade.
-            for entry in result['result']:
-                entry['guidance'] = PEER_GUIDANCE
-        print(json.dumps(result, indent=2))
-        return 0 if result['ok'] else 1
-    finally:
-        w.close()
-        await w.wait_closed()
+    if request['op'] == 'inbox' and result.get('ok'):
+        # Also protect reads from servers started before a runtime upgrade.
+        for entry in result['result']:
+            entry['guidance'] = PEER_GUIDANCE
+    print(json.dumps(result, indent=2))
+    return 0 if result['ok'] else 1
 
 
 def main():

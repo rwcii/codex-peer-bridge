@@ -39,6 +39,7 @@ import uuid
 
 from peer_transport import LIMIT, credentials, encode, private_dir
 import platform_support
+from peer_transport import control_exchange, NoControlReply
 
 PROTOCOL = 1
 SCHEMA = 3
@@ -1721,7 +1722,8 @@ def write_owner(home, sock_path, generation, repo):
 
 def read_owner(home):
     try:
-        return json.loads((Path(home) / 'owner.json').read_text())
+        value = json.loads((Path(home) / 'owner.json').read_text())
+        return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         return None
 
@@ -1745,22 +1747,11 @@ def owner_is_dead(owner):
 
 
 async def request(root, payload, timeout=10):
-    control = platform_support.control_socket_path(Path(root))
-    r, w = await asyncio.open_unix_connection(str(control), limit=LIMIT)
     try:
-        credentials(w.get_extra_info('socket'))
-        w.write(encode(payload))
-        await w.drain()
-        line = await asyncio.wait_for(r.readline(), timeout)
-        if not line:
-            raise MemoryError_('no_reply', 'the service closed the connection without replying')
-        return json.loads(line)
-    finally:
-        w.close()
-        try:
-            await w.wait_closed()
-        except OSError:
-            pass
+        reply, _pid = await control_exchange(Path(root), payload, timeout)
+        return reply
+    except NoControlReply:
+        raise MemoryError_('no_reply', 'the service closed the connection without replying') from None
 
 
 async def verify_running(root, repo):
@@ -1771,13 +1762,14 @@ async def verify_running(root, repo):
     between the answer and the durable ownership record.
     """
     try:
-        reply = await request(root, dict(op='hello'), timeout=5)
+        reply, connected_pid = await control_exchange(Path(root), dict(op='hello'), timeout=5)
     except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
         return None
     result = reply.get('result') if reply.get('ok') else None
     if not isinstance(result, dict) or result.get('service') != 'codex-peer-memory':
         return None
-    if result.get('repo') != repo or result.get('protocol') != PROTOCOL:
+    if (result.get('repo') != repo or type(result.get('protocol')) is not int or
+            result['protocol'] != PROTOCOL):
         raise MemoryError_('foreign_service', 'another service holds this socket; refusing to reuse it')
     if not result.get('healthy'):
         raise MemoryError_('unhealthy_service', 'the running service reports an unhealthy store')
@@ -1789,6 +1781,18 @@ async def verify_running(root, repo):
         raise MemoryError_('unknown_owner',
                            'a service is listening with no ownership record; stop it explicitly '
                            'before reusing this state directory')
+    if (type(owner.get('pid')) is not int or type(result.get('pid')) is not int or
+            owner['pid'] != connected_pid or result['pid'] != connected_pid):
+        raise MemoryError_('ownership_mismatch', 'the connected process does not match the recorded service')
+    if type(owner.get('protocol')) is not int:
+        raise MemoryError_('ownership_mismatch', 'the recorded protocol is invalid')
+    generation = owner.get('generation')
+    if (not isinstance(generation, str) or len(generation) != 32 or
+            any(c not in '0123456789abcdef' for c in generation)):
+        raise MemoryError_('ownership_mismatch', 'the service has no valid recorded generation')
+    marker = owner.get('proc_start')
+    if not isinstance(marker, str) or not marker.strip():
+        raise MemoryError_('ownership_mismatch', 'the service has no recorded process-start marker')
     checks = (('repo', owner.get('repo'), repo),
               ('protocol', owner.get('protocol'), PROTOCOL),
               ('socket', owner.get('socket'), str(control)),

@@ -51,6 +51,21 @@ messages with its peer-input framing. That is an observed internal behaviour, no
 compatibility guarantee or proof of equivalent safeguards. Koinon does not verify that
 receiver-side framing, so a change to it would require a fresh compatibility review.
 
+## Endpoint roles
+
+Messaging validation rejects `control.sock` and `*-control.sock`, including short
+control paths placed in the peer socket directory. These endpoints do not appear in
+`bridge.py peers` and cannot be used by `bridge.py send`. A control client derives its
+endpoint from an explicitly configured state root and checks the directory and socket
+ownership and modes without creating directories. Control replies use the same bounded
+JSON framing as peer messages; a missing reply does not prove that a mutation rolled back.
+
+These path checks do not authenticate a service role. Memory-service reuse additionally
+requires agreement between the connected kernel PID, the hello response and the owner
+record, with a present matching process-start marker and a valid current generation.
+Messaging addresses remain literal for peer-key lookup; service roots are filesystem
+configuration and do not use peer tokens.
+
 ## Discovery
 
 Claude scans process records in its configured `sessions` directory. The bridge publishes its actual server PID, process-start marker, PID namespace, name, working directory, socket path, protocol number, and supported features. It retains the compatibility entrypoint `codex-peer-bridge` after the project rename to Koinon.
