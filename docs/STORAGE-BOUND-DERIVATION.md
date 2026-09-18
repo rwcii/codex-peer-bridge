@@ -306,6 +306,7 @@ asserted by a test in `test_memory.StorageBoundTests`:
 | The log holds nothing before a commit | `test_the_log_holds_nothing_before_a_commit` |
 | Frames never exceed dirty pages plus the padding bound | `test_frames_never_exceed_dirty_pages_plus_the_padding_bound` |
 | Each part of the reset conjunction refuses on its own | `test_a_reset_that_did_not_happen_is_reported_not_assumed` |
+| Admission never admits an append enforcement will refuse | `test_admission_never_admits_an_append_that_enforcement_will_refuse` |
 | A clean reset leaves no log | `test_a_clean_reset_leaves_no_log` |
 | The engine ceiling rolls back whole, integrity intact | `test_the_engine_ceiling_rolls_back_whole_with_integrity_intact` |
 | A build without in-memory temporaries is refused | `test_a_build_without_in_memory_temporaries_is_refused` |
@@ -357,9 +358,17 @@ actually running, and the pages above it are unreachable by ordinary writes:
 | `RESERVE_PAGES` | 2048 | 8.00 MiB |
 | `ORDINARY_MAX_PAGES` | 14280 | 55.78 MiB |
 
-`Store.admit` refuses an ordinary append unless the pages already allocated are below
-`ORDINARY_MAX_PAGES`, and `Store.enforce_pages` re-reads the count **inside** the
-transaction and raises on a breach, which rolls the transaction back. A control or progress
+`Store.admit` and `Store.enforce_pages` share one effective limit through
+`Store.page_cap`, and admission additionally leaves `APPEND_ALLOWANCE` pages for the growth
+one append can cause. Enforcement re-reads the count **inside** the transaction and raises
+on a breach, which rolls the transaction back.
+
+**Both thresholds must subtract the commit-time allocation, not just one.** While only
+enforcement did, a store resting between the two figures admitted every append and rolled
+every one back -- which presents to a caller as a store that accepts writes and loses them.
+`APPEND_ALLOWANCE` is 8 pages, derived as at most one b-tree leaf and two overflow pages for
+a body at `MAX_BODY`, its index rows, and a pointer-map page. With it, admission refuses
+first and enforcement becomes the backstop it is meant to be rather than the usual path. A control or progress
 transition is checked against `MAX_PAGES` instead, which is what lets it draw on the
 reserve. The engine holds `max_page_count` at `MAX_PAGES` underneath both, so the ceiling
 does not depend on either check being correct.

@@ -242,11 +242,14 @@ class WriteTests(Base):
                 self.s.set_meta('probe-at-the-bound', '1')
             self.assertEqual(self.s.meta('probe-at-the-bound'), '1')
 
-            # Recovery: expire the bulk, reclaim, and prove the pages return and are
-            # reusable under the same ceiling.
+            # Recovery: expire nearly everything, reclaim, and prove the pages return and
+            # are reusable under the same ceiling. Expiring almost all of it rather than
+            # half keeps the assertion independent of how much a particular SQLite build
+            # returns in one incremental vacuum, which differs between builds and is not
+            # something this design may depend on.
             at_bound = self.s.pages()
             self.s.db.execute('UPDATE entries SET expires=? WHERE seq IN (%s)'
-                              % ','.join(str(x) for x in written[:len(written)//2]),
+                              % ','.join(str(x) for x in written[:-5]),
                               (time.time()-1,))
             self.s.db.commit()
             self.s.reclaim()
@@ -1218,6 +1221,40 @@ class StorageBoundTests(Base):
         finally:
             self.s.db = real
             Path(str(self.s.path) + '-wal').unlink(missing_ok=True)
+
+    def test_admission_never_admits_an_append_that_enforcement_will_refuse(self):
+        """The two thresholds must be the same one, or a full store spins.
+
+        Admission compares the pages already allocated; enforcement re-reads the count
+        inside the transaction against a limit reduced by the commit-time allocation. While
+        only enforcement subtracted it, a store resting in the gap admitted every append and
+        rolled every one back, which reads to a caller as a store that accepts writes and
+        loses them.
+        """
+        for body_len in (200, 4000, 8000):
+            with self.subTest(body=body_len):
+                # A fresh store for each size, so a size is never measured against a store
+                # the previous size already filled.
+                store = memory.Store(self.home/f'window-{body_len}.sqlite3', REPO)
+                self.addCleanup(store.close)
+                ceiling = store.pages() + 400
+                with patch.object(memory, 'MAX_PAGES', ceiling), \
+                     patch.object(memory, 'ORDINARY_MAX_PAGES', ceiling - 80), \
+                     patch.object(memory, 'MAX_ENTRIES', 100_000), \
+                     patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40):
+                    for _ in range(40_000):
+                        try:
+                            store.note('writer', 'decision', 'x' * body_len)
+                        except memory.MemoryError_ as exc:
+                            self.assertEqual(exc.code, 'capacity')
+                            # Admission refused it. Enforcement refusing instead would mean
+                            # the transaction ran and was rolled back for want of room.
+                            self.assertNotIn('would leave', str(exc),
+                                             'an admitted append was refused by enforcement')
+                            break
+                    else:
+                        self.fail('growth was never bounded')
+                    self.assertLessEqual(store.pages(), ceiling - 80)
 
     def test_a_clean_reset_leaves_no_log(self):
         self.note('something to log')

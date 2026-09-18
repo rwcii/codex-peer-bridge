@@ -115,6 +115,12 @@ ORDINARY_MAX_PAGES = MAX_PAGES - RESERVE_PAGES
 # is one page for an ordinary append; the bound allows for crossing a boundary as well.
 PTRMAP_COVERAGE = PAGE_SIZE // 5
 COMMIT_SLACK = 2
+# The most pages one ordinary append can add: at most one b-tree leaf and two overflow
+# pages for a body at MAX_BODY, its index rows, and a pointer-map page. Admission leaves
+# this much room so that a write it admits is not certain to be refused by enforcement.
+# Without it the two thresholds disagreed, and a store sitting in the gap admitted every
+# append and then rolled every one of them back.
+APPEND_ALLOWANCE = 8
 
 # Lifetimes. Every retained record has one, and expiry returns a defined recovery
 # result rather than silently changing a caller's meaning.
@@ -336,6 +342,15 @@ class Store:
     def pages(self):
         """Durable pages allocated. This is what admission compares, and nothing else."""
         return self.db.execute('PRAGMA page_count').fetchone()[0]
+
+    @staticmethod
+    def page_cap(control):
+        """The one effective page limit, so admission and enforcement cannot disagree.
+
+        Both must subtract the commit-time allocation. When only enforcement did, a store
+        resting between the two figures admitted every append and rolled every one back.
+        """
+        return (MAX_PAGES if control else ORDINARY_MAX_PAGES) - COMMIT_SLACK
 
     def reset_log(self):
         """Return the log to zero before a write, and prove it rather than assume it.
@@ -632,7 +647,7 @@ class Store:
         A control or progress transition may draw on the reserve; an ordinary append may
         not, which is what keeps a withdrawal possible at a full store.
         """
-        cap = (MAX_PAGES if control else ORDINARY_MAX_PAGES) - COMMIT_SLACK
+        cap = self.page_cap(control)
         actual = self.pages()
         if actual > cap:
             raise MemoryError_('capacity',
@@ -655,13 +670,13 @@ class Store:
             use = self.usage()
             entry_cap = MAX_ENTRIES if control else MAX_ENTRIES - RESERVED_ENTRIES
             byte_cap = MAX_LOGICAL_BYTES if control else MAX_LOGICAL_BYTES - RESERVED_BYTES
-            page_cap = MAX_PAGES if control else ORDINARY_MAX_PAGES
-            # Pages already allocated are compared directly. There is no margin term: the
-            # log is not in this comparison, and the end-of-transaction check is what
-            # catches the growth a projection cannot predict.
+            # The same effective limit enforcement uses, less the room one append can
+            # need. The log is not in this comparison at all; the end-of-transaction check
+            # is what catches growth a projection cannot predict.
+            cap = self.page_cap(control) - (0 if control else APPEND_ALLOWANCE)
             pages = self.pages()
             if (use['entries'] + slots <= entry_cap and use['logical'] + need <= byte_cap
-                    and pages < page_cap):
+                    and pages <= cap):
                 return use
             if attempt == 0:
                 self.reclaim()
