@@ -10,6 +10,8 @@ into a dated release section when promoted to `main`.
 - Dedicated bridge and memory database workers with bounded queues, separate control
   admission, and shutdown that settles accepted writes even after caller cancellation.
   Status reports observed storage and programming faults separately from input refusals.
+  Memory startup distinguishes a busy, unresponsive or invalid service from an absent
+  listener and refuses replacement before constructing another database owner.
 
 - Separate control endpoint validation and bounded exchanges for bridge and memory
   clients. Control sockets are excluded from generic messaging and discovery; memory

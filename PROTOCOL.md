@@ -61,6 +61,11 @@ ownership and modes without creating directories. Control replies use the same b
 JSON framing as peer messages; a missing reply does not prove that a mutation rolled back.
 An endpoint that fails its permission or metadata checks reports `unsafe_service_endpoint`;
 it is not treated as an absent memory service or a reason to start a replacement.
+Memory reuse likewise distinguishes `service_busy`, `service_unresponsive`,
+`service_unavailable`, `service_refused` and `invalid_service_response` from an absent
+listener. A connected service with another identity is `foreign_service`. These results
+refuse a replacement start; only a missing or refused connection takes the absent-listener
+path, which still requires the existing ownership checks before binding.
 
 These path checks do not authenticate a service role. Memory-service reuse additionally
 requires agreement between the connected kernel PID, the hello response and the owner

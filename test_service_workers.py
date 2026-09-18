@@ -74,6 +74,11 @@ class ServiceWorkerTests(unittest.IsolatedAsyncioTestCase):
                 await until(lambda: service.admission.counts['ordinary'] == i+1)
             extra = await memory.request(self.root, dict(op='hello'))
             self.assertEqual(extra['code'], 'capacity')
+            factories = []
+            with self.assertRaises(memory.MemoryError_) as caught:
+                await asyncio.to_thread(memory.start, self.root, REPO, lambda: factories.append(True))
+            self.assertEqual(caught.exception.code, 'service_busy')
+            self.assertEqual(factories, [])
             status = asyncio.create_task(memory.request(self.root, dict(op='status')))
             await until(lambda: service.admission.counts['control'] == 1)
             wrong = await memory.request(self.root, dict(op='stop', repo=REPO, generation='wrong'))
@@ -260,3 +265,44 @@ class ServiceWorkerTests(unittest.IsolatedAsyncioTestCase):
             await service.worker.close()
             sock.close()
             memory.release(self.root, control, service.generation)
+
+    async def test_handshake_timeout_does_not_mean_service_is_absent(self):
+        gate = asyncio.Event()
+        async def stalled(reader, writer):
+            try:
+                await reader.readline()
+                await gate.wait()
+            finally:
+                await close_writer(writer)
+        await self.listen(stalled)
+        exchange = memory.control_exchange
+        async def short_exchange(root, payload, timeout):
+            return await exchange(root, payload, timeout=.05)
+        try:
+            with mock.patch.object(memory, 'control_exchange', short_exchange):
+                with self.assertRaises(memory.MemoryError_) as caught:
+                    await memory.verify_running(self.root, REPO)
+            self.assertEqual(caught.exception.code, 'service_unresponsive')
+        finally:
+            gate.set()
+
+    async def test_connected_invalid_or_refused_handshake_is_not_absence(self):
+        response = {}
+        async def answer(reader, writer):
+            try:
+                await reader.readline()
+                writer.write(bridge.encode(response))
+                await writer.drain()
+            finally:
+                await close_writer(writer)
+        await self.listen(answer)
+        for reply, code in ((dict(ok=False, code='rejected'), 'service_refused'),
+                            (dict(ok=True, result={}), 'foreign_service'),
+                            (dict(ok=True, result=[]), 'invalid_service_response'),
+                            (dict(ok='yes', result={}), 'invalid_service_response')):
+            response.clear()
+            response.update(reply)
+            with self.subTest(code=code, reply=reply):
+                with self.assertRaises(memory.MemoryError_) as caught:
+                    await memory.verify_running(self.root, REPO)
+                self.assertEqual(caught.exception.code, code)

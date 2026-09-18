@@ -1814,11 +1814,23 @@ async def verify_running(root, repo):
         reply, connected_pid = await control_exchange(Path(root), dict(op='hello'), timeout=5)
     except UnsafeServiceEndpoint as exc:
         raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
-    except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
+    except (ConnectionRefusedError, FileNotFoundError):
         return None
-    result = reply.get('result') if reply.get('ok') else None
-    if not isinstance(result, dict) or result.get('service') != 'codex-peer-memory':
-        return None
+    except TimeoutError:
+        raise MemoryError_('service_unresponsive', 'the service did not complete its handshake; no replacement was started') from None
+    except OSError:
+        raise MemoryError_('service_unavailable', 'the service endpoint could not be contacted; no replacement was started') from None
+    except ValueError:
+        raise MemoryError_('invalid_service_response', 'the service did not return a valid handshake; no replacement was started') from None
+    if reply.get('ok') is False:
+        if reply.get('code') == 'capacity':
+            raise MemoryError_('service_busy', 'the service is at request capacity; retry after pending work settles')
+        raise MemoryError_('service_refused', 'the listening service refused its handshake; no replacement was started')
+    result = reply.get('result') if reply.get('ok') is True else None
+    if not isinstance(result, dict):
+        raise MemoryError_('invalid_service_response', 'the service did not return a valid handshake; no replacement was started')
+    if result.get('service') != 'codex-peer-memory':
+        raise MemoryError_('foreign_service', 'another service holds this socket; refusing to reuse it')
     if (result.get('repo') != repo or type(result.get('protocol')) is not int or
             result['protocol'] != PROTOCOL):
         raise MemoryError_('foreign_service', 'another service holds this socket; refusing to reuse it')
