@@ -17,6 +17,7 @@ from database_worker import DatabaseWorker, CapacityError, WorkerFailure
 from service_runtime import Admission, close_writer, drain_handlers, database_status, HANDSHAKE_TIMEOUT
 from peer_guidance import PEER_GUIDANCE
 import platform_support
+import inbox_schema
 
 from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange, UnsafeServiceEndpoint, NoControlReply
 DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge')
@@ -71,7 +72,7 @@ class InboxStore:
     def __init__(self, root):
         self.db = sqlite3.connect(root / 'inbox.sqlite3')
         try:
-            self.db.execute('CREATE TABLE IF NOT EXISTS inbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, received REAL, pid INTEGER, frame TEXT)')
+            inbox_schema.initialize(self.db)
         except BaseException:
             self.db.close()
             raise
@@ -100,7 +101,12 @@ class InboxStore:
     def command(self, r):
         op = r['op']
         if op == 'status':
-            return self.db.execute('SELECT count(*) FROM inbox').fetchone()[0]
+            with inbox_schema.transaction(self.db, write=False):
+                state = inbox_schema.metadata(self.db)
+                count = self.db.execute('SELECT count(*) FROM inbox').fetchone()[0]
+            return dict(inbox_count=count, inbox_schema=state['schema'],
+                        ack_through=state['ack_through'], journal_activation=state['journal_activation'],
+                        capabilities=list(inbox_schema.CAPABILITIES))
         if op == 'inbox':
             rows = self.db.execute('SELECT seq,received,pid,frame FROM inbox WHERE seq>? ORDER BY seq LIMIT 10', (int(r.get('after', 0)),)).fetchall()
             entries = []
@@ -112,9 +118,9 @@ class InboxStore:
                 entries.append(item)
             return entries
         if op == 'ack':
-            with self.db:
-                self.db.execute('DELETE FROM inbox WHERE seq<=?', (int(r['through']),))
-            return 'acknowledged locally'
+            return inbox_schema.acknowledge(self.db, r['through'])
+        if op in ('activate-notification-journal', 'rebuild-notification-journal-activation'):
+            return inbox_schema.activate(self.db, r)
         raise ValueError('unknown database operation')
 
 
@@ -123,6 +129,7 @@ class Bridge:
         self.root = root
         self.address = f'uds:/tmp/cc-socks/{os.getpid()}.sock'
         self.stop = asyncio.Event()
+        self.generation = uuid.uuid4().hex
         # Construction must not open or migrate a database before endpoint ownership.
         self.worker = None
         self.admission = Admission()
@@ -219,9 +226,12 @@ class Bridge:
             raise ValueError('expected operation object')
         op = r['op']
         if op == 'status':
-            count, diagnostics = await database_status(self.worker, r)
-            return dict(pid=os.getpid(), address=self.address, inbox_count=count,
-                        **diagnostics,
+            state, diagnostics = await database_status(self.worker, r)
+            if state is None:
+                state = dict(inbox_count=None, inbox_schema=None, ack_through=None,
+                             journal_activation=None, capabilities=[])
+            return dict(pid=os.getpid(), address=self.address, generation=self.generation,
+                        **state, **diagnostics,
                         delivery='inbox available; run notify.py to notify the selected participant session')
         if op == 'send':
             return await self.send(r.get('to'), r.get('message'), r.get('priority', 'next'))
@@ -229,11 +239,17 @@ class Bridge:
             if op == 'ack' and 'through' not in r:
                 raise ValueError('through is required')
             key = 'after' if op == 'inbox' else 'through'
-            try:
-                request = dict(r, **{key: int(r.get(key, 0))})
-            except (ValueError, TypeError):
-                raise ValueError(f'{key} must be an integer') from None
+            value = r.get(key, 0)
+            if isinstance(value, str) and value.isascii() and value.isdecimal():
+                value = int(value)
+            if type(value) is not int or value < 0:
+                raise ValueError(f'{key} must be a nonnegative integer')
+            if op == 'inbox':
+                value = min(value, inbox_schema.MAX_SEQUENCE)
+            request = dict(r, **{key: value})
             return await self.worker.call('command', request)
+        if op in ('activate-notification-journal', 'rebuild-notification-journal-activation'):
+            return await self.worker.call('command', r)
         if op == 'stop':
             self.stop.set()
             return 'stopping'
@@ -372,6 +388,13 @@ def cli_main():
     s.add_argument('--after', type=int, default=0)
     s = sub.add_parser('ack')
     s.add_argument('through', type=int)
+    for op in ('activate-notification-journal', 'rebuild-notification-journal-activation'):
+        s = sub.add_parser(op)
+        s.add_argument('--target-digest', required=True)
+        s.add_argument('--nonce', required=True)
+        if op.startswith('rebuild-'):
+            s.add_argument('--expected-previous-nonce', required=True)
+            s.add_argument('--accept-history-loss', action='store_true', required=True)
     a = vars(p.parse_args())
     root = Path(a.pop('state_dir')).absolute()
     startup_directory(root)
@@ -386,6 +409,15 @@ def cli_main():
 def main():
     try:
         cli_main()
+    except inbox_schema.InboxSchemaError as exc:
+        print(json.dumps(dict(ok=False, code='incompatible_inbox', error=str(exc))))
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None
+    except sqlite3.ProgrammingError:
+        print(json.dumps(dict(ok=False, code='internal_error', error='inbox initialization failed')))
+        raise SystemExit(platform_support.SOFTWARE_EXIT_STATUS) from None
+    except sqlite3.DatabaseError:
+        print(json.dumps(dict(ok=False, code='storage_error', error='inbox storage is unavailable')))
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None
     except BridgeOwnershipError as exc:
         print(json.dumps(dict(ok=False, code='endpoint_unavailable', error=str(exc))))
         raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None

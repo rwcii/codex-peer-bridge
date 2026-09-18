@@ -21,12 +21,15 @@ class InstallTests(unittest.TestCase):
     def test_ownership_refusals_do_not_restart_bridge_or_notifier_services(self):
         args = (Path('/app'), Path('/state'), 'target', 'peer', '/repo',
                 '/usr/bin/python3', '/bin/codex')
-        legacy = installer.units(*args).values()
+        legacy = installer.units(*args)
         supervised = next(iter(installer.units(*args, instance='a'*16).values()))
-        for unit in (*legacy, supervised):
-            self.assertIn('\nRestartPreventExitStatus=78\n', unit)
+        for name, unit in (*legacy.items(), ('supervisor', supervised)):
+            excluded = next(line.split('=',1)[1].split() for line in unit.splitlines()
+                            if line.startswith('RestartPreventExitStatus='))
+            self.assertEqual(set(excluded), {'70','78'})
+            self.assertNotIn('75', excluded)
             self.assertIn('\nRestart=on-failure\n', unit)
-            self.assertNotIn('\nSuccessExitStatus=78\n', unit)
+            self.assertNotIn('SuccessExitStatus=', unit)
 
     def test_unrelated_unit_refused(self):
         with tempfile.TemporaryDirectory() as temp:

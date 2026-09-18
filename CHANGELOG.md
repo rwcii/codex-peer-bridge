@@ -7,6 +7,11 @@ into a dated release section when promoted to `main`.
 
 ### Added
 
+- Inbox schema 2 with atomic migration, a bounded acknowledgement watermark and
+  durable journal activation evidence. Status advertises only those implemented
+  capabilities. Bridge software faults preserve exit 70 through the supervisor and
+  stop automatic restarts. Subscription, binding and notifier-journal delivery remain pending.
+
 - Bridge startup reserves both socket paths before opening the inbox and retains
   ownership until database shutdown completes. Endpoint refusal exits 78 without
   changing the store. Directory ownership refusals use the same status, and both

@@ -62,7 +62,8 @@ path in a JSON diagnostic on stdout and exits with status 78. For example
 ```
 
 On Linux, installed systemd bridge and session services prevent automatic restart
-on exit 78. On macOS, this refusal ends the manually started process; after
+on exit 70 (internal software error) or 78 (configuration refusal). On macOS,
+these errors end the manually started process; after
 correcting the path, start it again with the command described in the
 [macOS setup](#macos). The macOS leftover-socket note at the end of this recovery
 section also applies. An unsafe startup directory also reports this refusal. Correct the named path
@@ -390,3 +391,31 @@ only confirmed bridge units before migration.
 - **Custom Claude home:** set `CLAUDE_CONFIG_DIR` consistently for the supervisor. For
   systemd use a service override with `Environment=CLAUDE_CONFIG_DIR=/your/path`.
 - **Inbox full:** read and acknowledge handled entries; the limit is 1,000 records.
+
+## Inbox schema upgrade
+
+Schema 2 migrates on bridge startup after exclusive socket reservation. Stop the old
+bridge and notifier together, install the new runtime at the existing target and paths,
+and restart both. Apply the same sequence to manual macOS processes. An installation
+with `--no-start` does not upgrade running processes. Preserve the inbox and legacy
+notification checkpoint; do not reset either to activate the schema.
+
+Do not run an older bridge against a schema-2 inbox after activation: its `ack` operation
+does not maintain the new watermark. Restore a consistent pre-upgrade backup for a
+rollback instead of mixing runtime and metadata versions. The schema change preserves
+ordinary-reader compatibility but does not itself implement a notifier journal or
+upgrade an old notifier to the new delivery protocol. Bindings and subscriptions also
+remain pending. The explicit bridge activation controls store evidence only; they are
+not a substitute for the planned stopped-notifier rebuild procedure.
+
+Migration and acknowledgements use SQLite transactions. Process-termination tests
+verify rollback and retry; they do not establish power-loss durability on every
+filesystem. Keep the existing state and checkpoint backups when upgrading.
+
+Inbox startup storage failures, including a lock that outlasts SQLite's finite
+busy timeout, exit 78. This deliberately requires inspection and an explicit restart;
+it does not classify every SQLite operational error as retryable. Do not assume
+that a storage failure means the migration or a prior mutation was lost.
+The supervisor preserves bridge exit codes 70 and 78 through each startup phase
+and its running loop. All installer-managed units exclude both permanent statuses
+70 and 78 from automatic restart, while 75 remains retryable.

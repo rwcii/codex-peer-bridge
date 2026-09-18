@@ -16,7 +16,7 @@ import platform_support
 MARKER = '# Managed by codex-peer-bridge\n'
 SERVICES = ('codex-peer-notify.service', 'codex-peer-bridge.service')
 
-FILES = ('database_worker.py', 'service_runtime.py', 'participant_lock.py', 'peer_transport.py', 'peer_guidance.py', 'CHANGELOG.md', 'memory.py', 'session.py', 'codex_instructions.py', 'platform_support.py', 'dsh_delivery.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md', 'docs/PARITY-MEMORY-DESIGN.md')
+FILES = ('inbox_schema.py', 'database_worker.py', 'service_runtime.py', 'participant_lock.py', 'peer_transport.py', 'peer_guidance.py', 'CHANGELOG.md', 'memory.py', 'session.py', 'codex_instructions.py', 'platform_support.py', 'dsh_delivery.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md', 'docs/PARITY-MEMORY-DESIGN.md')
 
 
 def unit_arg(value):
@@ -44,10 +44,10 @@ def units(prefix, state, thread, name, repo, python, codex, instance=None,
     else:
         watcher += ['--codex', codex]
     common = '\nRestart=on-failure\nRestartSec=5\nUMask=0077\n\n[Install]\nWantedBy=default.target\n'
-    owned = f'\nRestartPreventExitStatus={platform_support.CONFIGURATION_EXIT_STATUS}'
+    permanent = '\nRestartPreventExitStatus=' + ' '.join(map(str, platform_support.PERMANENT_EXIT_STATUSES))
     rendered = {
-        'codex-peer-bridge.service': MARKER + '[Unit]\nDescription=Local Codex peer messaging bridge\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,base)) + owned + common,
-        'codex-peer-notify.service': MARKER + '[Unit]\nDescription=Codex peer inbox notifications\nRequires=codex-peer-bridge.service\nAfter=codex-peer-bridge.service\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,watcher)) + owned + common,
+        'codex-peer-bridge.service': MARKER + '[Unit]\nDescription=Local Codex peer messaging bridge\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,base)) + permanent + common,
+        'codex-peer-notify.service': MARKER + '[Unit]\nDescription=Codex peer inbox notifications\nRequires=codex-peer-bridge.service\nAfter=codex-peer-bridge.service\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,watcher)) + permanent + common,
     }
 
     if instance:
@@ -57,7 +57,7 @@ def units(prefix, state, thread, name, repo, python, codex, instance=None,
         supervisor = start_command_for(python, prefix, thread, repo, agent, model)
         rendered = {f'codex-peer-session-{instance}.service': MARKER +
                     '[Unit]\nDescription=Codex peer session supervisor\n\n[Service]\nType=simple\nExecStart=' +
-                    ' '.join(map(unit_arg,supervisor)) + owned + common}
+                    ' '.join(map(unit_arg,supervisor)) + permanent + common}
     return rendered
 
 

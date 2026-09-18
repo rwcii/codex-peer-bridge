@@ -1,6 +1,6 @@
 # Stage 4 implementation design for review
 
-Status: all five concrete design gates accepted in independent review. Shared helper extraction and participant ownership are implemented; remaining stage 4 components are pending. No stage 4 runtime changes are deployed.
+Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented in the current candidate, pending review. Subscriptions, bindings/pointers and the notifier journal remain pending. No stage 4 runtime changes are deployed.
 Baseline: develop 84f35e727b0f17a9469de182db9a843e7a28d092, integrated by signed merge 7503dc1.
 Codex is the sole driver. Claude is the reviewer. The merged baseline was independently verified. Implementation branch: feature/shared-transport-delivery.
 
@@ -419,3 +419,13 @@ Tests delete marker and journal together while retaining the inbox and legacy cu
 then require explicit recovery with no automatic provider call. They also crash before
 and after bridge activation, lose its reply, and test same-pair retry, target mismatch,
 and refused nonce replacement outside accepted rebuild.
+
+### Schema-2 candidate wire names
+
+The implemented activation capability is `notification_journal_activation`.
+Its normal control is `activate-notification-journal`; explicit evidence replacement
+uses `rebuild-notification-journal-activation` with `expected_previous_nonce` and
+`accept_history_loss: true`, preserving the target. These are bridge-side operations;
+the planned notifier rebuild must still enforce stopped ownership and local evidence
+before invoking replacement. The current candidate does not implement that notifier
+workflow or advertise bindings/subscriptions.

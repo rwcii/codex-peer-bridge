@@ -207,8 +207,55 @@ Control timeouts, lost replies, transport failures and invalid replies produce
 structured CLI errors and exit 1. A failed reply does not establish whether a
 mutation committed. The CLI does not automatically repeat that mutation.
 
-On Linux, installed systemd bridge and session services do not restart on exit 78.
+On Linux, installed systemd bridge and session services do not restart on exit 70
+(internal software error) or 78 (configuration refusal).
 On macOS, the manual process exits and must be started again after correction; see
 [macOS setup](docs/INSTALL.md#macos). For a leftover socket, follow [recovery from a killed instance](docs/INSTALL.md#recovering-from-a-killed-instance).
 Remove a socket only after verifying that its owner is dead. Unsafe startup
 directories also produce a structured ownership refusal with exit 78.
+
+## Inbox schema 2 and journal activation
+
+The bridge migrates its inbox in one explicit `BEGIN IMMEDIATE` transaction after
+reserving both endpoints and before listening. Existing rows and AUTOINCREMENT
+allocation are preserved. Rows gain `kind` (initially `peer`) and nullable `binding`.
+A fixed-key `inbox_meta` table stores JSON values for `schema`, `ack_through`, and
+`journal_activation`. Initial values are 2, 0 and null. No historical acknowledgement
+is inferred. The inbox keeps its journal mode; migration does not enable WAL.
+
+`ack` deletes rows and updates the monotone `ack_through` value in the same explicit
+write transaction. The requested position is clamped to the allocated inbox head
+read from `sqlite_sequence` within that transaction. A never-used inbox has head
+zero. This prevents a large acknowledgement from covering future arrivals. Neither
+peer receipt nor notification delivery acknowledges the inbox or a memory consumer.
+
+Status includes a per-process 32-hex `generation`, `inbox_schema`, `ack_through`,
+`journal_activation`, and `capabilities`. This component implements only
+`inbox_ack_watermark` and `notification_journal_activation`. Their advertisement
+requires a successful read of validated committed metadata. Unavailable or corrupt
+metadata produces database diagnostics, null database fields and no capabilities;
+it is never substituted with legacy defaults. Incompatible startup metadata exits
+78 as `incompatible_inbox`; other SQLite storage failures exit 78 as `storage_error`.
+SQLite programming errors exit 70 as `internal_error`.
+
+The control operation `activate-notification-journal` accepts `target_digest`
+(64 lowercase hex characters) and `nonce` (32 lowercase hex characters). It commits
+that pair before replying. Repeating the pair is idempotent. A different target is
+always refused, and ordinary activation cannot replace a nonce.
+`rebuild-notification-journal-activation` additionally requires
+`expected_previous_nonce` and `accept_history_loss: true`; it replaces only the
+matching target's expected nonce. Repeating the resulting pair is safe after a lost
+reply. This is the bridge-side evidence operation, not a complete notifier rebuild.
+The notifier journal and its maintenance command are not yet implemented.
+
+An empty `memory_binding` table is reserved for the next component. Its repository
+and state paths must be absolute and at most 4096 UTF-8 bytes; SQL constraints enforce
+these bounds. This release enables no binding writer, memory pointers or subscriptions
+and advertises none of those capabilities. Existing ordinary notification readers
+can still read the original inbox columns. New notifier capability negotiation and
+journal migration remain pending; this change does not activate them.
+
+CLI forms use the same operation names with `--target-digest` and `--nonce`.
+Explicit activation replacement also requires `--expected-previous-nonce` and
+`--accept-history-loss`. These controls are operator commands; stored peer controls
+remain inert data and cannot invoke them.

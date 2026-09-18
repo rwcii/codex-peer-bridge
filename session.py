@@ -155,6 +155,14 @@ def notify_command(prefix, config, state, thread, repo, name, agent='codex', mod
     return command
 
 
+def permanent_child_exit(children):
+    for child in children:
+        status = child.poll()
+        if status in platform_support.PERMANENT_EXIT_STATUSES:
+            return status
+    return None
+
+
 def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=None):
     # A persistent managed session owns both children; repeated calls cannot duplicate it.
     with (state/'supervisor.lock').open('a') as lock:
@@ -175,7 +183,7 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
             children.append(subprocess.Popen([sys.executable,str(prefix/'bridge.py'),'--state-dir',str(state),'serve']))
             for _ in range(100):
                 bridge_exit = children[0].poll()
-                if bridge_exit == platform_support.CONFIGURATION_EXIT_STATUS:
+                if bridge_exit in platform_support.PERMANENT_EXIT_STATUSES:
                     raise SystemExit(bridge_exit)
                 if stopped or bridge_exit is not None:
                     raise RuntimeError('bridge exited during startup')
@@ -187,8 +195,9 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
             children.append(subprocess.Popen(notify_command(prefix,config,state,thread,repo,name,agent,model)))
             for _ in range(100):
                 notifier_exit = children[-1].poll()
-                if any(p.poll() == platform_support.CONFIGURATION_EXIT_STATUS for p in children):
-                    raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS)
+                permanent_exit = permanent_child_exit(children)
+                if permanent_exit is not None:
+                    raise SystemExit(permanent_exit)
                 if stopped or notifier_exit is not None:
                     raise RuntimeError('notifier exited during startup')
                 if notifier_ready(state,bridge_status(prefix,state)):
@@ -200,8 +209,9 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
             while not stopped and all(p.poll() is None for p in children):
                 time.sleep(.2)
             if not stopped:
-                if any(p.poll() == platform_support.CONFIGURATION_EXIT_STATUS for p in children):
-                    raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS)
+                permanent_exit = permanent_child_exit(children)
+                if permanent_exit is not None:
+                    raise SystemExit(permanent_exit)
                 raise RuntimeError('session child exited; restart the complete session')
         finally:
             for child in reversed(children):
