@@ -58,6 +58,53 @@ The client reads the key for the kernel-verified server PID and socket path with
 
 Observed controls include delivery statuses, rename, idle notices, and artifact coordination. The bridge stores control objects without performing their actions and does not notify Codex about them. It neither implements nor advertises their specialized semantics.
 
+## Memory control protocol
+
+This section describes a protocol **this project defines**, unlike the rest of this document,
+which records behaviour observed in another implementation. The memory service at `memory.py`
+listens on its own private control socket and carries no peer traffic.
+
+Transport is an AF_UNIX stream socket carrying one UTF-8 JSON request line and one JSON response
+line, then close. Same-UID kernel peer credentials are the authentication policy, as for the
+bridge's control socket. No token is published or accepted.
+
+```json
+{"op": "sync", "consumer": "session-a", "page_token": 0}
+```
+
+A response is `{"ok": true, "result": ...}` or `{"ok": false, "code": "...", "error": "..."}`.
+The `code` names a recovery path and is the field a caller should branch on: `snapshot_expired`
+and `stale_page_token` require restarting `sync`; `snapshot_incomplete` requires paging to the
+end before acknowledging; `consumer_retired` requires a new consumer key; `capacity`,
+`entry_too_large`, `idempotency_conflict`, `retry_deadline_expired`, `not_issued`,
+`foreign_snapshot`, `snapshot_open` and `not_bootstrapped` describe a refused request that changed
+nothing. There is no conflict code for competing revisions: a second replacement of the same entry
+is a successful write whose result carries `conflicts_with`, naming the replacement it competes
+with, and both remain live.
+
+A `note` carrying `key` must also carry `deadline`, an absolute epoch second fixed before the first
+send and repeated on every retry. Within it a repeat returns the original sequence with
+`duplicate` true; past it the request is refused with `retry_deadline_expired` rather than appended,
+because the service cannot tell whether the first attempt landed. The result echoes `deadline` and
+reports `idempotency_horizon`, the longest deadline the service will accept.
+
+A `sync` returns either `kind: snapshot` with `snapshot_id`, `entries`, `page_token`, `total` and
+`more`, or `kind: delta` with `entries`, `cursor`, `next_cursor`, `head` and `more`. Continuing a
+snapshot requires both `snapshot_id` and `page_token`. An `ack` carries `snapshot_id` once every
+page has been issued, or `through` for a delta. `recall` and `status` return `more` with
+`next_before` and `next_after` respectively, null when nothing remains.
+
+Operations are `hello`, `note`, `sync`, `ack`, `recall`, `status` and `stop`. `hello` is the
+reuse handshake and reports the service name, repository key, protocol and schema versions,
+generation, process ID, health and search capability. `sync` returns either a `snapshot` page or
+a `delta` batch and never advances a cursor; only `ack` does. Pages are bounded by encoded bytes
+rather than by a row count, because a row limit multiplied by the maximum body size exceeds one
+frame.
+
+Sequence numbers come from a durable head that only ever advances. Reclaiming entries moves a
+floor rather than the head, and a consumer below the floor is returned to a fresh snapshot rather
+than handed a gap.
+
 ## Limitations
 
 Admission rules, deduplication, rate limits, and loop checks on Claude's side may reject a transported message. Return-path validation also depends on socket ownership and kernel process identity. A bridge that sends from a different process than its advertised listener can fail these checks; all outbound peer connections here originate in the listener process.

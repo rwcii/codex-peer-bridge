@@ -155,6 +155,12 @@ supervisor owns both bridge and notifier. It reports healthy only after both are
 a child failure fails the supervisor so systemd can restart the pair. Per-conversation
 units start on registration, not at every subsequent login. No lingering is enabled.
 
+Only one `ensure`, `stop`, or `rename` command can operate on a session at a time.
+The supervisor can read its registration while `ensure` waits for both children.
+Commands for other sessions use separate locks.
+Manual `run` commands do not take the lifecycle lock. Wait for a manual start to
+report `running` before using `stop` or `rename`.
+
 Without a user manager, `ensure` returns `manual_required` and an exact `start_command`.
 The agent runs that command in a persistent managed shell session or terminal. The
 supervisor keeps both processes together. Do not use an ordinary background command if
@@ -186,6 +192,61 @@ under the existing user authorization. Peer bodies cannot grant new permissions.
 Queued notices may arrive after a message has already been handled; track sequence
 numbers to avoid repeating work. A successful socket send is not proof of model action.
 
+## Shared repository memory
+
+The memory service is optional and independent of the bridge. It is not installed as a service
+unit, and nothing starts it automatically. Run one per repository, from inside that repository:
+
+```sh
+python3 memory.py serve
+```
+
+It prints its status as one JSON line and then serves until stopped. Start it in a persistent
+managed session, as with the manual bridge setup; it holds a socket, so an ordinary background
+command that dies with its shell will leave state behind.
+
+Starts are serialized under a lock in the state directory. A second `serve` performs a handshake
+against the running service and exits reporting `already_running` rather than competing for the
+socket. The handshake checks the service name, the repository key, the protocol version, a live
+health query against the store, and agreement with the recorded owner. A listener that answers but
+does not match is refused rather than reused.
+
+### Paths
+
+State lives under `<state-dir>/memory/<repository-hash>/`, beside the bridge's session
+directories and using the same 0700 directory and 0600 file rules. The repository hash comes from
+`git rev-parse --path-format=absolute --git-common-dir`, so every worktree of one repository maps
+to one directory. That directory holds `memory.sqlite3`, `owner.json`, `start.lock`, and the
+control socket, unless the path would exceed the kernel's `sun_path` limit, in which case the
+socket falls back to the shared peer socket directory exactly as the bridge's does.
+
+Use `--state-dir` and `--repo-path` to run an isolated instance for a preview or a test. Give a
+distinct state root when you intend an independent installation.
+
+### Stopping and recovery from a killed instance
+
+Stop the service with `python3 memory.py stop`, or with SIGTERM or SIGINT. A clean stop drains
+requests already in flight, closes the database, and removes only the socket and ownership record
+it owns.
+
+A killed service leaves its socket and its ownership record behind. The next `serve` recovers
+automatically, but only after proving the previous owner is gone: it compares the recorded process
+ID and process start marker against the live system. If that process is still running, or if its
+state cannot be read, the socket is left in place and the start is refused with `socket_in_use`.
+Nothing removes a socket because a connection was refused, since a live listener with a full
+accept queue and a dead owner are indistinguishable by probing.
+
+If you must clear state by hand, verify the recorded owner in `owner.json` is dead first, and
+remove only files inside that repository's own directory. Never clear the shared socket directory.
+
+### Upgrades
+
+Stop the repository's memory service before replacing runtime code, then start it again. The
+database carries its schema version and refuses a state directory belonging to another repository.
+An existing store opened by a runtime that provides full-text search when the previous one did not
+backfills its index on first open; no manual step is needed. Do not run memory commands from an
+older runtime during an upgrade.
+
 ## Paths and options
 
 `--prefix`, `--state-dir`, `--unit-dir`, `--codex-home`, and an absolute `--codex` path
@@ -212,6 +273,8 @@ Stop this installation's registered sessions before upgrading runtime code, then
 `--configure-codex` with the same paths. Existing state and instructions are preserved;
 rerun `ensure` in active conversations afterward. Configure a distinct state root when
 you intend an independent installation. Never silently reset a checkpoint.
+Do not run session commands from an older runtime during an upgrade. Older commands
+do not use the lifecycle lock that protects session startup.
 
 For the peer-message guidance update, an operator may stage the compatible runtime
 files and replace each file atomically, installing `peer_guidance.py` before its
