@@ -16,12 +16,21 @@ into a dated release section when promoted to `main`.
   a fixed head, so a revocation or a reclamation cannot change what a reader is still paging
   through. The server records page issuance and completion, so a cursor advances only on an
   acknowledgement it actually issued, and a retained acknowledgement replays after a lost
-  response. Responses are bounded by encoded bytes with continuation. Storage enforces logical
-  and physical budgets with slots and bytes reserved so a withdrawal stays recordable, and every
-  retained record has a lifetime whose expiry returns a defined recovery result. Start is
+  response. Responses are bounded by encoded bytes with continuation. Storage enforces a logical
+  budget and a durable page ceiling, with slots and pages reserved so a withdrawal stays
+  recordable, and every retained record has a lifetime whose expiry returns a defined recovery
+  result. The store is opened by a single exclusive owner; a second owner is told the store is
+  busy rather than that the file is unreadable. Search answers from the index only while the
+  index is known to cover every live entry, and otherwise from a complete scan, and the reply
+  says which answered. Start is
   serialized, and a socket left by an unclean exit is recovered only after its recorded owner is
   proved dead. Entries are reported data and grant no authority. There is no bus integration and
   no compaction in this form.
+- `docs/STORAGE-BOUND-DERIVATION.md`, the derivation of the storage bound the memory service
+  enforces, with its terms traced to the SQLite sources at a pinned tag. It records why the log
+  a single transaction can produce is finite, why the shared-memory and sub-journal files do not
+  contribute to the declared total, what the choice costs in memory instead, and which figures
+  are an example workload rather than a bound. No runtime behaviour changes with this entry.
 - `docs/PARITY-MEMORY-DESIGN.md`, the agreed design and acceptance contract for peer
   capability parity and a shared per-repository memory service. It records the contracts
   for identity, delivery, presence, and memory, the capabilities that remain unverified

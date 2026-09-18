@@ -285,9 +285,12 @@ WAL <= 32 + (N + 16) * (24 + page_size)          N = max_page_count
 Durability is not traded for this. Padding disappears if `synchronous` is lowered, and it
 is carried instead.
 
-**Five settings are applied when the store opens, and every one is read back and
+**Seven settings are applied when the store opens, and every one is read back and
 compared with what was requested.** A pragma that is silently ignored is the failure mode
-this project has already met once with `auto_vacuum`.
+this project has already met once with `auto_vacuum`. `Store.pragmas` builds the list on
+each call rather than holding it as a class attribute, so the constants stay authoritative;
+a captured copy once let the ceiling given to the engine differ from the one the rest of the
+code compared against.
 
 | Setting | Why |
 |---|---|
@@ -305,6 +308,27 @@ incompatible store is refused **without deleting anything**.
 **Ownership.** All readers reach the store through the control socket. No database read
 transaction spans a response or an await. Exclusive locking mode makes this an engine
 property rather than a convention: a second process cannot open the store at all.
+
+**A store is opened by one owner, and a second is told so.** Exclusive locking makes a
+second connection fail outright. That is a routine condition, not corruption, so it is
+reported as `store_busy` and points the caller at the control socket rather than suggesting
+the file is unreadable.
+
+**The threshold below the ceiling is enforced, not inferred.** `ORDINARY_MAX_PAGES` is
+`MAX_PAGES` less `RESERVE_PAGES`, and its size is justified by the transitions that must
+never be refused: expiring a full store, a withdrawal, an acknowledgement and a retirement
+record. It is not derived from an index ratio, because a measured ratio is a sizing
+observation and cannot be a limit. Enforcement re-reads the page count inside the running
+transaction and rolls back on a breach, and it leaves `COMMIT_SLACK` pages of room because a
+commit allocates pointer-map pages the in-transaction count does not yet report -- without
+that, an append committed one page above its threshold.
+
+**A rebuild is not assumed to be free.** It is refused before it starts when the reserve
+cannot cover it, never part way through, and search then answers from a complete scan.
+`Service.recall` chooses its path on `Store.index_usable`, which requires the index to exist
+*and* to cover the head, and the reply states which path answered. Choosing the path on
+whether the index returned rows would conflate "no such entry" with "index unusable" and
+answer both identically.
 
 **Admission compares durable data pages, and nothing else.** The earlier design compared
 the total file size including the log and then added a fixed margin for it. That made
@@ -329,10 +353,14 @@ retract a directive. A rebuild that would exceed the reserve is refused before i
 never part way through, and a known incomplete index is never served.
 
 **Auxiliary files are bounded rather than excused.** Sorters are held in memory.
-Sub-journals have only two write sites in the pager: the cache-spill path, unreachable
-once spilling is off, and one gated on an open savepoint. The service opens no explicit
-savepoint, so the only source is a statement journal, whose size is bounded by the pages
-one statement must undo. No maintenance statement may have an unbounded undo set.
+Sub-journals reach disk only when SQLite's temp-in-memory predicate is false:
+`sqlite3BtreeBeginTrans` passes `sqlite3TempInMemory(db)` to `sqlite3PagerBegin` as
+`subjInMemory`, and `openSubJournal` then opens the journal with a negative spill size,
+which keeps it in memory. With `temp_store=MEMORY` that predicate holds for every supported
+value of `SQLITE_TEMP_STORE`, so the term is zero on disk. A build reporting an unsupported
+value is refused at open with `unsupported_runtime` rather than run with an unaccounted
+term. The cost moves to memory instead, and the contract states it there rather than
+banking the smaller disk total silently.
 
 **The memory cost is stated, not hidden.** Disabling the spill holds the dirty set until
 commit. The payload term is bounded by `N * page_size`; page metadata, FTS5 working

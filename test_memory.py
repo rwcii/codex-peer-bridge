@@ -146,11 +146,26 @@ class WriteTests(Base):
         self.assertTrue(self.note('task bound', scope='task', scope_target='T-1'))
 
     def test_a_store_declaring_another_schema_is_refused(self):
-        self.s.set_meta('schema', SchemaProbe := memory.SCHEMA + 1)
+        self.s.set_meta('schema', memory.SCHEMA + 1)
         self.s.db.commit()
+        # The owner releases the store first. Exclusive locking refuses a second
+        # connection outright, which is a different condition asserted separately, and
+        # opening one here would test the lock instead of the schema check.
+        self.s.close()
         with self.assertRaises(memory.MemoryError_) as e:
             memory.Store(self.home/'memory.sqlite3', REPO)
         self.assertEqual(e.exception.code, 'schema_too_new')
+
+    def test_a_second_owner_is_refused_as_busy_not_as_unreadable(self):
+        """Exclusive locking makes a second owner routine, so it needs its own code.
+
+        Reporting it as an unreadable file would tell an operator to suspect corruption
+        when the real cause is that the service already holds the store.
+        """
+        with self.assertRaises(memory.MemoryError_) as e:
+            memory.Store(self.home/'memory.sqlite3', REPO)
+        self.assertEqual(e.exception.code, 'store_busy')
+        self.assertIn('control socket', str(e.exception))
 
     def test_byte_width_not_character_count_bounds_a_body(self):
         wide = 'é' * (memory.MAX_BODY//2 + 1)
@@ -175,22 +190,27 @@ class WriteTests(Base):
             target = self.s.live()[0]['seq']
             self.assertTrue(self.note('withdrawn', kind='directive', revokes=target))
 
-    def test_growth_stops_at_the_physical_bound_and_space_is_recoverable(self):
-        """The bound must stop real growth, reserve room for a withdrawal, and recover.
+    def test_growth_stops_at_the_page_ceiling_and_space_is_recoverable(self):
+        """The ceiling must stop real growth, reserve room for a withdrawal, and recover.
 
-        A test that merely sets the limit below an existing file proves only that a
-        comparison happens. This drives actual allocation into the bound.
+        A test that sets the limit below an existing file proves only that a comparison
+        happens. This drives actual allocation into the ceiling.
+
+        It asserts pages, not file bytes. The log is deliberately outside the comparison:
+        including it made the outcome depend on when the last checkpoint ran and on how far
+        a particular SQLite build shrank the file during recovery, which is why the earlier
+        version of this test passed on five CI runners and failed on the sixth. Pages are
+        the quantity the engine itself caps, so the result is the same on every build.
         """
         body = 'x' * 4000
-        cap = self.s.physical() + 2_000_000
-        reserve = 200_000
+        ceiling = self.s.pages() + 600
+        reserve = 120
         written = []
-        with patch.object(memory, 'MAX_PHYSICAL_BYTES', cap), \
-             patch.object(memory, 'RESERVED_BYTES', reserve), \
-             patch.object(memory, 'WAL_MARGIN', 512_000), \
+        with patch.object(memory, 'MAX_PAGES', ceiling), \
+             patch.object(memory, 'ORDINARY_MAX_PAGES', ceiling - reserve), \
              patch.object(memory, 'MAX_ENTRIES', 100_000), \
              patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40):
-            for _ in range(1000):
+            for _ in range(4000):
                 try:
                     written.append(self.note(body, kind='decision'))
                 except memory.MemoryError_ as exc:
@@ -199,39 +219,48 @@ class WriteTests(Base):
             else:
                 self.fail('growth was never bounded')
             self.assertGreater(len(written), 5, 'the bound must not stop growth immediately')
-            # Real allocation is what stopped, and it stopped below the hard limit.
-            self.assertLessEqual(self.s.physical(), cap)
-            # Other transitions must also be bounded, not merely the append path.
+            # Ordinary appends stopped at the ordinary threshold, so the reserve is intact
+            # rather than merely nominal.
+            self.assertLessEqual(self.s.pages(), ceiling - reserve)
+            # Every growth path is bounded, not only the append path.
             with self.assertRaises(memory.MemoryError_) as e:
                 memory.freeze(self.s, 'a-reader-at-the-bound')
             self.assertEqual(e.exception.code, 'capacity')
             with self.assertRaises(memory.MemoryError_) as e:
                 self.call(op='sync', consumer='another-reader-at-the-bound')
             self.assertEqual(e.exception.code, 'capacity')
+            # A refused mutation leaves nothing behind.
             stored = len(self.s.live())
-            # The reserve is what keeps a withdrawal possible at the bound; without
-            # reserved bytes a full store would pin a directive it can never retract.
+            # The reserve is what keeps a withdrawal possible at a full store. Without
+            # reserved pages a full store would pin a directive it could never retract.
             withdrawal = self.note('withdrawn', kind='directive', revokes=written[0])
             self.assertTrue(withdrawal)
             self.assertEqual(len(self.s.live()), stored)
+            # Progress must also still commit at the ceiling, drawing on the same reserve.
+            self.s.progress_probe = None
+            with self.s.progress():
+                self.s.set_meta('probe-at-the-bound', '1')
+            self.assertEqual(self.s.meta('probe-at-the-bound'), '1')
 
-            # Recovery: expire the bulk, reclaim, and prove the space returns and is
-            # reusable under the same limit.
-            at_bound = self.s.physical()
+            # Recovery: expire the bulk, reclaim, and prove the pages return and are
+            # reusable under the same ceiling.
+            at_bound = self.s.pages()
             self.s.db.execute('UPDATE entries SET expires=? WHERE seq IN (%s)'
-                              % ','.join(str(s) for s in written[:len(written)//2]),
+                              % ','.join(str(x) for x in written[:len(written)//2]),
                               (time.time()-1,))
             self.s.db.commit()
             self.s.reclaim()
-            self.assertLess(self.s.physical(), at_bound, 'reclaimed space must be returned')
-            self.assertTrue(self.note(body, kind='decision'), 'writes must resume after recovery')
+            self.assertLess(self.s.pages(), at_bound, 'reclaimed pages must be returned')
+            self.assertTrue(self.note(body, kind='decision'),
+                            'writes must resume after recovery')
 
-    def test_physical_budget_also_refuses(self):
+    def test_page_ceiling_also_refuses(self):
         self.note('one')
-        with patch.object(memory,'MAX_PHYSICAL_BYTES',1):
+        with patch.object(memory, 'MAX_PAGES', 1), \
+             patch.object(memory, 'ORDINARY_MAX_PAGES', 1):
             with self.assertRaises(memory.MemoryError_) as e:
                 self.note('two')
-            self.assertEqual(e.exception.code,'capacity')
+            self.assertEqual(e.exception.code, 'capacity')
         self.assertEqual(len(self.s.live()), 1)
 
     def test_a_snapshot_copy_is_charged_against_the_budget(self):
@@ -1078,3 +1107,227 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StorageBoundTests(Base):
+    """The invariants the storage bound rests on, asserted rather than assumed.
+
+    These deliberately assert invariants and not sizes. Different correct SQLite builds
+    allocate different numbers of pages for the same content, so a test that demanded a
+    particular figure would be testing the build rather than this design, and would fail
+    on a correct one. See docs/STORAGE-BOUND-DERIVATION.md.
+    """
+
+    def wal_bytes(self):
+        try:
+            return os.stat(str(self.s.path) + '-wal').st_size
+        except OSError:
+            return 0
+
+    def test_every_setting_the_bound_depends_on_reads_back_as_requested(self):
+        for name, requested, expected in self.s.pragmas():
+            with self.subTest(pragma=name):
+                self.assertEqual(self.s.db.execute(f'PRAGMA {name}').fetchone()[0], expected,
+                                 f'PRAGMA {name}={requested} did not take effect')
+
+    def test_a_setting_that_does_not_take_effect_refuses_the_store(self):
+        """A silently ignored pragma is the failure this readback exists to catch."""
+        # A setting whose stated expectation cannot hold, so the readback must refuse.
+        with patch.object(memory.Store, 'pragmas',
+                          staticmethod(lambda: (('journal_mode', 'WAL', 'memory'),))):
+            with self.assertRaises(memory.MemoryError_) as e:
+                memory.Store(self.home/'refused.sqlite3', REPO)
+            self.assertEqual(e.exception.code, 'unsupported_runtime')
+
+    def test_no_shared_memory_file_is_created(self):
+        """Exclusive locking holds the wal-index in memory, so the term is zero."""
+        self.note('content that forces the log into use')
+        self.assertFalse(Path(str(self.s.path) + '-shm').exists())
+
+    def test_the_log_holds_nothing_before_a_commit(self):
+        """This is the observation the one-frame-per-dirty-page argument rests on.
+
+        With cache_spill=OFF the commit dirty list is the only path to the log, so a
+        transaction that has not committed must not have written to it.
+        """
+        self.note('seed')
+        self.s.reset_log()
+        self.s.db.execute('BEGIN IMMEDIATE')
+        try:
+            for i in range(400):
+                self.s.db.execute(
+                    'INSERT INTO entries(seq,ts,type,scope,body,author,revision) '
+                    'VALUES(?,?,?,?,?,?,?)', (10_000 + i, 1.0, 'finding', 'repo',
+                                              'y' * 3000, 'a', 1))
+            self.assertEqual(self.wal_bytes(), 0,
+                             'a spill wrote to the log before the commit')
+        finally:
+            self.s.db.execute('ROLLBACK')
+
+    def test_frames_never_exceed_dirty_pages_plus_the_padding_bound(self):
+        """F <= D + P, with P bounded by the sector-size ceiling."""
+        self.s.reset_log()
+        with self.s.db:
+            for i in range(300):
+                self.s.db.execute(
+                    'INSERT INTO entries(seq,ts,type,scope,body,author,revision) '
+                    'VALUES(?,?,?,?,?,?,?)', (20_000 + i, 1.0, 'finding', 'repo',
+                                              'z' * 3000, 'a', 1))
+        frames = (self.wal_bytes() - 32) / memory.FRAME_BYTES
+        self.assertGreater(frames, 0, 'the commit wrote no frames, so nothing was measured')
+        # Pages after the commit bound the pages it could have dirtied.
+        self.assertLessEqual(frames, self.s.pages() + memory.PAD_FRAMES)
+        self.assertLessEqual(self.wal_bytes(), memory.WAL_BUDGET_BYTES)
+
+    def test_a_reset_that_did_not_happen_is_reported_not_assumed(self):
+        """No single result proves a reset, so each part of the conjunction must refuse.
+
+        The three cases are driven through a stub because exclusive locking makes a real
+        foreign reader impossible, which is the point of exclusive locking. What is under
+        test is this code's decision, not SQLite's checkpointing.
+        """
+        class Stub:
+            def __init__(self, row):
+                self.row = row
+
+            def execute(self, *_a, **_k):
+                return self
+            def fetchall(self):
+                return [self.row]
+
+        real = self.s.db
+        for row, why in (((1, 400, 0), 'a busy checkpoint'),
+                         ((0, 400, 0), 'a passive checkpoint that moved nothing')):
+            with self.subTest(case=why):
+                self.s.db = Stub(row)
+                try:
+                    with self.assertRaises(memory.MemoryError_) as e:
+                        self.s.reset_log()
+                    self.assertEqual(e.exception.code, 'storage_blocked')
+                finally:
+                    self.s.db = real
+        # A clean result with a log still on disk must also refuse: (0, 0, 0) is equally
+        # what a store returns when no log has ever existed.
+        self.s.db = Stub((0, 0, 0))
+        try:
+            with open(str(self.s.path) + '-wal', 'wb') as fh:
+                fh.write(b'\x00' * 4096)
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.s.reset_log()
+            self.assertEqual(e.exception.code, 'storage_blocked')
+        finally:
+            self.s.db = real
+            Path(str(self.s.path) + '-wal').unlink(missing_ok=True)
+
+    def test_a_clean_reset_leaves_no_log(self):
+        self.note('something to log')
+        self.s.reset_log()
+        self.assertEqual(self.wal_bytes(), 0)
+
+    def test_the_engine_ceiling_rolls_back_whole_with_integrity_intact(self):
+        """Past the page ceiling the engine refuses, and the refusal must be clean."""
+        with patch.object(memory, 'MAX_PAGES', self.s.pages() + 40), \
+             patch.object(memory, 'ORDINARY_MAX_PAGES', 1 << 30), \
+             patch.object(memory, 'MAX_ENTRIES', 100_000), \
+             patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40):
+            store = memory.Store(self.home/'tight.sqlite3', REPO)
+            self.addCleanup(store.close)
+            before = len(store.live())
+            with self.assertRaises(memory.MemoryError_) as e:
+                for i in range(10_000):
+                    store.note('writer', 'decision', 'q' * 4000)
+            self.assertEqual(e.exception.code, 'capacity')
+            self.assertIn('rolled back', str(e.exception))
+            self.assertEqual(store.db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+            self.assertGreater(len(store.live()), before, 'nothing was ever written')
+
+    def test_a_build_without_in_memory_temporaries_is_refused(self):
+        """On such a build the sub-journal size is unbounded and unaccounted for."""
+        class Stub:
+            def execute(self, sql, *_a):
+                if 'compile_options' in sql:
+                    return [('TEMP_STORE=0',)]
+                raise AssertionError('nothing else should be reached')
+
+        real = self.s.db
+        self.s.db = Stub()
+        try:
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.s.require_temp_in_memory()
+            self.assertEqual(e.exception.code, 'unsupported_runtime')
+            self.assertIn('TEMP_STORE=0', str(e.exception))
+        finally:
+            self.s.db = real
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'reads /proc/self/fd')
+    def test_no_sub_journal_reaches_disk(self):
+        """Sub-journals open delete-on-close, so a directory listing would miss them.
+
+        The verification is stronger on Linux than elsewhere for exactly this reason, and
+        the derivation records that as a limit rather than claiming parity.
+        """
+        def unlinked():
+            found = {}
+            for fd in os.listdir('/proc/self/fd'):
+                try:
+                    target = os.readlink(f'/proc/self/fd/{fd}')
+                    if '(deleted)' in target:
+                        found[target] = os.fstat(int(fd)).st_size
+                except OSError:
+                    pass
+            return found
+
+        for i in range(60):
+            self.note('body ' + str(i) * 200, kind='finding')
+        with self.s.db:
+            self.s.db.execute('UPDATE entries SET revision=revision+1')
+            self.s.db.execute('DELETE FROM entries WHERE seq % 3 = 0')
+        self.assertEqual({t: n for t, n in unlinked().items() if n}, {},
+                         'a sub-journal or sorter spilled to disk')
+
+    def test_a_known_incomplete_index_is_never_served_and_the_scan_is_complete(self):
+        """Search must answer from one path, chosen on trust, not on emptiness."""
+        needle = 'zqxjkv'
+        seq = self.note(f'a body containing {needle} once')
+        self.assertTrue(self.s.index_usable())
+        found = self.call(op='recall', query=needle)
+        self.assertEqual([e['seq'] for e in found['entries']], [seq])
+        self.assertTrue(found['indexed'])
+        # Mark the index short of the head, as a runtime without FTS would leave it.
+        self.s.set_meta('indexed_through', -1)
+        self.s.db.commit()
+        self.assertFalse(self.s.index_usable())
+        fallback = self.call(op='recall', query=needle)
+        self.assertFalse(fallback['indexed'], 'the reply must say which path answered')
+        self.assertEqual([e['seq'] for e in fallback['entries']], [seq],
+                         'the fallback must be complete, not empty')
+
+    def test_the_reserve_survives_a_full_store_for_every_promised_transition(self):
+        """At the ordinary threshold, progress and control must all still commit."""
+        body = 'x' * 4000
+        ceiling = self.s.pages() + 700
+        with patch.object(memory, 'MAX_PAGES', ceiling), \
+             patch.object(memory, 'ORDINARY_MAX_PAGES', ceiling - 150), \
+             patch.object(memory, 'MAX_ENTRIES', 100_000), \
+             patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40):
+            written = []
+            for _ in range(4000):
+                try:
+                    written.append(self.note(body, kind='decision'))
+                except memory.MemoryError_:
+                    break
+            self.assertTrue(written)
+            self.assertLessEqual(self.s.pages(), ceiling - 150)
+            # A withdrawal, drawing on reserved slots and reserved pages.
+            self.assertTrue(self.note('withdrawn', kind='directive', revokes=written[0]))
+            # Expiry and reclamation, which must run at the bound rather than be refused.
+            self.s.db.execute('UPDATE entries SET expires=? WHERE seq=?',
+                              (time.time() - 1, written[1]))
+            self.s.db.commit()
+            self.s.reclaim()
+            # An index rebuild, which replaces content rather than growing the store.
+            self.s.set_meta('indexed_through', 0)
+            self.s.db.commit()
+            self.s._reconcile_index()
+            self.assertTrue(self.s.index_usable())
+            self.assertLessEqual(self.s.pages(), ceiling)

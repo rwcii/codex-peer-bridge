@@ -77,9 +77,44 @@ MAX_LOGICAL_BYTES = 32 * 1024 * 1024
 MAX_PHYSICAL_BYTES = 128 * 1024 * 1024
 RESERVED_ENTRIES = 64
 RESERVED_BYTES = RESERVED_ENTRIES * MAX_BODY
-# Headroom kept free for write-ahead log growth between checkpoints.
-WAL_MARGIN = 2 * 1024 * 1024
 ENTRY_OVERHEAD = 512
+
+# The durable ceiling, and the log's derived worst case.
+#
+# The log is never measured for admission. It is reset before every write transaction and
+# its peak follows from the page ceiling, so admission cannot depend on checkpoint timing
+# or on how far a particular SQLite build shrinks the file during recovery. An earlier
+# design compared the total file size including the log and added a fixed margin for it;
+# that made the same write succeed or fail according to when the last checkpoint ran.
+#
+# One transaction appends one frame per page it dirties, because cache_spill=OFF leaves
+# the commit dirty list as the only path to the log, and then repeats the final frame to
+# the next sector boundary. sqlite3SectorSize is clamped to MAX_SECTOR_SIZE, so that
+# padding is finite. docs/STORAGE-BOUND-DERIVATION.md carries the argument and the
+# source references; the numbers here are derived from it and must not be tuned alone.
+PAGE_SIZE = 4096
+FRAME_BYTES = 24 + PAGE_SIZE
+MAX_SECTOR_SIZE = 0x10000
+PAD_FRAMES = -(-(MAX_SECTOR_SIZE - 1) // FRAME_BYTES)
+# The largest page ceiling for which the data pages and the log's worst case both fit.
+MAX_PAGES = (MAX_PHYSICAL_BYTES - 32 - PAD_FRAMES * FRAME_BYTES) // (PAGE_SIZE + FRAME_BYTES)
+WAL_BUDGET_BYTES = 32 + (MAX_PAGES + PAD_FRAMES) * FRAME_BYTES
+# Pages ordinary appends may not consume, so that progress and control transitions still
+# commit at a full store. It is sized from those transitions, not from an index ratio:
+# expiring a full store transiently adds index tombstones before the vacuum returns the
+# pages, which measured about 0.28 pages for each entry removed, and a withdrawal, an
+# acknowledgement and a retirement record cost a few pages each.
+RESERVE_PAGES = 2048
+ORDINARY_MAX_PAGES = MAX_PAGES - RESERVE_PAGES
+# A commit allocates pages the in-transaction count does not yet report. With incremental
+# auto-vacuum one pointer-map page carries back pointers for usable/5 pages, so a
+# transaction that grows the store allocates one as it crosses that boundary, after the
+# point where the page count can be read. Enforcement therefore leaves this much room, so
+# that the COMMITTED store honours its threshold rather than the state part way through.
+# Measured, the gap between the count read inside the transaction and the committed count
+# is one page for an ordinary append; the bound allows for crossing a boundary as well.
+PTRMAP_COVERAGE = PAGE_SIZE // 5
+COMMIT_SLACK = 2
 
 # Lifetimes. Every retained record has one, and expiry returns a defined recovery
 # result rather than silently changing a caller's meaning.
@@ -146,6 +181,28 @@ def state_dir(root, repo):
     return Path(root) / 'memory' / repo
 
 
+def storage_exhausted(exc):
+    """Did the engine itself refuse the allocation, rather than this code refusing it?
+
+    `max_page_count` is the durable ceiling and the engine enforces it whatever admission
+    decided, so the error it raises must be reported as capacity with the transaction's
+    real outcome, not surfaced as an unexplained database error.
+    """
+    return (isinstance(exc, sqlite3.OperationalError)
+            and 'full' in str(exc).lower())
+
+
+def owned_elsewhere(exc):
+    """Is this failure another owner holding the store, rather than a broken store?
+
+    Exclusive locking makes this an ordinary outcome rather than a corruption signal, so
+    it must not be reported as an unreadable file. SQLite distinguishes it only by
+    message, so the test is on the message and is kept in one place.
+    """
+    return (isinstance(exc, sqlite3.OperationalError)
+            and 'locked' in str(exc).lower())
+
+
 def fingerprint(payload):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
 
@@ -172,12 +229,7 @@ class Store:
         try:
             if existing:
                 self.inspect(repo)
-            # Order matters: auto_vacuum can only be chosen before the database header
-            # is written, and setting the journal mode first writes it. With it left at
-            # NONE, deleted pages stay in the file's freelist and a store that reached
-            # its physical bound could never shrink back below it.
-            self.db.execute('PRAGMA auto_vacuum=INCREMENTAL')
-            self.db.execute('PRAGMA journal_mode=WAL')
+            self.configure()
             self.db.executescript(SCHEMA_SQL)
             if not existing:
                 with self.db:
@@ -186,11 +238,129 @@ class Store:
                         self.set_meta(key, value)
             self.fts = False if fts is False else self._open_fts()
             self._reconcile_index()
+        except sqlite3.Error as exc:
+            self.db.close()
+            if owned_elsewhere(exc):
+                raise MemoryError_(
+                    'store_busy',
+                    'another owner holds this store. The service keeps one exclusive '
+                    'connection so that its storage bound holds, so a second owner is '
+                    'refused rather than admitted; reach it through the control socket. '
+                    'Nothing was written') from exc
+            raise
         except BaseException:
             # A constructor that raises must not leave the handle open; the suite
             # otherwise reports unclosed connections that hide real ones.
             self.db.close()
             raise
+
+    # Applied at open, in this order, and each one read back and compared. A pragma that
+    # is silently ignored is the failure mode this project has already met once: setting
+    # the journal mode writes the database header, after which auto_vacuum and page_size
+    # can no longer be chosen, and locking_mode must be exclusive before the log exists
+    # for the wal-index to be held in memory rather than in a file.
+    @staticmethod
+    def pragmas():
+        """Built on each call so the module constants stay authoritative.
+
+        Holding this as a class attribute captured MAX_PAGES once, at import, so the
+        ceiling the engine was given could silently differ from the constant the rest of
+        the code compared against. That is the same drift this file guards against
+        everywhere else, and it hid a real gap in the ceiling test.
+        """
+        return (('locking_mode', 'EXCLUSIVE', 'exclusive'),
+                ('auto_vacuum', 'INCREMENTAL', 2),
+                ('page_size', PAGE_SIZE, PAGE_SIZE),
+                ('journal_mode', 'WAL', 'wal'),
+                ('cache_spill', 'OFF', 0),
+                ('temp_store', 'MEMORY', 2),
+                ('max_page_count', MAX_PAGES, MAX_PAGES))
+
+    def configure(self):
+        """Apply the settings the storage bound depends on, then prove they took effect.
+
+        Every setting here is load-bearing. Exclusive locking makes single ownership an
+        engine property and removes the shared-memory file; no cache spill makes the
+        commit list the only path to the log; memory temporaries keep the sub-journal off
+        disk; and max_page_count is the durable ceiling, enforced by the engine rather
+        than by a comparison this code makes.
+        """
+        self.require_temp_in_memory()
+        settings = self.pragmas()
+        for name, value, _ in settings:
+            self.db.execute(f'PRAGMA {name}={value}').fetchall()
+        for name, _, expected in settings:
+            got = self.db.execute(f'PRAGMA {name}').fetchone()[0]
+            if got == expected:
+                continue
+            if name == 'max_page_count':
+                # The limit cannot shrink an existing database; asked to, it returns the
+                # current count. An oversized store is refused with its data intact,
+                # because deleting a caller's memory to fit a new ceiling is not recovery.
+                raise MemoryError_(
+                    'store_too_large',
+                    f'this store holds {got} pages and the supported ceiling is '
+                    f'{expected}; it was left untouched. Export what is needed from it '
+                    'with an older runtime rather than truncating it')
+            raise MemoryError_(
+                'unsupported_runtime',
+                f'PRAGMA {name} reads back as {got!r} after being set to {value!r}; the '
+                f'storage bound requires {expected!r}. Nothing was written')
+
+    def require_temp_in_memory(self):
+        """Refuse a build on which the sub-journal cannot be kept out of the filesystem.
+
+        SQLite decides this through `sqlite3TempInMemory`, which `sqlite3BtreeBeginTrans`
+        passes to `sqlite3PagerBegin` as its `subjInMemory` argument; `openSubJournal`
+        then opens the journal with a negative spill threshold, which keeps it in memory
+        and off disk. That predicate honours `temp_store` only while SQLITE_TEMP_STORE is
+        1, 2 or 3. Outside that range it returns false whatever the pragma says, and the
+        sub-journal becomes an unbounded term in a directory this store does not account
+        for. The build reports the value, so an unsupported one is refused rather than
+        carried as an unmeasured cost.
+        """
+        setting = 1                     # sqliteInt.h defines 1 when nothing overrides it
+        for (option,) in self.db.execute('PRAGMA compile_options'):
+            if option.startswith('TEMP_STORE='):
+                try:
+                    setting = int(option.split('=', 1)[1])
+                except ValueError:
+                    setting = -1
+        if setting not in (1, 2, 3):
+            raise MemoryError_(
+                'unsupported_runtime',
+                f'this SQLite build reports TEMP_STORE={setting}, on which temp_store '
+                'cannot keep sub-journals in memory, so their size is unbounded and '
+                'unaccounted. Nothing was written')
+
+    def pages(self):
+        """Durable pages allocated. This is what admission compares, and nothing else."""
+        return self.db.execute('PRAGMA page_count').fetchone()[0]
+
+    def reset_log(self):
+        """Return the log to zero before a write, and prove it rather than assume it.
+
+        No single result establishes a reset. A passive checkpoint reports a clear busy
+        flag while moving nothing, and `(0, 0, 0)` is equally what a store returns when no
+        log has ever existed and when the log was already empty. The proof is therefore a
+        conjunction: a clear busy flag, zero log pages, and a log file that is absent or
+        empty. Under exclusive locking no other process can hold a snapshot, so a busy
+        result is a genuine recovery condition rather than ordinary contention.
+        """
+        busy, log_pages, moved = self.db.execute(
+            'PRAGMA wal_checkpoint(TRUNCATE)').fetchall()[0]
+        try:
+            residual = os.stat(str(self.path) + '-wal').st_size
+        except OSError:
+            residual = 0
+        if busy or log_pages or residual:
+            raise MemoryError_(
+                'storage_blocked',
+                f'the write-ahead log could not be reset (busy={busy}, '
+                f'log_pages={log_pages}, {residual} bytes remain), so the bound on a '
+                'write cannot be held. No write was attempted and stored data is intact; '
+                'reads and recovery remain available')
+        return moved
 
     def inspect(self, repo):
         """Read-only compatibility check on an existing store. Writes nothing."""
@@ -198,6 +368,13 @@ class Store:
             rows = dict(self.db.execute(
                 "SELECT key,value FROM meta WHERE key IN ('repo','schema','protocol')").fetchall())
         except sqlite3.Error as exc:
+            if owned_elsewhere(exc):
+                raise MemoryError_(
+                    'store_busy',
+                    'another owner holds this store. The service keeps one exclusive '
+                    'connection so that its storage bound holds, so a second reader is '
+                    'refused rather than admitted; reach it through the control socket. '
+                    'Nothing was written') from exc
             raise MemoryError_('incompatible_store',
                                f'this file is not a memory store ({type(exc).__name__}); it was '
                                'left untouched') from exc
@@ -273,6 +450,15 @@ class Store:
 
     def floor(self):
         return int(self.meta('floor') or 0)
+
+    def index_usable(self):
+        """Is the search index present AND known to cover every live entry?
+
+        Emptiness and error are the wrong tests. An index that exists but lags the head
+        silently loses results, which is worse than being slow, so completeness is
+        tracked explicitly and anything short of it sends search to the scan instead.
+        """
+        return bool(self.fts) and int(self.meta('indexed_through') or 0) == self.head()
 
     def healthy(self):
         try:
@@ -371,9 +557,21 @@ class Store:
         both are documented in the contract rather than skipped silently.
         """
         self.admit(need, slots, control)
-        with self.db:
-            yield
-            self.enforce(control, need)
+        self.reset_log()
+        try:
+            with self.db:
+                yield
+                self.enforce(control, need)
+        except sqlite3.OperationalError as exc:
+            if not storage_exhausted(exc):
+                raise
+            # The engine refused a page before the commit, so the transaction rolled back
+            # whole. Reporting the rollback is the point: a caller must be able to tell a
+            # refused write from a partly applied one.
+            raise MemoryError_(
+                'capacity',
+                f'the engine refused a page at the {MAX_PAGES} page ceiling; the '
+                'transaction was rolled back and stored data is intact') from exc
 
     @contextlib.contextmanager
     def progress(self):
@@ -385,14 +583,30 @@ class Store:
         bounded instead of refused, by relieving write-ahead log growth when the file
         approaches its limit, and they add no rows a caller controls.
         """
-        with self.db:
-            yield
-        if self.physical() > MAX_PHYSICAL_BYTES - WAL_MARGIN:
-            self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+        self.reset_log()
+        try:
+            with self.db:
+                yield
+        except sqlite3.OperationalError as exc:
+            if not storage_exhausted(exc):
+                raise
+            # A progress transition that the engine refuses is the one case the reserve
+            # was meant to prevent, so it is reported as a blocked store rather than as
+            # ordinary fullness: reads and recovery stay available, writes do not resume
+            # on their own.
+            raise MemoryError_(
+                'storage_blocked',
+                f'the engine refused a page at the {MAX_PAGES} page ceiling during a '
+                'progress transition, which the reserve exists to prevent. The '
+                'transaction was rolled back and stored data is intact; recovery is '
+                'required before writes resume') from exc
+        # The reserve, not a margin, is what leaves room for this transition. Its pages
+        # are withheld from ordinary admission, so there is nothing to relieve here.
+        self.enforce_pages(control=True)
 
     def enforce(self, control, need=0):
         """Verify real allocation, and logical usage when the change was a growth."""
-        self.enforce_physical(control)
+        self.enforce_pages(control)
         if need:
             cap = MAX_LOGICAL_BYTES if control else MAX_LOGICAL_BYTES - RESERVED_BYTES
             logical = self.usage()['logical']
@@ -402,22 +616,28 @@ class Store:
                                    f'above the {cap} byte limit; it was rolled back and stored '
                                    'data is intact')
 
-    def enforce_physical(self, control):
-        """Check real allocation after a mutation, inside its transaction.
+    def enforce_pages(self, control):
+        """Check pages actually allocated, inside the transaction, so a breach rolls back.
 
-        Estimating physical growth from payload bytes is not enforcement: SQLite
-        allocates pages, maintains indexes and appends to the write-ahead log by amounts
-        the payload does not predict. Measuring what was actually allocated and raising
-        rolls the mutation back, which makes the advertised bound a limit rather than a
-        projection.
+        Projecting growth from payload bytes is not enforcement: SQLite allocates pages
+        and maintains indexes by amounts the payload does not predict, and the cost of one
+        row is a step function of its size rather than a curve. Measuring what was really
+        allocated and raising is what makes the ceiling a limit rather than an estimate.
+
+        Only the durable page count is compared. The log is excluded because it is reset
+        before every write and bounded by the page ceiling, so including it would make the
+        outcome depend on checkpoint timing and on how far a given SQLite build shrinks
+        the file during recovery.
+
+        A control or progress transition may draw on the reserve; an ordinary append may
+        not, which is what keeps a withdrawal possible at a full store.
         """
-        cap = MAX_PHYSICAL_BYTES if control else MAX_PHYSICAL_BYTES - RESERVED_BYTES
-        actual = self.physical()
+        cap = (MAX_PAGES if control else ORDINARY_MAX_PAGES) - COMMIT_SLACK
+        actual = self.pages()
         if actual > cap:
             raise MemoryError_('capacity',
-                               f'this mutation would leave {actual} physical bytes stored, above '
-                               f'the {cap} byte limit; it was rolled back and stored data is '
-                               'intact')
+                               f'this mutation would leave {actual} pages allocated, above the '
+                               f'{cap} page limit; it was rolled back and stored data is intact')
 
     def admit(self, need, slots=0, control=False):
         """The single admission point for every durable mutation.
@@ -435,22 +655,19 @@ class Store:
             use = self.usage()
             entry_cap = MAX_ENTRIES if control else MAX_ENTRIES - RESERVED_ENTRIES
             byte_cap = MAX_LOGICAL_BYTES if control else MAX_LOGICAL_BYTES - RESERVED_BYTES
-            physical_cap = (MAX_PHYSICAL_BYTES if control
-                            else MAX_PHYSICAL_BYTES - RESERVED_BYTES)
-            # Project the mutation rather than testing only what is already stored.
-            # Leave room for write-ahead log growth before declaring the store full.
-            # The log can hold far more bytes than the payload predicts, and it is
-            # reclaimable by a checkpoint, so refusing on it without checkpointing first
-            # would report a full store that is merely un-checkpointed.
-            margin = max(need, WAL_MARGIN)
+            page_cap = MAX_PAGES if control else ORDINARY_MAX_PAGES
+            # Pages already allocated are compared directly. There is no margin term: the
+            # log is not in this comparison, and the end-of-transaction check is what
+            # catches the growth a projection cannot predict.
+            pages = self.pages()
             if (use['entries'] + slots <= entry_cap and use['logical'] + need <= byte_cap
-                    and use['physical'] + margin <= physical_cap):
+                    and pages < page_cap):
                 return use
             if attempt == 0:
                 self.reclaim()
         raise MemoryError_('capacity', f"{use['entries']} entries, {use['logical']} logical bytes "
-                           f"and {use['physical']} physical bytes are stored, and this mutation "
-                           f'needs {need} more; nothing was written and stored data is intact')
+                           f'and {pages} pages are stored, and this mutation needs {need} more '
+                           'bytes; nothing was written and stored data is intact')
 
     def expire(self):
         """Remove only what is past its stated lifetime.
@@ -526,7 +743,7 @@ class Store:
         # Both pragmas must be driven to completion; preparing them without stepping
         # through their results leaves the pages exactly where they were.
         self.db.execute('PRAGMA incremental_vacuum').fetchall()
-        self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+        self.reset_log()
         return removed
 
     # --- writes ---------------------------------------------------------------
@@ -1033,16 +1250,24 @@ class Service:
         before = int(r.get('before') or 0)
         clause, args = self.store.live_clause()
         window = [before or (1 << 62), ROW_WINDOW + 1]
-        rows = []
-        if self.store.fts:
+        # One path is chosen, on whether the index can be trusted, and never on whether
+        # a query happened to match nothing. Falling back when the index returns no rows
+        # conflates "no such entry" with "index unusable" and answers the two differently
+        # for the same store, so a caller cannot tell which it received.
+        indexed = self.store.index_usable()
+        if indexed:
             try:
                 rows = self.store.db.execute(
                     f'{self.store.SELECT} WHERE seq IN (SELECT rowid FROM search WHERE search MATCH ?)'
                     f' AND {clause} AND seq < ? ORDER BY seq DESC LIMIT ?',
                     [term] + args + window).fetchall()
             except sqlite3.Error:
-                rows = []
-        if not rows:
+                # The index answered with an error, so it cannot be trusted for this
+                # reply either. Scan rather than report a short result as complete.
+                indexed, rows = False, []
+        if not indexed:
+            # The complete fallback. It is slower and it matches substrings rather than
+            # tokens, so the reply says which path produced it.
             pattern = '%' + term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
             rows = self.store.db.execute(
                 f"{self.store.SELECT} WHERE body LIKE ? ESCAPE '\\' AND {clause} AND seq < ? "
@@ -1054,7 +1279,7 @@ class Service:
         # `more` accounts for both limits: the byte budget and the row window. Reporting
         # only the first would hide results behind a false ending.
         more = truncated or (beyond and len(entries) == len(rows))
-        return dict(entries=entries, more=more,
+        return dict(entries=entries, more=more, indexed=indexed,
                     next_before=entries[-1]['seq'] if entries and more else None)
 
     def status(self, r=None):
