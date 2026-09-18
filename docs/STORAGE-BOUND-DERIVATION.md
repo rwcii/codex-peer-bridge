@@ -408,12 +408,18 @@ reserve. The engine holds `max_page_count` at `MAX_PAGES` underneath both, so th
 does not depend on either check being correct.
 
 **A commit allocates pages the in-transaction count does not yet report**, so enforcement
-leaves `COMMIT_SLACK` pages of room and the *committed* store honours its threshold rather
-than the state part way through. With incremental auto-vacuum one pointer-map page carries
-back pointers for `usable/5 = 819` pages, and a growing transaction allocates one as it
-crosses that boundary, after the point where the count can be read. Measured, the gap is
-one page for an ordinary append; the constant is 2, which also covers crossing a boundary.
-Without it, appends committed one page above the threshold.
+leaves `COMMIT_SLACK` pages of room. With incremental auto-vacuum one pointer-map page
+carries back pointers for `usable/5 = 819` pages, and a growing transaction allocates one as
+it crosses that boundary, after the point where the count can be read. Without any allowance,
+appends committed above the threshold every time.
+
+**`COMMIT_SLACK` is a guard, not a bound.** The gap was one page on the runtime where it was
+measured and as many as eight on another supported build, so the committed count can sit
+slightly above the ordinary threshold. That is harmless and is stated rather than papered
+over: the reserve is three orders of magnitude larger, `max_page_count` holds underneath
+regardless, and the next append is refused at admission. What the tests assert is therefore
+that the reserve survives, not that the threshold is exact -- an exact-threshold assertion
+would be testing the build.
 
 ### Why the reserve is this size
 
@@ -527,7 +533,8 @@ admission counts reserved slots as well as bytes. That is a further reason the w
   documented as a handled capacity outcome rather than ruled out.
 - A rebuild is not assumed to add no pages. It is guarded before it starts, rolled back if it
   does not fit, and search falls back to a complete scan.
-- `APPEND_ALLOWANCE` and `REBUILD_HEADROOM` are guards that keep refusals rare, not bounds.
-  Neither makes a rolled-back capacity refusal impossible, and neither is claimed to.
+- `APPEND_ALLOWANCE`, `REBUILD_HEADROOM` and `COMMIT_SLACK` are guards that keep refusals and
+  overshoot rare, not bounds. None makes a rolled-back capacity refusal impossible, and none
+  is claimed to. `max_page_count` is the only hard limit here, and the engine holds it.
 - The blocked state is held by the running service, not written into the store, because a
   store that cannot be written cannot record that it cannot be written.

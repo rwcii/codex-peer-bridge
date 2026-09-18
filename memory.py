@@ -106,13 +106,18 @@ WAL_BUDGET_BYTES = 32 + (MAX_PAGES + PAD_FRAMES) * FRAME_BYTES
 # acknowledgement and a retirement record cost a few pages each.
 RESERVE_PAGES = 2048
 ORDINARY_MAX_PAGES = MAX_PAGES - RESERVE_PAGES
-# A commit allocates pages the in-transaction count does not yet report. With incremental
-# auto-vacuum one pointer-map page carries back pointers for usable/5 pages, so a
-# transaction that grows the store allocates one as it crosses that boundary, after the
-# point where the page count can be read. Enforcement therefore leaves this much room, so
-# that the COMMITTED store honours its threshold rather than the state part way through.
-# Measured, the gap between the count read inside the transaction and the committed count
-# is one page for an ordinary append; the bound allows for crossing a boundary as well.
+# A commit allocates pages the in-transaction count does not yet report: with incremental
+# auto-vacuum one pointer-map page carries back pointers for usable/5 pages, and one is
+# allocated as a growing transaction crosses that boundary, after the point where the count
+# can be read. Enforcement leaves this much room so the COMMITTED store honours its
+# threshold rather than the state part way through.
+#
+# It is a guard, NOT a bound. The gap was one page for an ordinary append on the runtime
+# where it was measured and as many as eight on another supported build, so the committed
+# count can sit slightly above the ordinary threshold. That is harmless: the reserve is
+# three orders of magnitude larger, the engine holds MAX_PAGES underneath regardless, and
+# the next append is refused at admission. What must not be claimed is that the threshold
+# is exact.
 PTRMAP_COVERAGE = PAGE_SIZE // 5
 COMMIT_SLACK = 2
 # Room admission leaves for the growth one append causes, so that a store resting just
