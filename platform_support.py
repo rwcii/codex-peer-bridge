@@ -234,3 +234,27 @@ def control_socket_path(root):
         return direct
     digest = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:16]
     return Path('/tmp/cc-socks') / f'{digest}-control.sock'
+
+
+class AccountHomeUnavailable(RuntimeError):
+    """The effective OS account has no usable persistent home directory."""
+
+
+def account_home():
+    """Read the OS account entry, never HOME or a provider-specific override."""
+    import pwd
+    try:
+        value = pwd.getpwuid(os.geteuid()).pw_dir
+        if not value or not Path(value).is_absolute() or not Path(value).is_dir():
+            raise AccountHomeUnavailable('account_home_unavailable')
+        return Path(value)
+    except (KeyError, OSError, ValueError):
+        raise AccountHomeUnavailable('account_home_unavailable') from None
+
+
+def participant_lock_dir():
+    """Persistent singleton namespace shared by every state root of this account."""
+    home = account_home()
+    if DARWIN:
+        return home / 'Library' / 'Application Support' / 'koinon-locks'
+    return home / '.local' / 'state' / 'koinon-locks'

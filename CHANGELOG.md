@@ -5,6 +5,13 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+### Added
+
+- Account-local notifier ownership across state directories. Duplicate provider/session
+  targets fail before registration; conflict diagnostics and session status expose a
+  matching digest. Persistent Koinon lock paths do not depend on agent home overrides,
+  and delivery subprocesses cannot retain the lock after notifier exit.
+
 ## 2026-09-18 — Koinon
 
 ### Changed

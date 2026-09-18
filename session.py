@@ -60,27 +60,31 @@ def bridge_status(prefix, state):
     return None
 
 
-def notifier_ready(state, bridge):
+def notifier_readiness(state, bridge):
     if not bridge:
-        return False
+        return None
     try:
         ready=json.loads((state/'notify-ready.json').read_text())
         if ready['bridge_pid'] != bridge['pid']:
-            return False
+            return None
         pid=ready['notifier_pid']
         if not platform_support.same_process(ready['proc_start'], platform_support.proc_start(pid)):
-            return False
+            return None
     except (OSError,ValueError,KeyError,IndexError,subprocess.SubprocessError):
-        return False
+        return None
     try:
         with (state/'notifier.lock').open('a') as lock:
             try:
                 fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:
-                return True
+                return ready
     except OSError:
         pass
-    return False
+    return None
+
+
+def notifier_ready(state, bridge):
+    return notifier_readiness(state, bridge) is not None
 
 
 def read_config(prefix):
@@ -271,6 +275,8 @@ def main():
         if a.action=='status' or (a.action=='ensure' and active):
             data=result(prefix,state,name,a.thread,repo,'running' if healthy else ('repair_required' if active else 'stopped'),agent,model)
             data['bridge']=active
+            ready=notifier_readiness(state,active) if healthy else None
+            data['participant_lock']=ready.get('participant_lock') if ready else None
             if active and not healthy:
                 data['repair_command']=shlex.join([sys.executable,str(prefix/'session.py'),'stop','--thread',a.thread])
             print(json.dumps(data))

@@ -12,6 +12,14 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 from scripts.install import units
 
+
+def isolate_account_home(app, home):
+    home.mkdir(parents=True, exist_ok=True)
+    # Test-owned installed copy only; production has no environment escape hatch.
+    with (app/'platform_support.py').open('a') as stream:
+        stream.write('\ndef account_home():\n    return Path(' + repr(str(home)) + ')\n')
+
+
 class SessionTests(unittest.TestCase):
     def test_isolation_and_units(self):
         config={'state_root':'/state'}
@@ -73,6 +81,7 @@ class SessionTests(unittest.TestCase):
             subprocess.run([sys.executable,'scripts/install.py','--configure-codex','--no-start',
                 '--codex',sys.executable,'--prefix',str(app),'--state-dir',str(root/'state'),
                 '--unit-dir',str(root/'units'),'--codex-home',str(root/'codex')],check=True,capture_output=True,env=env)
+            isolate_account_home(app, root/'account')
             config=session.read_config(app)
             processes=[]
             try:
@@ -92,7 +101,12 @@ class SessionTests(unittest.TestCase):
                     self.assertTrue(session.notifier_ready(state,status))
                     result=subprocess.run([sys.executable,str(app/'session.py'),'ensure','--thread',thread],
                                            env=env,capture_output=True,text=True,check=True)
-                    self.assertEqual(json.loads(result.stdout)['bridge']['pid'],status['pid'])
+                    reported = json.loads(result.stdout)
+                    self.assertEqual(reported['bridge']['pid'],status['pid'])
+                    from participant_lock import identity
+                    self.assertEqual(reported['participant_lock'], identity('codex', thread))
+                    self.assertEqual(json.loads((state/'notify-ready.json').read_text())[
+                        'participant_lock'], reported['participant_lock'])
                 self.assertNotEqual(statuses[0]['pid'],statuses[1]['pid'])
                 self.assertNotEqual(statuses[0]['address'],statuses[1]['address'])
                 # A unit file alone must not prevent shutting down a manual instance.
@@ -141,6 +155,7 @@ class SystemdStartupTests(unittest.TestCase):
                         '--unit-dir', str(self.root/'units'),
                         '--codex-home', str(self.root/'codex')],
                        check=True, capture_output=True, env=self.env)
+        isolate_account_home(self.app, self.root/'account')
         # A competing command must never reach the host's service manager.
         binaries = self.root/'bin'
         binaries.mkdir()

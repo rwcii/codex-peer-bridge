@@ -49,5 +49,27 @@ class InstallTests(unittest.TestCase):
             self.assertIn('--codex',unit)
             self.assertFalse((root/'state').exists())
 
+    def test_uninstall_preserves_shared_locks_under_an_ancestor_state_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            account = root/'account'
+            app = root/'app'
+            lock_dir = account/'.local/state/koinon-locks'
+            lock_dir.mkdir(parents=True, mode=0o700)
+            lock = lock_dir/('0'*64+'.lock')
+            lock.touch(mode=0o600)
+            inode = lock.stat().st_ino
+            install = subprocess.run([sys.executable, 'scripts/install.py',
+                '--configure-codex', '--no-start', '--codex', sys.executable,
+                '--prefix', str(app), '--state-dir', str(account),
+                '--unit-dir', str(root/'units'), '--codex-home', str(root/'codex')],
+                capture_output=True, text=True)
+            self.assertEqual(install.returncode, 0, install.stderr)
+            uninstall = subprocess.run([sys.executable, str(app/'scripts/uninstall.py'),
+                '--prefix', str(app)], capture_output=True, text=True)
+            self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+            self.assertEqual(lock.stat().st_ino, inode)
+            self.assertEqual(lock.stat().st_size, 0)
+
 if __name__ == '__main__':
     unittest.main()

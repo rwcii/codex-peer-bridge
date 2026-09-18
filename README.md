@@ -236,6 +236,21 @@ State directories must be owned by the current user and mode 0700. The notifier 
 
 The watcher checks every two seconds and batches new user messages into a notice. It skips controls to avoid receipt loops. Queue failures retry after 30 seconds, and checkpoints advance only after queue success. An ambiguous timeout or crash can produce a duplicate notice. Codex controls notification scheduling: delivery may wait until an active turn finishes. Older notices can therefore surface after their messages have already been handled.
 
+## Notifier ownership
+
+One notifier may serve a provider/session identity per OS account, even when bridge
+instances use different state directories or provider homes. The scope is deliberately
+account-local: equal session IDs in separate DeepSeek harnesses conflict conservatively.
+Different session IDs or providers can run together. A refused start reports
+`participant_in_use` with provider, scope and a digest; `session.py status` exposes the
+same `participant_lock` value for a running instance. Manual installations can inspect
+that value in their private `notify-ready.json`. Neither diagnostic prints the target ID.
+
+Locks use a persistent `koinon-locks` directory below the OS account's home, independent
+of environment overrides. See [installation](docs/INSTALL.md#notifier-ownership) for the
+paths and upgrade procedure. This coordinates Koinon notifiers only; it cannot exclude
+other programs that deliver to the same session without taking this lock.
+
 ## Lifecycle
 
 Both processes must remain running. The optional installer supplies systemd user services on Linux; see [installation](docs/INSTALL.md). macOS has no systemd, so it uses the managed supervisor instead (`session.py ensure` reports `manual_required` with a start command, and `session.py run` owns both children in one persistent session). Stop the watcher with Ctrl-C or SIGTERM; `bridge.py stop` stops the server and causes the watcher to exit. Graceful cleanup removes only the process's own sockets and registry entry. SQLite and checkpoints remain for restart.

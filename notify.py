@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Register the live bridge and queue inbox notifications to a selected participant."""
 import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -15,6 +14,7 @@ import uuid
 
 import dsh_delivery
 import platform_support
+from participant_lock import OwnershipError, notifier_ownership
 from bridge import DEFAULT, private_dir
 from peer_guidance import PEER_GUIDANCE
 
@@ -89,9 +89,11 @@ def proc_start_value(pid):
 def run(a):
     os.umask(0o077)
     root = Path(a.state_dir).absolute()
-    private_dir(root)
-    lock = (root / 'notifier.lock').open('a')
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with notifier_ownership(root, a.agent, a.thread) as participant:
+        return run_owned(a, root, participant)
+
+
+def run_owned(a, root, participant):
     status = json.loads(subprocess.check_output([sys.executable, str(Path(__file__).with_name('bridge.py')),
                                                '--state-dir', str(root), 'status'], timeout=10))['result']
     pid, address = status['pid'], status['address']
@@ -124,7 +126,7 @@ def run(a):
     db = sqlite3.connect((root / 'inbox.sqlite3').as_uri() + '?mode=ro', uri=True)
     ready = root/'notify-ready.json'
     save(ready,dict(owner=owner,bridge_pid=pid,notifier_pid=os.getpid(),
-                    proc_start=proc_start_value(os.getpid())))
+                    proc_start=proc_start_value(os.getpid()), participant_lock=participant))
     print(json.dumps(dict(registered=address, name=a.name, thread=a.thread)), flush=True)
     try:
         while not stopped:
@@ -164,7 +166,6 @@ def run(a):
                 record.unlink()
         except FileNotFoundError:
             pass
-        lock.close()
 
 
 if __name__ == '__main__':
@@ -182,4 +183,8 @@ if __name__ == '__main__':
     p.add_argument('--name', default='codex-peer')
     p.add_argument('--repo', default=os.getcwd())
     p.add_argument('--after', type=int, default=0)
-    run(p.parse_args())
+    try:
+        run(p.parse_args())
+    except OwnershipError as exc:
+        print(json.dumps(exc.result()), flush=True)
+        raise SystemExit(1)

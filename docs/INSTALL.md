@@ -285,6 +285,38 @@ not add global guidance. Prefer Codex-wide mode for concurrent sessions. It does
 adopt an already running prototype or legacy inbox automatically; stop or migrate that
 instance deliberately to avoid duplicate registrations for one conversation.
 
+## Notifier ownership
+
+The notifier takes its state-directory lock first, then a lock for the provider and
+session identity across the OS account. Both acquisitions are nonblocking. A conflict
+fails startup before registration or delivery, with `participant_in_use`, the provider,
+the `account-local` scope, and the lock digest. Match that digest to `participant_lock`
+in `session.py status` or the running notifier's private `notify-ready.json`. Stop an
+unwanted instance through its own session command; do not remove a lock file to bypass it.
+
+The shared namespace is derived from the effective user's operating-system account
+entry, not `HOME`, `XDG_STATE_HOME`, `CODEX_HOME`, `DSH_HOME`, or the delivery URL:
+
+- Linux: `<account-home>/.local/state/koinon-locks`.
+- macOS: `<account-home>/Library/Application Support/koinon-locks`.
+
+An unavailable account home produces `account_home_unavailable`; startup does not fall
+back to a different namespace. A state directory equal to or below the resolved lock
+namespace is refused, including symlink aliases. An ancestor state directory is allowed;
+removal must preserve the shared namespace and must not recursively purge that state root.
+
+Lock files persist after exit and uninstall. Each distinct historical provider/session
+identity adds a zero-length file; inode and directory-entry use is not bounded by a
+journal or memory-store budget. Never unlink these files while notifiers may use them.
+Descriptors are close-on-exec, so a launched delivery command cannot retain the lock
+once the notifier exits. Unrelated tools that do not take this lock are not coordinated.
+
+When upgrading from a runtime without participant locks, stop and upgrade all Koinon
+notifiers that could target the same participant before restarting them. An older
+notifier in another state directory does not hold the new lock and cannot be excluded
+by it. Preserve inboxes, checkpoints, registration targets and unrelated bridge instances;
+do not treat installing files with `--no-start` as activating the new exclusion rule.
+
 ## Upgrades and removal
 
 Stop this installation's registered sessions before upgrading runtime code, then rerun
