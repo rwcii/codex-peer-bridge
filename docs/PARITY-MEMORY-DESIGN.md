@@ -261,48 +261,92 @@ that read and the connection, and an unqualified request would then stop the wro
 
 ### Storage bound
 
-A single measured total cannot be enforced. The file's size includes a write-ahead log whose
-size depends on checkpoint timing and on whether a concurrent reader is holding an old
-snapshot, so a limit on the total makes admission depend on unrelated timing: the same write
-succeeds or fails according to when the last checkpoint ran. A constant margin does not fix
-that; it only chooses how often the wrong answer appears.
+The full argument, with source references and measurements, is in
+[STORAGE-BOUND-DERIVATION.md](STORAGE-BOUND-DERIVATION.md). This section states the
+policy the store implements; the derivation is what justifies the numbers.
 
-The bound is therefore split into three budgets, each enforceable by a different mechanism.
+Two earlier designs for this section are withdrawn and must not return. Bounding the log
+with `wal_autocheckpoint` and `journal_size_limit` was wrong: the first triggers a passive
+checkpoint rather than capping anything, and the second governs what is retained after a
+reset, not the peak. Bounding it by measurement plus a check after commit was also wrong:
+a check after the fact is a diagnostic for an assumption already violated, and it cannot
+hold a peak below a hard limit.
 
-**Durable data** is the committed content of the main database, measured as `page_count`
-multiplied by `page_size`. Admission compares projected growth against this figure alone, so a
-transient log never makes admission flap.
+**The log a single transaction can produce is finite and derived, not observed.** It has
+two terms. The pages the transaction dirties, `D`, reach the log exactly once each,
+because `cache_spill=OFF` makes the commit list the only write path. The final frame is
+then repeated to the next sector boundary, which adds at most `ceil((65535)/4120) = 16`
+frames at this page size. Since `max_page_count` caps `D`:
 
-**Log workspace** is bounded by configuration rather than by measurement.
-`PRAGMA wal_autocheckpoint` bounds the pages accumulated between automatic checkpoints, and
-`PRAGMA journal_size_limit` bounds the bytes the log file retains after one. Both are set when
-the store opens and read back to confirm they took effect, because a pragma that is silently
-ignored is the failure mode this project has already met once with `auto_vacuum`. A single
-transaction may exceed the autocheckpoint threshold while it runs; that is the one unbounded
-term, and it is bounded in turn by the per-entry and per-page limits, which cap how much any
-one transaction can write.
+```
+WAL <= 32 + (N + 16) * (24 + page_size)          N = max_page_count
+```
 
-**Maintenance workspace** is headroom inside the data budget that ordinary admission may not
-consume. It exists so that progress and cleanup always have room to commit. Reserving it is
-what makes "bounded progress" a property rather than a hope: an acknowledgement, a retirement
-record, a snapshot removal or an index rebuild draws on this reserve and is therefore never
-refused for space, while still being subject to a real limit.
+Durability is not traded for this. Padding disappears if `synchronous` is lowered, and it
+is carried instead.
 
-So `MAX_PHYSICAL_BYTES = DATA_BUDGET + WAL_BUDGET`, and an ordinary write is admitted only up
-to `DATA_BUDGET - MAINT_RESERVE - RESERVED_BYTES`, where `RESERVED_BYTES` remains the room kept
-for a withdrawal.
+**Five settings are applied when the store opens, and every one is read back and
+compared with what was requested.** A pragma that is silently ignored is the failure mode
+this project has already met once with `auto_vacuum`.
 
-**Enforcement points.** Admission checks projected data bytes before the transaction. The
-transaction's own end checks measured data pages and rolls back on breach. After commit, the
-checkpoint result is inspected rather than assumed: `PRAGMA wal_checkpoint` reports a busy flag
-and the pages it moved, and a checkpoint that could not complete is reported instead of being
-treated as success. A rebuild that would exceed the maintenance reserve is refused before it
-starts rather than part way through, since a partially rebuilt index is worse than a stale one.
+| Setting | Why |
+|---|---|
+| `locking_mode=EXCLUSIVE`, before `journal_mode` | Engine-enforced single ownership, and no `-shm` file exists at all |
+| `auto_vacuum=INCREMENTAL`, before `journal_mode` | Freed pages can leave the file |
+| `journal_mode=WAL` | The log this section bounds |
+| `cache_spill=OFF` | Makes the commit list the only path to the log |
+| `temp_store=MEMORY` | Keeps sorters out of the filesystem |
+| `max_page_count=N` | The durable ceiling, enforced by the engine |
 
-**Verification.** Tests assert the log pragmas are in effect after open; drive durable data to
-its budget and then prove that a withdrawal, an acknowledgement, a retirement and an index
-rebuild each still complete; assert the log stays within its budget across those operations;
-and assert that a checkpoint reporting busy is surfaced rather than swallowed.
+`max_page_count` cannot shrink an existing database; asked to, it returns the current
+count. The returned value is therefore compared with the request, and an oversized
+incompatible store is refused **without deleting anything**.
+
+**Ownership.** All readers reach the store through the control socket. No database read
+transaction spans a response or an await. Exclusive locking mode makes this an engine
+property rather than a convention: a second process cannot open the store at all.
+
+**Admission compares durable data pages, and nothing else.** The earlier design compared
+the total file size including the log and then added a fixed margin for it. That made
+admission depend on checkpoint timing, so the same write succeeded or failed according to
+when the last checkpoint ran, and how far a given SQLite build shrank the file during
+recovery. Admission now reads `page_count` alone. The log is not in the comparison
+because it is bounded separately and reset before every write.
+
+**A reset is verified before every write transaction, and the test is a conjunction.**
+`PRAGMA wal_checkpoint(TRUNCATE)` must return `busy == 0` **and** `log_pages == 0`, and
+the `-wal` file must be absent or exactly zero bytes. No single one of these is
+sufficient: a passive checkpoint reports `busy == 0` while moving nothing, and `(0, 0, 0)`
+is also what a store returns when no log has ever existed. A failed reset reports
+`storage_blocked`, admits no further writes, and keeps reads and explicit recovery
+available. Under exclusive mode no foreign reader can exist, so a busy result is a
+genuine recovery condition and not ordinary contention.
+
+**Maintenance and control capacity are reserved from ordinary admission.** An
+acknowledgement, a retirement record, a withdrawal and an index rebuild draw on a reserve
+that ordinary appends may not consume, so a full store can still record progress and
+retract a directive. A rebuild that would exceed the reserve is refused before it starts,
+never part way through, and a known incomplete index is never served.
+
+**Auxiliary files are bounded rather than excused.** Sorters are held in memory.
+Sub-journals have only two write sites in the pager: the cache-spill path, unreachable
+once spilling is off, and one gated on an open savepoint. The service opens no explicit
+savepoint, so the only source is a statement journal, whose size is bounded by the pages
+one statement must undo. No maintenance statement may have an unbounded undo set.
+
+**The memory cost is stated, not hidden.** Disabling the spill holds the dirty set until
+commit. The payload term is bounded by `N * page_size`; page metadata, FTS5 working
+structures, in-memory sorters and the rows in flight are additional and are bounded by the
+same operation design that bounds `D`. An allocation failure fails the transaction by
+rollback, like any other error, and never applies it partly.
+
+**Verification is by invariant, not by size.** Different correct SQLite builds allocate
+different numbers of pages for the same content, so a test demanding a particular size
+would be testing the build. The supported matrix asserts instead that every setting reads
+back as requested, that no `-shm` file exists, that the log holds zero bytes before any
+commit, that frames per dirty page never exceed `1 + 16/D`, that a reset satisfies the
+conjunction above, that a `max_page_count` breach rolls back whole with integrity intact,
+and that no sub-journal reaches disk.
 
 ### Durable transitions
 

@@ -1,126 +1,223 @@
 # Derivation: the write-ahead log produced by one transaction
 
-This note answers one question and nothing else: **what is the largest write-ahead log
-that a single admitted transaction can produce?** Every storage budget in
-`PARITY-MEMORY-DESIGN.md` depends on that figure, so it is derived and measured here
-before any policy is written against it.
+This note answers one question: **what is the largest write-ahead log a single admitted
+transaction can produce?** Every storage budget in `PARITY-MEMORY-DESIGN.md` rests on
+that figure, so it is derived from the SQLite sources, against pinned versions, before
+any policy is written against it.
 
-An earlier design bounded the log with `wal_autocheckpoint` and `journal_size_limit`.
-That design was wrong and is withdrawn. `wal_autocheckpoint` triggers a passive
-checkpoint, it does not cap anything, and a passive checkpoint can move nothing;
-`journal_size_limit` governs the size retained after a reset, not the peak. Neither
-bounds a transaction that is still running.
+Two earlier designs are withdrawn.
 
-## 1. The arithmetic is exact
+- Bounding the log with `wal_autocheckpoint` and `journal_size_limit` was wrong.
+  `wal_autocheckpoint` triggers a passive checkpoint rather than capping anything, and
+  `journal_size_limit` governs what is retained after a reset, not the peak.
+- Bounding it by measurement plus a check after commit was also wrong. A check after
+  the fact is a diagnostic for a violated assumption; it cannot hold a peak below a hard
+  limit. Sampling a file size, however finely, yields an observed maximum, not a bound.
 
-From the file format: a WAL is a 32-byte header followed by frames, and "each frame
-consists of a 24-byte frame-header followed by a *page-size* bytes of page data"
-(`fileformat.html#wal_file_format`). So for a log holding `F` frames:
+Every term below is finite and traced to source. Measurements appear only to corroborate
+a term that the source already establishes, and they are labelled by which kind of
+workload produced them.
+
+## 1. The frame arithmetic is exact
+
+A WAL is a 32-byte header followed by frames, and "each frame consists of a 24-byte
+frame-header followed by a *page-size* bytes of page data"
+(`fileformat.html#wal_file_format`). For `F` frames at this store's 4096-byte page, one
+frame costs 4120 bytes:
 
 ```
 wal_bytes = 32 + F * (24 + page_size)
 ```
 
-At the 4096-byte page this store uses, one frame costs 4120 bytes. Nothing here is
-estimated; the only unknown is `F`.
-
-## 2. Bounding the frame count
-
-A transaction appends a frame each time it writes a page to the log. It writes pages at
-two moments: when the page cache *spills* mid-transaction, and at commit. Spilling is
-what makes `F` exceed the number of distinct pages the transaction touched, because a
-page that is spilled and then modified again is written again.
-
-`PRAGMA cache_spill=OFF` removes the first moment. The documentation describes it as
-disabling "the ability of the pager to spill dirty cache pages to the database file in
-the middle of a transaction" (`pragma.html#pragma_cache_spill`). If nothing is written
-before commit, then commit writes each dirty page exactly once, and
+## 2. `F` has exactly two terms
 
 ```
-F = D,  where D = the distinct pages the transaction dirties
+F <= D + P
 ```
 
-**This is evidence, not a contract.** The documentation does not promise that spilling
-can never occur when the pragma is off, and it says nothing about behaviour under
-memory exhaustion. Section 5 therefore keeps a runtime check rather than trusting the
-bound. What the measurements do establish is that the pre-commit log was *exactly zero
-bytes* for every operation tested, at full store size, on the runtime measured.
+`D` is the count of distinct pages the transaction dirties. `P` is the sector-padding
+term. Both are bounded below.
 
-Since `D` cannot exceed the number of pages in the database, and `PRAGMA
-max_page_count` caps that number in the engine:
+### 2.1 Why the commit list is the only write path: `D`
+
+Source references are to SQLite 3.46.1, `src/pager.c`.
+
+A page reaches the log from two call sites. The first is `pagerStress`, the cache-spill
+path. `SPILLFLAG_OFF` is defined as "Never spill cache. Set via pragma" (line 447), and
+the pager documents the consequence directly: "When bits SPILLFLAG_OFF or
+SPILLFLAG_ROLLBACK of doNotSpill are set, writing to the database from pagerStress() is
+disabled altogether" (lines 523-524). The guard is at line 4610, and the pragma sets and
+clears the bit at lines 3630-3632.
+
+With that path disabled the only remaining writer is the commit dirty list, which visits
+each dirty page once. Hence `F = D` before padding, as a property of the code rather
+than of an observation.
+
+**Corroboration, raw-engine stress workload.** With spilling off the log held *zero
+bytes* before `COMMIT` in every operation measured, and no operation exceeded 1.00 frames
+per page. With spilling on, incremental vacuum reached **3.77 frames per page** and a
+68.56 MiB log over an 88 MiB database, because vacuum moves pages repeatedly and each
+spilled page is written again. The same vacuum with spilling off wrote 4609 frames
+instead of 17449. Repeated `UPDATE`s do not reproduce the amplification, so a probe built
+from them would have wrongly suggested spilling is free.
+
+The price of disabling the spill is memory: the dirty set is held until commit. Expiring
+a full store grew resident memory by 43.1 MiB. Section 6 states that term.
+
+### 2.2 The padding term: `P`
+
+Source references are to SQLite 3.46.1, `src/wal.c`, in `walFrames`.
+
+At commit, when the sync flags are set, SQLite repeats the final frame to reach the next
+sector boundary. The comment states it plainly: "If padding is needed, then the final
+frame is repeated (with its commit mark) until the next sector boundary is crossed"
+(lines 4141-4144). The loop follows at lines 4150-4160:
+
+```c
+if( pWal->padToSectorBoundary ){
+  int sectorSize = sqlite3SectorSize(pWal->pWalFd);
+  w.iSyncPoint = ((iOffset+sectorSize-1)/sectorSize)*sectorSize;
+  bSync = (w.iSyncPoint==iOffset);
+  while( iOffset<w.iSyncPoint ){
+    rc = walWriteOneFrame(&w, pLast, nTruncate, iOffset);
+    if( rc ) return rc;
+    iOffset += szFrame;
+    nExtra++;
+  }
+}
+```
+
+`padToSectorBoundary` is initialised to 1 (line 1707) and cleared only when the device
+reports `SQLITE_IOCAP_POWERSAFE_OVERWRITE` (line 1725), so it must be assumed set.
+
+The gap to the boundary is strictly less than one sector, and each iteration advances by
+one frame, so the term is bounded by the sector-size ceiling. `sqlite3SectorSize` is
+clamped -- its "return value is guaranteed to lie between 32 and MAX_SECTOR_SIZE"
+(`pager.c`, line 2681) -- and `MAX_SECTOR_SIZE` is `0x10000` (`pager.c`, line 415).
 
 ```
-D <= N        (N = max_page_count)
-wal_max = 32 + N * (24 + page_size)
+P <= ceil((MAX_SECTOR_SIZE - 1) / (24 + page_size)) = ceil(65535 / 4120) = 16
 ```
 
-## 3. Measurements
+Padding occurs only when `WAL_SYNC_FLAGS(sync_flags) != 0`, so lowering `synchronous`
+would remove the term. **Durability is kept and the term is carried instead.** A storage
+formula is not a reason to weaken a durability guarantee.
 
-Linux, Python 3.14.4, SQLite 3.46.1, page size 4096, `auto_vacuum=INCREMENTAL` set
-before `journal_mode=WAL`. The store uses the real `SCHEMA_SQL` from `memory.py` and a
-contentless FTS5 table. Bodies are distinct-token text, not repeated filler: filler
-understates the index by two orders of magnitude. Every measurement begins from a
-verified log reset, and the log file size is sampled every 0.5 ms so the figure is the
-peak during the transaction, not the size left behind.
+**Corroboration, raw-engine stress workload.** A transaction dirtying 4000 pages produced
+4001 frames, and one dirtying 302 pages produced 304: one to two padding frames on a
+4096-byte sector, consistent with the bound.
 
-Filled to the logical ceiling: 3855 entries of 8192 bytes = 32.0 MiB logical.
+### 2.3 The bound
 
-| State | Data pages | Data | `-shm` |
-|---|---|---|---|
-| At the logical ceiling | 13274 | 51.85 MiB | 128 KiB |
-| After one whole-store snapshot | 21437 | 83.74 MiB | 128 KiB |
+```
+F    <= N + 16                       (N = max_page_count, since D <= N)
+WAL  <= 32 + (N + 16) * (24 + page_size)
+```
 
-**The logical ceiling costs 1.62x in data pages, and 2.62x once a snapshot of it
-exists.** The index and per-row overhead are the difference.
+## 3. The durable ceiling is engine-enforced
 
-One transaction per row. `pre-commit` is the log size observed before `COMMIT` ran.
+`PRAGMA max_page_count` caps the page count inside the engine. Driven past a 6000-page
+limit inside one transaction:
 
-| Operation | `cache_spill` | Pages | Log peak | Frames | Frames/page | Pre-commit log | RSS growth |
-|---|---|---|---|---|---|---|---|
-| Rebuild the whole index | ON | 13274 | 19.83 MiB | 5048 | 0.38 | 20571192 | 30.5 MiB |
-| Rebuild the whole index | OFF | 13274 | 19.83 MiB | 5047 | 0.38 | **0** | 0.0 MiB |
-| Snapshot the whole store | ON | 21437 | 32.31 MiB | 8224 | 0.38 | 31835272 | 0.0 MiB |
-| Snapshot the whole store | OFF | 21437 | 32.31 MiB | 8224 | 0.38 | **0** | 0.0 MiB |
-| Expire everything | ON | 22502 | 88.38 MiB | 22494 | 1.00 | 90162112 | 0.2 MiB |
-| Expire everything | OFF | 22502 | 88.38 MiB | 22493 | 1.00 | **0** | 43.1 MiB |
-| Incremental vacuum | ON | 22502 | **68.56 MiB** | 17449 | **3.77** | 71436712 | 0.0 MiB |
-| Incremental vacuum | OFF | 22502 | **18.11 MiB** | 4609 | **1.00** | **0** | 3.2 MiB |
+- the write failed with `database or disk is full`;
+- the transaction rolled back completely, the page count returning to its pre-transaction
+  value and every row from the failed transaction gone;
+- `PRAGMA integrity_check` returned `ok`;
+- the failed transaction wrote **no log at all**, because the allocation was refused
+  before any page was written;
+- asked to set the limit below the current page count, it returned the current count
+  rather than the requested one.
 
-### What the table establishes
+The last point is the operative one: the returned value must be read and compared with
+the request, exactly as `auto_vacuum` taught this project once already. The limit cannot
+shrink an existing database, so an oversized incompatible store is refused without
+deleting anything.
 
-1. **Amplification is real, and it is the vacuum that produces it.** With spilling
-   enabled, incremental vacuum wrote 3.77 frames for every page in the database and
-   produced a 68.56 MiB log for an 88 MiB database. Vacuum moves pages repeatedly, so
-   pages are spilled and then dirtied again. Synthetic repeated `UPDATE`s do *not*
-   reproduce this: they stayed at 1.00 frames per page because SQLite overwrites a
-   frame it wrote earlier in the same uncommitted transaction. Relying on that
-   overwrite would have been relying on an undocumented optimisation that the vacuum
-   path does not benefit from anyway.
-2. **`cache_spill=OFF` removes the amplification.** The same vacuum produced 4609
-   frames instead of 17449, and 18.11 MiB instead of 68.56 MiB. No operation exceeded
-   **1.00 frames per page** with spilling off.
-3. **The pre-commit log was zero for every operation with spilling off**, which is the
-   observation the `F = D` argument rests on.
-4. **The price is memory.** Expiring the whole store grew resident memory by 43.1 MiB,
-   because 22493 dirty pages were held until commit instead of being spilled. The
-   memory cost of this design is `D * page_size`, and it is bounded by `N * page_size`.
+Allocation failure and rollback behaviour: a refused allocation raises before any page is
+written, the transaction is rolled back whole, and the store is left at its previous
+page count with integrity intact. A memory allocation failure while the dirty set is held
+(section 6) fails the transaction the same way, by rollback, not by partial application.
 
-## 4. The engine-enforced durable ceiling
+## 4. The shared-memory term is zero, by exclusive mode
 
-`PRAGMA max_page_count` was set to 6000 and the store driven past it inside one
-transaction:
+The wal-index file is allocated in fixed blocks, not arbitrary byte counts. From
+`walformat.html`: "each hash table is 32768 bytes in size. Except, a 136-byte header is
+carved out of the front of the very first hash table"; the first block maps 4062 frames
+(`u32 aPgno[4062]`) and each later block maps 4096; "the total size of the shm file is
+always a multiple of 32768". So where the file exists:
 
-- The write failed with `database or disk is full`.
-- The transaction rolled back completely: the page count returned to its pre-transaction
-  value of 1911 and every row written by the failed transaction was gone.
-- `PRAGMA integrity_check` returned `ok`.
-- The failed transaction left **no log at all** — the peak was 0 bytes, because the
-  allocation was refused before any page was written.
-- Setting the limit below the current page count returned the current count, not the
-  requested one. The limit cannot shrink an existing database, so the returned value
-  must be read and checked rather than assumed, exactly as `auto_vacuum` taught.
+```
+shm_bytes = 32768 * (1 + ceil(max(0, F - 4062) / 4096))
+```
 
-## 5. A reset must be verified, and `busy` is not the test
+**It does not have to exist.** `wal.c` distinguishes `WAL_EXCLUSIVE_MODE` from
+`WAL_HEAPMEMORY_MODE` (lines 554-555) and gates the shared-memory file on the mode
+(lines 770, 911, 1606, 1613). Setting `locking_mode=EXCLUSIVE` before
+`journal_mode=WAL` holds the wal-index in heap memory instead.
+
+**Measured:** with `locking_mode=EXCLUSIVE` set first, no `-shm` file is created at all,
+and a second connection to the store fails with `database is locked`. Without it, a
+32768-byte `-shm` appears and a second connection is admitted.
+
+This is adopted, and it does more than remove a term. Single ownership stops being a
+convention the design asks callers to respect and becomes something the engine enforces.
+Section 2.1's argument depends on there being no foreign reader; exclusive mode is what
+makes that true rather than hoped for.
+
+## 5. Auxiliary files are bounded, not excused
+
+Temporary files live in another directory, which is not a reason to leave them out.
+
+**Sorters and temporary tables** are moved into memory with `PRAGMA temp_store=MEMORY`,
+and their memory cost is part of section 6.
+
+**Sub-journals** have exactly two write sites in `pager.c`. One is inside `pagerStress`
+(line 4620) and is therefore unreachable once spilling is disabled. The other is gated on
+an open savepoint: `if( pPager->nSavepoint>0 ) subjournalPageIfRequired(pPg);`
+(line 6090). The service opens no explicit savepoint, so the only source is a statement
+journal that SQLite opens for a statement needing statement-level rollback.
+
+Such a journal is memory-backed up to a threshold and spills beyond it. `openSubJournal`
+takes `nStmtSpill` from `sqlite3Config` (line 4499), which `SQLITE_CONFIG_STMTJRNL_SPILL`
+sets (`main.c`, lines 745-748). That entry point is a `sqlite3_config()` call and is not
+reachable through Python's `sqlite3` module, so the threshold cannot be configured away
+and the term is carried instead of dismissed.
+
+Its size is bounded by the pages **one statement** must be able to undo, not by the whole
+transaction, because the journal belongs to the statement. The design constraint that
+keeps it finite is therefore: no explicit savepoint, and no single maintenance statement
+whose undo set is unbounded.
+
+**Measured:** a transaction performing four whole-table `UPDATE`s, a multi-row `DELETE`
+and an incremental vacuum over 6000 rows produced **zero bytes** of sub-journal on disk.
+The check inspected `/proc/self/fd` for unlinked files, because these are opened
+`SQLITE_OPEN_DELETEONCLOSE` (line 4498) and never appear as a directory entry. That
+technique is Linux-only, so the macOS verification is by directory inspection alone and
+is weaker; this is recorded as a limit rather than glossed.
+
+## 6. The memory term
+
+Disabling the spill moves the cost from disk to memory. The resident cost of a
+transaction is the dirty payload plus everything that is not payload:
+
+```
+memory >= D * page_size          (dirty page payload)
+       +  per-page cache metadata
+       +  FTS5 working structures
+       +  the sorter and temporary tables moved in by section 5
+       +  Python objects for the rows in flight
+```
+
+`D * page_size` is the payload term only and is **not** a bound on process memory.
+Measured, expiring a full store grew resident memory by 43.1 MiB while its dirty payload
+was 87.9 MiB, so the relationship is not even a simple ratio. The honest statement is
+that the payload term is bounded by `N * page_size` and the remaining terms are bounded
+by the same operation design that bounds `D`.
+
+## 7. Verifying a reset
+
+`PRAGMA wal_checkpoint` returns three values and the code must stop discarding them. It
+must also not be reduced to a single one of them.
 
 With a reader pinned to an older snapshot while the owner committed new frames:
 
@@ -130,66 +227,148 @@ With a reader pinned to an older snapshot while the owner committed new frames:
 | `PASSIVE`, stale reader present | **0** | 400 | **0** | unchanged |
 | `TRUNCATE`, after the reader left | 0 | 0 | 0 | 0 bytes |
 
-**A passive checkpoint reported `busy = 0` while moving zero pages.** A caller that
-treats a clear busy flag as success will conclude the log was reset when nothing
-happened. The success test is therefore `log_pages == 0`, not `busy == 0`, and the code
-must stop discarding all three returned values.
+A passive checkpoint reported `busy = 0` while moving nothing, so a clear busy flag is
+not proof of a reset.
 
-This also shows the failure is a *recovery* condition, not capacity exhaustion: the log
-could not be reset because another process held an old snapshot, which the single-owner
-rule exists to prevent.
+`log_pages == 0` alone is also not proof, because `(0, 0, 0)` is returned in three
+different situations, measured: when no log file has ever existed, when a `TRUNCATE`
+genuinely reset the log, and when the log was already empty. The return convention for a
+missing log is therefore indistinguishable from success on the pragma's results alone.
 
-## 6. The resulting policy
+**The reset test is the conjunction:** the checkpoint returned `busy == 0` **and**
+`log_pages == 0`, **and** the `-wal` file is absent or exactly zero bytes. A failure is
+reported as `storage_blocked`, admits no further writes, and leaves reads and explicit
+recovery available. Under exclusive mode a foreign reader cannot exist, so a busy result
+is a genuine recovery condition rather than ordinary contention.
 
-1. **One owning connection.** All readers go through the control socket. No read
-   transaction spans a response or an await. A foreign reader is the one thing that can
-   block the reset, and it is designed out rather than handled.
-2. **`cache_spill=OFF`, read back and confirmed.** This is what makes `F = D` hold. Its
-   memory cost is stated, not hidden.
-3. **`PRAGMA max_page_count = N`**, read back and checked against the requested value.
-   It refuses an oversized incompatible store without deleting anything.
-4. **Reset before every write transaction, and verify it.** `wal_checkpoint(TRUNCATE)`
-   must return `log_pages == 0`. If it does not, admit no further writes, report
-   `storage_blocked`, and keep reads and explicit recovery available.
-5. **Check the log peak after commit.** Because section 2 rests on evidence rather than
-   a documented guarantee, a log that exceeded its budget is detected and reported
-   rather than assumed impossible.
+## 8. Conformance, not reproduction
 
-### Sizing
+Different correct SQLite builds may allocate different numbers of pages for the same
+content. A matrix check that demanded identical sizes would fail on a correct build and
+would be testing the build rather than this design.
+
+The supported matrix therefore validates the **invariants**, not the figures:
+
+1. `cache_spill`, `locking_mode`, `max_page_count`, `auto_vacuum` and `journal_mode` read
+   back the values that were requested.
+2. No `-shm` file exists.
+3. The log holds zero bytes before any `COMMIT`.
+4. Frames per dirty page never exceed `1 + 16/D`.
+5. A reset satisfies the section 7 conjunction.
+6. A breach of `max_page_count` rolls back whole, with integrity intact.
+7. No sub-journal reaches disk.
+
+## 9. Sizing
+
+The overall ceiling of 128 MiB and the logical ceiling of 32 MiB are retained. They are
+independent upper limits; neither promises that a logical ceiling of payload plus a full
+second copy of it must fit, and admission would refuse that combination anyway, because
+frozen snapshot bytes count toward logical usage.
+
+With the shared-memory term zero and auxiliary files reserved separately:
 
 ```
-DATA_BUDGET  = N * page_size
-WAL_BUDGET   = 32 + N * (24 + page_size)
-SHM          = 32768 + 8 * N            (measured 192 KiB at 22494 frames)
-MAX_PHYSICAL = DATA_BUDGET + WAL_BUDGET + SHM
+DATA  = N * page_size
+WAL   = 32 + (N + 16) * (24 + page_size)
+TOTAL = DATA + WAL <= MAX_PHYSICAL_BYTES
 ```
 
-The measured requirement at a 32 MiB logical ceiling is 83.74 MiB of data pages. With a
-maintenance reserve above that:
+Solving at 128 MiB gives `N = 16327` pages:
 
 | Quantity | Value |
 |---|---|
-| `N` (`max_page_count`) | 26624 pages |
-| `DATA_BUDGET` | 104.00 MiB |
-| `WAL_BUDGET` | 104.61 MiB |
-| `SHM` | 240 KiB |
-| `MAX_PHYSICAL` | 208.85 MiB |
+| `N` (`max_page_count`) | 16327 pages |
+| `DATA_BUDGET` | 63.78 MiB |
+| `WAL_BUDGET` | 64.21 MiB |
+| `SHM` | 0 |
+| `TOTAL` | 127.99 MiB |
 
-**The current constants are not achievable.** `MAX_PHYSICAL_BYTES` is 128 MiB while
-`MAX_LOGICAL_BYTES` is 32 MiB, and a full store that is snapshotted and then expired
-needs 83.74 MiB of data and an 88.38 MiB log at the same moment: 172 MiB. The physical
-constant must rise to about 224 MiB, or the logical ceiling must fall. Raising the
-physical constant is the recommendation, because halving the logical ceiling halves what
-the service is for.
+### What a full store actually needs
 
-## 7. Limits of this derivation
+Admitted service workload: every byte counted here passed `admit()`. This is what sets
+the reserve, and it is kept separate from the raw-engine stress figures above.
 
-- Measured on SQLite 3.46.1 and Python 3.14.4 on Linux only. The supported matrix is
-  Python 3.11 to 3.13 on Linux and macOS, and those runtimes carry different SQLite
-  builds. **The derivation is not validated across the matrix until a workflow run
-  reports these same figures.** This is the same open item as the FTS5 matrix check.
-- `F = D` rests on the measured absence of pre-commit writes, not on a documented
-  guarantee. Policy point 5 exists because of that gap.
-- Temporary files used for sorting during index maintenance are outside this budget.
-  They live in the temporary directory, not beside the store, and bounding them is a
-  separate question from bounding the store.
+**The cost per entry is a step function, so a scan cannot establish it.** A store filled
+with 6080-byte bodies occupied 7411 pages; the same store filled with 6144-byte bodies --
+the same 4936 rows and 1% more content -- occupied 9884. The dominant term moved by 33%.
+
+The cause is the record format, and it makes the cost derivable. For a table b-tree leaf
+at usable page size `U`, with `X = U - 35` the largest payload held wholly in the leaf and
+`M = ((U-12)*32/255) - 23`, a payload `P > X` is split:
+
+```
+K        = M + ((P - M) mod (U - 4))
+local    = K if K <= X else M
+overflow = ceil((P - local) / (U - 4))
+per_leaf = floor((U - 12) / (local + 6))
+pages_per_row = 1/per_leaf + overflow
+```
+
+`local` moves cyclically with `P`, so it crosses `(U-12)/2` and halves `per_leaf` from 2
+to 1. That is the step. At a 6080-byte body `local` is 2035 and two cells share a leaf, so
+the cost is 1.50 pages per row. Sixty-four bytes later `local` is 2099, one cell fills a
+leaf, and the cost is 2.00.
+
+So the bound is computed rather than sampled, by maximising `n(b) * pages_per_row(b)` over
+every admissible body size, where `n(b) = min(MAX_ENTRIES - RESERVED_ENTRIES,
+(MAX_LOGICAL_BYTES - RESERVED_BYTES) / (b + ENTRY_OVERHEAD))`:
+
+| Quantity | Value |
+|---|---|
+| Worst body size | about 6082 bytes |
+| Entries at that size | 4936, the entry cap |
+| `local` | 2037, one cell per leaf |
+| Pages per row | 2.00 |
+| **`entries` table** | **9872 pages, 38.56 MiB** |
+
+The maximum is insensitive to the estimate of the non-body columns: 45 through 48 stored
+bytes all yield 9872 pages. Against measurement the model predicts 7404 pages where 7411
+were observed, and 9872 where 9884 were observed -- within 0.12% at both points, including
+across the step.
+
+**The index term is measured, not derived.** A `dbstat` breakdown of the worst store
+attributes 9884 pages to `entries`, 4634 to `search_data`, and 67 to `search_idx`,
+`entries_live`, `search_docsize` and the small tables together. The index came to 0.626 of
+the body bytes it covers. That ratio depends on token distribution, which the record
+format does not constrain, so it is carried as a measured coefficient with margin rather
+than presented as a bound.
+
+| Term | Basis | Pages |
+|---|---|---|
+| `entries` | derived from the record format | 9872 |
+| Search index | measured at 0.626, bounded at 0.70 | 5120 |
+| Indexes and small tables | measured | 70 |
+| **Worst admissible store** | | **15062 (58.84 MiB)** |
+
+### The reserve
+
+| Quantity | Pages | Bytes |
+|---|---|---|
+| Data budget, `N` | 16327 | 63.78 MiB |
+| Worst admissible store | 15062 | 58.84 MiB |
+| **Maintenance reserve** | **1265** | **4.94 MiB** |
+
+The reserve covers what must never be refused: an acknowledgement, a retirement record, a
+withdrawal and an index rebuild. A rebuild is the largest and, measured, adds no pages at
+all, because it replaces index content rather than growing the store. The others cost a
+handful of pages each.
+
+**Because the index term is measured rather than derived, a store reaching `N` before its
+logical ceiling stays possible.** That is a capacity outcome, not a correctness failure,
+and the contract already requires the behaviour: refuse with `capacity`, leave the reserve
+available so progress and withdrawal still commit, and keep recovery reachable. It is not
+claimed to be impossible, because the evidence does not support that claim.
+
+Attempting to add frozen snapshots to a store already at the entry cap is refused, because
+admission counts reserved slots as well as bytes. That is a further reason the withdrawn
+"data plus a full second copy" figure was never an admissible state.
+
+## 10. Limits
+
+- Source references are pinned to SQLite 3.46.1. A supported build carrying a different
+  version is covered by the section 8 invariants, not by these line numbers, and the
+  references must be re-pinned when the supported set changes.
+- Measurements were taken on one host. They corroborate the derived terms; they do not
+  establish them, and section 8 is what the matrix checks.
+- The sub-journal verification is strong on Linux and weaker on macOS, as section 5
+  records.
