@@ -1,9 +1,20 @@
 # Changelog
 
-User-visible changes to Codex Peer Bridge are recorded here. Unreleased entries move
+User-visible changes to Koinon are recorded here. Unreleased entries move
 into a dated release section when promoted to `main`.
 
 ## Unreleased
+
+## 2026-09-18 — Koinon
+
+### Changed
+
+- Rename the project documentation to Koinon, with the descriptor "Shared coordination
+  and memory for independent agents." Clarify the intended scope across agent families
+  and repositories, the current per-repository memory service, and agent handoff rules.
+  Runtime paths, service names, registry identifiers, and managed markers are unchanged.
+
+## 2026-09-18 — Repository memory and session readiness
 
 ### Added
 
@@ -45,6 +56,21 @@ into a dated release section when promoted to `main`.
   for identity, delivery, presence, and memory, the capabilities that remain unverified
   until they are measured, and the acceptance criteria that judge completion. No runtime
   behaviour changes with this entry.
+
+### Fixed
+
+- Session registration releases its registration lock before starting the systemd
+  supervisor. This prevents a false readiness timeout. Concurrent lifecycle commands
+  for the same session remain serialized.
+
+### Changed
+
+- Git ignores local `_handoff/` directories to keep handoff content out of commits.
+
+## 2026-09-11 — macOS, DeepSeek, and peer guidance support
+
+### Added
+
 - Generic peer-origin and permission-laundering guidance on inbox records, queued
   notifications, and managed session instructions, separate from peer message content.
 - Updated inbox CLI adds guidance when reading from an older running bridge, allowing
@@ -65,10 +91,6 @@ into a dated release section when promoted to `main`.
   runtime.
 
 ### Fixed
-
-- Session registration releases its registration lock before starting the systemd
-  supervisor. This prevents a false readiness timeout. Concurrent lifecycle commands
-  for the same session remain serialized.
 
 - Repository setup requires the six OS/Python matrix checks, replacing obsolete
   Python-only names that left pull requests waiting for nonexistent jobs.
@@ -93,8 +115,6 @@ into a dated release section when promoted to `main`.
   now reports it.
 
 ### Changed
-
-- Git ignores local `_handoff/` directories to keep handoff content out of commits.
 
 - Notice delivery is dispatched per participant. The Codex path, including generated
   systemd units and the manual start command, is unchanged.

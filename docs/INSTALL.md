@@ -1,4 +1,22 @@
-# Install and enable in Codex
+# Install and enable Koinon
+
+## Name and path compatibility
+
+Koinon was previously named Codex Peer Bridge. The project name and clone URL have
+changed. The installed runtime still uses `codex-peer-bridge` paths, existing
+`codex-peer-*` service names, and the `codex-peer-bridge` registry entrypoint. Commands
+below deliberately retain those names. No reinstall or restart is needed for this
+documentation change.
+
+The systemd ownership marker in `scripts/install.py` and the managed guidance markers
+in `codex_instructions.py` are also unchanged. Do not replace them by hand. A future
+migration must recognize existing markers so that upgrades and removal still find the
+owned units and managed sections.
+
+Existing local checkouts and worktrees can keep their directory names. Moving a local
+checkout is a separate operation: worktree links, repository identity, peer registration,
+and agent memory keyed by the working-directory path can depend on those paths. Do not
+move state or reset inbox and memory cursors as part of a documentation rename.
 
 ## Requirements
 
@@ -73,8 +91,8 @@ socket stays in the way until it is removed by hand.
 ## Recommended: configure Codex once
 
 ```sh
-git clone https://github.com/rwcii/codex-peer-bridge.git
-cd codex-peer-bridge
+git clone https://github.com/rwcii/koinon.git
+cd koinon
 python3 scripts/install.py --configure-codex
 ```
 
