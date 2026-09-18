@@ -46,7 +46,7 @@ Keep ack as a bridge-owned operation. In an explicit BEGIN IMMEDIATE transaction
 
 Before constructing or retrying a notice, reconcile retained rows and this watermark. An acknowledged failed unit closes as acknowledged, not delivered and not unrecoverable. Unacknowledged retained members remain retryable. Work removed by pointer coalescing is obsolete; the replacement remains pending at its new sequence. Never infer acknowledgement solely from a missing row. Unexpected missing data above the watermark is a distinct diagnostic, not successful delivery.
 
-An ack can still occur after a notifier read or while a provider call is in flight. A content-free notice already in flight can therefore arrive after ack. Do not claim to cancel a provider call atomically with local deletion. On its next reconciliation the journal closes acknowledged work and does not retry it. Tests must force ack before scan, after failure, during notice preparation and during provider delivery. Migration starts the new watermark without inventing historical acknowledgement; an absent old row must not be recreated or replayed. 
+An ack can still occur after a notifier read or while a provider call is in flight. A content-free notice already in flight can therefore arrive after ack. Do not claim to cancel a provider call atomically with local deletion. On its next reconciliation the journal closes acknowledged work and does not retry it. Tests must force ack before scan, after failure, during notice preparation and during provider delivery. Migration starts the new watermark without inventing historical acknowledgement; an absent old row must not be recreated or replayed.
 
 Create the additive metadata schema in a transaction before bridge readiness, preserving all existing inbox rows and allocated sequence values. Test rollback after deletion but before watermark update, including abrupt process termination. Do not depend on implicit Python sqlite3 transactions.
 
@@ -128,7 +128,7 @@ verified deployment-identity API. Do not manufacture a narrower namespace from C
 DSH_HOME, a credential pathname, or a URL. All Codex homes for one account share the Codex
 namespace; all DeepSeek harnesses for that account share the DeepSeek namespace. Thus
 repeated IDs in independent harnesses conflict conservatively, even if they are different
-sessions. Report `participant_in_use`; never silently deliver from both. Distinct IDs and
+sessions. Report `participant_in_use` with provider, account-local scope, and lock digest; never silently deliver from both. Running notifier status and its readiness record expose the same digest so an operator can match a conflict to a registered instance without publishing the participant identifier. Distinct IDs and
 distinct providers coexist. This is an explicit admission policy, not a claim that provider
 IDs are globally unique. A future narrower namespace requires a verified provider identity
 contract and lock-transition design.
@@ -219,7 +219,7 @@ retained rows while preserving cumulative uncertainty. Acknowledged rows are not
   NULL, attempts INTEGER NOT NULL, retry_at INTEGER NOT NULL, uncertain INTEGER NOT NULL)`.
 - `attempt(id INTEGER PRIMARY KEY, started INTEGER NOT NULL)` and
   `attempt_member(attempt_id INTEGER, seq INTEGER PRIMARY KEY)` for the single in-flight
-  provider call. Membership is limited to ten existing work rows.
+  provider call. Membership is limited to ten existing work rows. Both attempt tables contain only the current call, not cumulative history. Resolve a call by deleting its attempt and membership rows in the same transaction that updates work disposition, cumulative attempts and uncertainty; recovery does the same for an interrupted call before another reservation. Thus the per-sequence primary key never blocks a later attempt.
 
 Only enum values, bounded identifiers, and signed-64-bit nonnegative counters are stored.
 Counters saturate instead of overflowing. No peer content or provider error body enters
@@ -242,9 +242,11 @@ Initialize schema, identity and checkpoint in one explicit transaction, fsync re
 directory metadata, verify the committed state, then atomically replace the marker with
 state `ready`. Do not call a provider until `ready` is durably published.
 
-Recovery states: no marker/no journal permits first migration; `preparing` permits creation
+A well-formed marker with a different target digest is refused in every marker state (preparing, rebuilding, and ready); it is never completed or retargeted.
+
+Recovery states: no marker/no journal permits first migration only when the bridge-owned journal activation record is absent; `preparing` permits creation
 or completion only of an empty or exactly matching initialized journal, with no delivery
-history; `ready` requires an intact matching journal. Missing/corrupt ready journal is
+history; `rebuilding` uses the exact accepted-loss predicate below; `ready` requires an intact matching journal. Here no delivery history means empty work, attempt and attempt_member tables and zero outcome counters, with the scan checkpoint exactly equal to the imported through value (which may be nonzero). Schema, identity, migration nonce and that imported checkpoint are expected metadata, not delivery history. Missing/corrupt ready journal is
 `journal_recovery_required` and stops delivery. Journal without marker is also refused.
 A preparing marker never permits replay of arbitrary populated tables. Retain the legacy
 cursor, never write it after migration, and never use it to recover a missing ready journal.
@@ -282,7 +284,7 @@ This derivation needs tests that enumerate every transaction entry point and ver
 pragmas, reset-before-write, rollback, and peak files under maximal admitted work. Exclusive
 WAL keeps the wal-index in heap memory; temporary sort/subjournal storage must remain in
 memory. Account for dirty-page and temporary-work memory separately; do not call this a
-process-RSS or allocated-disk-sector bound. Pre-existing stores above the cap are refused,
+process-RSS or allocated-disk-sector bound. After a FULL-synchronized WAL commit the latest state can reside in the WAL alone until checkpoint; recovery must preserve the database and its WAL together. Pre-existing stores above the cap are refused,
 not silently shrunk or modified. A capacity error preserves source backlog and leaves
 health publication possible on its separate budget; it need not guarantee another DB write.
 
@@ -307,7 +309,7 @@ never open the journal directly, so only its owning worker can write it.
 
 Inbox schema 2 keeps the existing inbox columns and adds `kind TEXT NOT NULL DEFAULT
 'peer'` and nullable `binding TEXT`, with an additive fixed-key `inbox_meta` table for
-schema and `ack_through`, plus `memory_binding` with binding key, absolute repository
+schema, `ack_through`, and the journal activation record, plus `memory_binding` with binding key, absolute repository
 common-directory path, repository key, and memory state root. Paths are bounded to 4096
 UTF-8 bytes each. Binding keys are SHA-256 of the canonical repository key and resolved
 memory state root. These binding records are separate from peer envelopes, not claimed
@@ -338,3 +340,71 @@ before any provider call. It rereads and validates on the next startup. A failed
 attempt-reservation commit similarly prevents the provider call. A failed result commit
 leaves the existing reservation uncertain for recovery, never reports delivery success,
 and does not proceed to later work until journal state is readable and consistent.
+
+### Explicit recovery and test separation
+
+`notify.py --state-dir STATE --thread TARGET --agent PROVIDER rebuild-journal
+--accept-history-loss` is a stopped-notifier maintenance operation. It takes the same
+state-then-participant locks, refuses a live notifier, requires matching target evidence from a valid ready marker or the bridge-owned activation record, and requires all prior journal SQLite files to be absent.
+If damaged files remain, it refuses and instructs the operator to preserve them outside
+the managed state before retrying; it never deletes or copies them silently. Such manual
+archives are outside the managed journal budget. No automatic recovery runs this command.
+
+The operator acceptance explicitly permits duplicate notices and loss of old attempt
+history. Rebuild reads a consistent current inbox acknowledgement watermark (requires
+schema 2), uses it as the new scan checkpoint, and writes a `rebuilding` marker with new
+nonce and `history_lost:true` before journal creation. The marker transition follows the
+same durable sequence as first migration. A matching rebuilding state permits only empty
+work/attempt tables, zero outcome counters, the exact recorded watermark, and the explicit
+history_lost identity flag. Ready publication preserves that flag. Subsequent scanning
+reconstructs retained work above the watermark. No memory cursor is touched. Delivery
+health remains degraded for lost history until explicit `ack-health`; acknowledge does
+not undo possible duplicates. A failed rebuild resumes only its exact recorded bootstrap
+state, never falls back to the stale legacy cursor. The command refuses an old bridge
+without acknowledgement capability and never invents a watermark from missing rows.
+
+Subscription-path tests disable the fallback rescan or set its deadline beyond the test
+window. They must prove setup-race, lost-hint/reconnect, and existing-backlog delivery
+through the subscription itself. A separate test disables subscriptions and proves the
+finite rescan alone recovers retained work. The two paths must not mask each other's
+failures. No sub-two-second latency claim is inferred from ordinary fallback-enabled tests.
+
+### Migration evidence outside notifier files
+
+Schema-2 inbox metadata contains a bridge-owned journal activation record (target digest
+and migration nonce). `activate-notification-journal` is an explicit control request with
+those two fields; the bridge persists it transactionally and acknowledges only after
+commit. Repeating the same pair is idempotent. A different target is always refused.
+Replacing the nonce requires the explicit rebuild operation with the expected previous
+nonce and the operator's accepted-history-loss flag; a normal start cannot replace it.
+The notifier reads this evidence through the advertised schema-2 status capability.
+
+After ready-marker publication but before any provider attempt, the notifier registers
+activation with the bridge and verifies the result. Thus every migrated installation
+that could have sent a notice has evidence in the inbox database as well as the notifier
+files. A crash before activation cannot have sent one. A lost activation reply is retried
+idempotently; it does not permit delivery by assumption.
+
+Missing marker and journal with a prior activation record is recovery-required, never
+first migration from the frozen legacy cursor. Explicit rebuild can use that record as
+its target evidence even when the marker is missing. It does not reconstruct old attempt
+history or claim that a retained message was never delivered. A new ready journal with
+a new nonce replaces activation only through the explicit rebuild transition. If both
+the inbox identity evidence and all notifier state are lost, this protocol cannot infer
+history; restoring only selected files from inconsistent backups is outside automatic
+recovery and requires operator reconciliation.
+
+New journals require the schema-2 activation capability. Against an older bridge, the
+notifier retains legacy ordinary-notice behavior and reports version compatibility;
+it does not begin journal migration without durable bridge-owned evidence. Migration
+also records `journal_required:true` in the retained legacy cursor before any provider
+attempt, preserving its target and through fields. A migrated installation without a
+usable journal must never resume through that legacy path. Coordinated upgrade is
+required; concurrently running an older notifier that overwrites this guard is unsupported.
+Existing ready journals can use old-bridge acknowledgement-attribution compatibility,
+but are not rebuilt or newly migrated against an old bridge.
+
+Tests delete marker and journal together while retaining the inbox and legacy cursor,
+then require explicit recovery with no automatic provider call. They also crash before
+and after bridge activation, lose its reply, and test same-pair retry, target mismatch,
+and refused nonce replacement outside accepted rebuild.
