@@ -356,6 +356,7 @@ refuses everything else:
 | A familiar name with a different definition | refused |
 | Any stored row without an identity, whether `meta` is empty **or absent** | refused |
 | A schema that cannot be read | refused, never treated as empty |
+| A table the catalog lists but that cannot be read | refused, never treated as absent |
 
 Two earlier attempts at this were wrong in instructive ways. Excluding every `search`-prefixed
 name let a database whose only table was `search_history` be adopted: a prefix cannot prove a
@@ -369,6 +370,19 @@ was enough to have an entry adopted with the head reset to zero.
 Shapes are compared, not just names, because a familiar name with another definition is a
 different table. The comparison normalises away `IF NOT EXISTS`, which SQLite strips from the
 text it stores; without that every table in a healthy store read as differently defined.
+
+**Only the catalog proves absence.** Reading `sqlite_master` successfully says nothing about
+whether a later table read will succeed, so the identity and data checks take the catalog's
+table list and skip only what it proves is not there. Any read failure on a table that does
+exist is refused.
+
+Swallowing those failures defeated the whole classification, in two ways that the tests now
+hold shut. A file holding a saved entry was adopted when the count of `entries` failed,
+because the check that refuses identity-free data could not see the data it exists to
+protect. Worse, an unreadable metadata table looked exactly like an absent one, so a store
+belonging to another repository with no entries to trip the data check was classified as an
+unfinished start and had this repository's identity written over it. A failed read is not
+evidence of emptiness.
 
 Two pragmas run their own transactions rather than sitting inside one, because
 `incremental_vacuum` cannot usefully be wrapped. Both are bracketed by resets.
@@ -439,6 +453,9 @@ asserted by a test in `test_memory.StorageBoundTests`:
 | A table defined differently is a different table | `InitialisationBoundaryTests.test_a_table_defined_differently_is_a_different_table` |
 | An unfinished schema without data is completed | `InitialisationBoundaryTests.test_an_unfinished_schema_without_data_is_completed` |
 | A schema that cannot be read is an error, not an empty file | `InitialisationBoundaryTests.test_a_schema_that_cannot_be_read_is_an_error_not_an_empty_file` |
+| Data that cannot be read is not taken for an empty table | `InitialisationBoundaryTests.test_data_that_cannot_be_read_is_not_taken_for_an_empty_table` |
+| An identity that cannot be read is not taken for an absent one | `InitialisationBoundaryTests.test_an_identity_that_cannot_be_read_is_not_taken_for_an_absent_one` |
+| A table the catalog does not list is genuinely absent | `InitialisationBoundaryTests.test_a_table_the_catalog_does_not_list_is_genuinely_absent` |
 | A raising checkpoint holds writes until recovery | `CheckpointExceptionTests.test_a_raising_checkpoint_holds_writes_until_recovery` |
 | Only a missing log proves a missing log | `CheckpointExceptionTests.test_only_a_missing_log_proves_a_missing_log` |
 | An unreadable log file is a failed proof | `CheckpointExceptionTests.test_an_unreadable_log_file_is_a_failed_proof` |

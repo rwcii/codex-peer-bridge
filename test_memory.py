@@ -1826,6 +1826,89 @@ class InitialisationBoundaryTests(unittest.TestCase):
                          'a file that could not be judged must be left alone')
 
 
+    def read_failure(self, fragment):
+        """Make one specific read fail while every other operation stays real SQLite.
+
+        A subclassed connection is used because sqlite3.Connection is immutable and cannot be
+        patched, and because the point is a failure of a data or metadata page read rather
+        than of the catalog read, which the unreadable-file test already covers.
+        """
+        class Failing(sqlite3.Connection):
+            def execute(self_, sql, *args):
+                if fragment in sql:
+                    raise sqlite3.OperationalError('simulated page read failure')
+                return super().execute(sql, *args)
+
+        real_connect = sqlite3.connect
+
+        def connect(path, *args, **kwargs):
+            kwargs['factory'] = Failing
+            return real_connect(path, *args, **kwargs)
+
+        return patch.object(memory.sqlite3, 'connect', connect)
+
+    def test_data_that_cannot_be_read_is_not_taken_for_an_empty_table(self):
+        """Reading the catalog does not prove a table read will succeed.
+
+        The check that refuses identity-free data swallowed every read error and continued as
+        though the table were absent, so a file holding a saved entry was adopted: the check
+        could not see the data it exists to protect.
+        """
+        path = self.prepared('unreadable-data.sqlite3', list(memory.SCHEMA_STATEMENTS) + [
+            "INSERT INTO entries(seq,ts,type,scope,body,author,revision) "
+            "VALUES(1,1.0,'finding','repo','a saved entry','a',1)"])
+        before = path.read_bytes()
+        with self.read_failure('count(*) FROM entries'):
+            with self.assertRaises(memory.MemoryError_) as e:
+                memory.Store(path, REPO)
+        self.assertEqual(e.exception.code, 'incompatible_store')
+        self.assertIn('could not be read', str(e.exception))
+        self.assertEqual(path.read_bytes(), before,
+                         'no identity or pragma may be written to a file that was refused')
+        db = sqlite3.connect(path)
+        self.addCleanup(db.close)
+        self.assertIsNone(db.execute("SELECT value FROM meta WHERE key='repo'").fetchone(),
+                          'an identity was written over a file this store cannot judge')
+        self.assertEqual(db.execute('SELECT count(*) FROM entries').fetchone()[0], 1)
+
+    def test_an_identity_that_cannot_be_read_is_not_taken_for_an_absent_one(self):
+        """This is how one repository's store could be re-identified as another's.
+
+        An unreadable metadata table looked exactly like an absent one, so a store belonging
+        to another repository, holding no entries to trip the data check, was classified as an
+        unfinished start and had this repository's identity written over it.
+        """
+        path = self.home/'other-repo.sqlite3'
+        owner = memory.Store(path, 'a-different-repository')
+        owner.close()
+        before = path.read_bytes()
+        with self.read_failure('FROM meta WHERE key IN'):
+            with self.assertRaises(memory.MemoryError_) as e:
+                memory.Store(path, REPO)
+        self.assertEqual(e.exception.code, 'incompatible_store')
+        self.assertIn('identity is unknown', str(e.exception))
+        self.assertEqual(path.read_bytes(), before)
+        db = sqlite3.connect(path)
+        self.addCleanup(db.close)
+        self.assertEqual(
+            db.execute("SELECT value FROM meta WHERE key='repo'").fetchone()[0],
+            'a-different-repository',
+            'the other repository\'s identity was overwritten')
+
+    def test_a_table_the_catalog_does_not_list_is_genuinely_absent(self):
+        """Absence still has to be usable, or every unfinished store would be refused.
+
+        The rule is that only the catalog proves absence, so a schema missing some of its
+        tables must still classify as unfinished rather than as unreadable.
+        """
+        statements = [st for st in memory.SCHEMA_STATEMENTS
+                      if 'snapshot_items' not in st and 'entries_live' not in st]
+        path = self.prepared('partial.sqlite3', statements)
+        store = memory.Store(path, REPO)
+        self.addCleanup(store.close)
+        self.assertEqual(store.meta('repo'), REPO)
+        self.assertTrue(store.note('writer', 'finding', 'completed from a partial schema'))
+
     def test_another_application_database_is_never_adopted(self):
         """Completing initialisation must not be a way to take over any nonempty file.
 

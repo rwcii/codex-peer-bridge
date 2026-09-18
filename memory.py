@@ -579,7 +579,11 @@ class Store:
                 'cannot be judged; it was left untouched') from exc
         if not objects:
             return 'empty'
-        if self.identity():
+        # The catalog is the only thing that proves a table absent. A failed read of a table
+        # that exists proves nothing at all, and must never be reported as an empty identity
+        # or as no data.
+        present = {name for type_, name, _sql in objects if type_ == 'table'}
+        if self.identity(present):
             return 'initialised'
 
         # No identity, so this may only be adopted if it is exactly an unfinished start.
@@ -616,7 +620,7 @@ class Store:
                 'incompatible_store',
                 f'this file defines {", ".join(sorted(malformed)[:4])} differently from this '
                 'schema, so it is not an unfinished store of ours; it was left untouched')
-        held = self.application_rows()
+        held = self.application_rows(present)
         if held:
             raise MemoryError_(
                 'incompatible_store',
@@ -624,27 +628,46 @@ class Store:
                 'cannot be adopted; it was left untouched')
         return 'unfinished'
 
-    def identity(self):
-        """The recorded identity rows, or an empty mapping when none has been written.
+    def identity(self, present):
+        """The recorded identity rows, or an empty mapping only when none can exist.
 
-        A missing metadata table and an empty one mean the same thing here: nothing has been
-        recorded. They must not diverge, because the checks that follow are what stop a file
-        with data being adopted, and reaching them depended on which of the two it was.
+        A missing metadata table and an empty one mean the same thing: nothing has been
+        recorded. A metadata table that exists but cannot be read means something quite
+        different, and returning an empty mapping for it let a store belonging to another
+        repository be re-identified as this one, because an unreadable identity looked
+        exactly like an absent one.
         """
+        if 'meta' not in present:
+            return {}
         try:
             return dict(self.db.execute(
                 "SELECT key,value FROM meta WHERE key IN ('repo','schema','protocol')"
             ).fetchall())
-        except sqlite3.Error:
-            return {}
+        except sqlite3.Error as exc:
+            raise MemoryError_(
+                'incompatible_store',
+                f'this file has a metadata table that could not be read '
+                f'({type(exc).__name__}: {exc}), so its identity is unknown and it cannot be '
+                'adopted; it was left untouched') from exc
 
-    def application_rows(self):
-        """A description of any stored data, or None. Missing tables hold nothing."""
+    def application_rows(self, present):
+        """A description of any stored data, or None only when there provably is none.
+
+        Absence is established from the catalog, never from a failed read. Treating a read
+        failure as an empty table let a file holding a saved entry be adopted, because the
+        check that refuses identity-free data could not see the data.
+        """
         for table in DATA_TABLES:
+            if table not in present:
+                continue
             try:
                 count = self.db.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
-            except sqlite3.Error:
-                continue
+            except sqlite3.Error as exc:
+                raise MemoryError_(
+                    'incompatible_store',
+                    f'this file has a {table} table that could not be read '
+                    f'({type(exc).__name__}: {exc}), so whether it holds data is unknown and '
+                    'it cannot be adopted; it was left untouched') from exc
             if count:
                 return f'{count} row(s) in {table}'
         return None

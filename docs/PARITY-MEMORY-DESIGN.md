@@ -353,7 +353,10 @@ before any pragma can modify it. Only an empty file or exactly this schema with 
 identity may be initialised. Object names are not evidence: definitions are compared, the FTS5
 shadow set is exact and admitted only alongside the virtual table that owns it, a schema that
 cannot be read is an error rather than an empty file, and any stored row without an identity is
-refused whether the metadata table is empty or missing. A refused file is left byte for byte
+refused whether the metadata table is empty or missing. Absence is established from the object
+catalog alone: a table that exists but cannot be read is refused rather than counted as empty,
+because an unreadable identity is not an absent one and an unreadable table is not an empty
+one. A refused file is left byte for byte
 alone. The connection runs in autocommit and every transaction is opened explicitly, because the
 driver starts an implicit transaction only for `INSERT`, `UPDATE`, `DELETE` and `REPLACE` -- so
 DDL committed statement by statement whatever it was wrapped in.
