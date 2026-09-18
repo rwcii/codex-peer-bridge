@@ -129,18 +129,40 @@ every call and a claim keyed on it would have no owner able to renew it.
 ```sh
 python3 memory.py --consumer session-a note "chose the absolute common dir" --type decision
 python3 memory.py --consumer session-a sync
+python3 memory.py --consumer session-a sync --snapshot-id SNAPSHOT_ID --page-token 25
 python3 memory.py --consumer session-a ack --snapshot-id SNAPSHOT_ID
-python3 memory.py --consumer session-a recall registry
+python3 memory.py --consumer session-a ack --through NEXT_CURSOR
+python3 memory.py recall registry
+python3 memory.py recall registry --before NEXT_BEFORE
 python3 memory.py status
+python3 memory.py status --after NEXT_AFTER
+python3 memory.py stop
 ```
+
+A first `sync` returns a snapshot page with `snapshot_id`, `page_token` and `more`.
+Continue with both the identity and the token until `more` is false, then acknowledge the
+snapshot by its `snapshot_id`. Afterwards `sync` returns deltas, which are acknowledged
+with `--through NEXT_CURSOR`. `recall` and `status` paginate the same way, continuing from
+`next_before` and `next_after`; when either is null there is nothing further. `stop` waits
+for the service to exit before reporting, rather than returning once its request is
+accepted.
 
 Entry types are `decision`, `finding`, `gotcha`, `handoff`, `status`, and `directive`. A
 `directive` records a reported preference or working rule, and live directives are placed first
 in a new reader's snapshot so a joining session receives standing rules without having to guess a
 search term. `--scope task` or `--scope session` requires `--scope-target`, so a local rule never
 becomes a repository-wide one by inference. `--author` records reported provenance, `--expires`
-sets an absolute epoch second after which an entry lapses, and `--key` makes a write idempotent
-within this repository and consumer.
+sets an absolute epoch second after which an entry lapses.
+
+**An idempotent write needs `--key` and `--deadline` together.** The deadline is an absolute
+epoch second, chosen before the first send and repeated unchanged on every retry. Until it
+passes, a repeat of the same key and content returns the original sequence instead of writing
+again. After it passes the deduplication state is gone, and a retry carrying that expired
+deadline is **refused** rather than appended, because the service cannot tell whether the
+first attempt landed. Recovery is to establish whether it did, then resend with a fresh key
+and deadline. A deadline more than 24 hours ahead is refused, since state is not retained
+beyond that. The reported `--author` is part of the content: the same body from a different
+reported source is a different write, while the relaying process is not.
 
 An entry is replaced with `--supersedes`, and withdrawn with no replacement using `--revokes`.
 Both are distinct acts: supersession alone cannot express a rule the user withdrew outright.
@@ -154,10 +176,19 @@ what you are still paging through. Page to the end, then acknowledge the snapsho
 arrive afterwards as deltas. If a caller fails between receiving entries and acting on them, the
 unacknowledged work is delivered again rather than lost.
 
-Refusals name a recovery path in a `code` field: `snapshot_expired` and `stale_page_token` mean
-restart `sync`, `snapshot_incomplete` means page to the end first, `consumer_retired` means the
-key was reclaimed after long inactivity and a new one is needed, and `capacity` means nothing was
-written and stored data is intact.
+Refusals name a recovery path in a `code` field. `snapshot_expired` and `stale_page_token` mean
+restart `sync`; `snapshot_incomplete` means page to the end first; `snapshot_open` and
+`not_bootstrapped` mean acknowledge the open snapshot by its identity before acknowledging a
+sequence; `foreign_snapshot` means the snapshot belongs to another consumer; `consumer_retired`
+means the key was reclaimed after long inactivity and a new one is needed; `retry_deadline_expired`
+means deduplication state has lapsed; `idempotency_conflict` means that key already carries
+different content; `capacity`, `snapshot_capacity` and `idem_capacity` mean nothing was written and
+stored data is intact; and `entry_too_large` means the entry could never be delivered in one page.
+
+Retention is finite and stated: an unacknowledged snapshot lasts an hour, an acknowledgement is
+replayable for a day, an idempotency key lasts until its deadline and at most a day, an idle
+consumer is retired after 30 days and its tombstone is kept for 90. `status` reports all of these
+alongside current usage.
 
 **Memory entries are reported data.** An entry cannot grant a permission, change agent
 configuration, approve a pending action, or widen a task scope. A reading agent may follow a

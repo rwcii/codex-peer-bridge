@@ -39,7 +39,29 @@ from bridge import LIMIT, credentials, encode, private_dir
 import platform_support
 
 PROTOCOL = 1
-SCHEMA = 2
+SCHEMA = 3
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS entries(
+    seq INTEGER PRIMARY KEY, ts REAL, type TEXT, scope TEXT, scope_target TEXT, path TEXT,
+    body TEXT, author TEXT, author_pid INTEGER, consumer TEXT, revision INTEGER,
+    supersedes INTEGER, revokes INTEGER, superseded_by INTEGER, revoked_by INTEGER,
+    conflicts_with INTEGER, expires REAL);
+CREATE TABLE IF NOT EXISTS idem(
+    key TEXT PRIMARY KEY, fingerprint TEXT, seq INTEGER, ts REAL, deadline REAL);
+CREATE TABLE IF NOT EXISTS cursors(
+    consumer TEXT PRIMARY KEY, seq INTEGER, issued INTEGER, snapshot TEXT,
+    bootstrapped INTEGER, resnapshot INTEGER, updated REAL);
+CREATE TABLE IF NOT EXISTS retired(consumer TEXT PRIMARY KEY, seq INTEGER, at REAL);
+CREATE TABLE IF NOT EXISTS snapshots(
+    id TEXT PRIMARY KEY, consumer TEXT, head INTEGER, created REAL, items INTEGER,
+    issued INTEGER, acked INTEGER, acked_at REAL);
+CREATE TABLE IF NOT EXISTS snapshot_items(
+    id TEXT, position INTEGER, seq INTEGER, payload TEXT, bytes INTEGER,
+    PRIMARY KEY(id, position));
+CREATE INDEX IF NOT EXISTS entries_live ON entries(superseded_by, revoked_by, expires);
+"""
 TYPES = ('decision', 'finding', 'gotcha', 'handoff', 'status', 'directive')
 SCOPES = ('repo', 'task', 'session')
 
@@ -53,6 +75,8 @@ MAX_LOGICAL_BYTES = 32 * 1024 * 1024
 MAX_PHYSICAL_BYTES = 128 * 1024 * 1024
 RESERVED_ENTRIES = 64
 RESERVED_BYTES = RESERVED_ENTRIES * MAX_BODY
+# Headroom kept free for write-ahead log growth between checkpoints.
+WAL_MARGIN = 2 * 1024 * 1024
 ENTRY_OVERHEAD = 512
 
 # Lifetimes. Every retained record has one, and expiry returns a defined recovery
@@ -65,6 +89,7 @@ MAX_SNAPSHOTS_PER_CONSUMER = 4
 MAX_CONSUMERS = 256
 MAX_IDEM_ROWS = 20000
 RETIRED_TTL = 90 * 86400
+MAX_RETIRED = 1024
 EXPIRY_INTERVAL = 30
 
 # Response framing. A page is bounded by encoded bytes, not by a row count, because
@@ -134,52 +159,58 @@ class Store:
     def __init__(self, path, repo, fts=None):
         self.repo, self.path = repo, path
         self.expired_at = 0.0
+        # An existing store is inspected before anything is written to it. Enabling WAL
+        # or creating tables first would modify a store this runtime has already decided
+        # it cannot understand, which is the opposite of refusing to touch it.
+        existing = Path(path).exists() and Path(path).stat().st_size > 0
         self.db = sqlite3.connect(path)
-        self.db.execute('PRAGMA journal_mode=WAL')
-        self.db.executescript('''
-        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS entries(
-            seq INTEGER PRIMARY KEY, ts REAL, type TEXT, scope TEXT, scope_target TEXT, path TEXT,
-            body TEXT, author TEXT, author_pid INTEGER, consumer TEXT, revision INTEGER,
-            supersedes INTEGER, revokes INTEGER, superseded_by INTEGER, revoked_by INTEGER,
-            conflicts_with INTEGER, expires REAL);
-        CREATE TABLE IF NOT EXISTS idem(key TEXT PRIMARY KEY, fingerprint TEXT, seq INTEGER, ts REAL);
-        CREATE TABLE IF NOT EXISTS cursors(
-            consumer TEXT PRIMARY KEY, seq INTEGER, issued INTEGER, snapshot TEXT,
-            bootstrapped INTEGER, resnapshot INTEGER, updated REAL);
-        CREATE TABLE IF NOT EXISTS retired(consumer TEXT PRIMARY KEY, seq INTEGER, at REAL);
-        CREATE TABLE IF NOT EXISTS snapshots(
-            id TEXT PRIMARY KEY, consumer TEXT, head INTEGER, created REAL, items INTEGER,
-            issued INTEGER, acked INTEGER, acked_at REAL);
-        CREATE TABLE IF NOT EXISTS snapshot_items(
-            id TEXT, position INTEGER, seq INTEGER, payload TEXT, bytes INTEGER,
-            PRIMARY KEY(id, position));
-        CREATE INDEX IF NOT EXISTS entries_live ON entries(superseded_by, revoked_by, expires);
-        ''')
-        stored = self.meta('repo')
-        if stored is None:
-            with self.db:
-                for key, value in (('repo', repo), ('protocol', str(PROTOCOL)),
-                                   ('schema', str(SCHEMA)), ('head', '0'), ('floor', '0')):
-                    self.set_meta(key, value)
-        elif stored != repo:
-            raise MemoryError_('wrong_repository', 'state directory belongs to another repository')
-        else:
-            # Validate what the file declares before writing to it. A store written by a
-            # newer schema or protocol must not be opened and silently half-understood.
-            for key, current in (('schema', SCHEMA), ('protocol', PROTOCOL)):
-                found = int(self.meta(key) or 0)
-                if found > current:
-                    raise MemoryError_('schema_too_new',
-                                       f'this store declares {key} {found}; this runtime supports '
-                                       f'{current}. Upgrade the runtime rather than downgrading '
-                                       'the store')
-                if found < current:
-                    raise MemoryError_('schema_too_old',
-                                       f'this store declares {key} {found}; this runtime expects '
-                                       f'{current} and has no migration for it')
-        self.fts = False if fts is False else self._open_fts()
-        self._reconcile_index()
+        try:
+            if existing:
+                self.inspect(repo)
+            # Order matters: auto_vacuum can only be chosen before the database header
+            # is written, and setting the journal mode first writes it. With it left at
+            # NONE, deleted pages stay in the file's freelist and a store that reached
+            # its physical bound could never shrink back below it.
+            self.db.execute('PRAGMA auto_vacuum=INCREMENTAL')
+            self.db.execute('PRAGMA journal_mode=WAL')
+            self.db.executescript(SCHEMA_SQL)
+            if not existing:
+                with self.db:
+                    for key, value in (('repo', repo), ('protocol', PROTOCOL),
+                                       ('schema', SCHEMA), ('head', 0), ('floor', 0)):
+                        self.set_meta(key, value)
+            self.fts = False if fts is False else self._open_fts()
+            self._reconcile_index()
+        except BaseException:
+            # A constructor that raises must not leave the handle open; the suite
+            # otherwise reports unclosed connections that hide real ones.
+            self.db.close()
+            raise
+
+    def inspect(self, repo):
+        """Read-only compatibility check on an existing store. Writes nothing."""
+        try:
+            rows = dict(self.db.execute(
+                "SELECT key,value FROM meta WHERE key IN ('repo','schema','protocol')").fetchall())
+        except sqlite3.Error as exc:
+            raise MemoryError_('incompatible_store',
+                               f'this file is not a memory store ({type(exc).__name__}); it was '
+                               'left untouched') from exc
+        if rows.get('repo') != repo:
+            raise MemoryError_('wrong_repository',
+                               'state directory belongs to another repository; it was left '
+                               'untouched')
+        for key, current in (('schema', SCHEMA), ('protocol', PROTOCOL)):
+            found = int(rows.get(key) or 0)
+            if found > current:
+                raise MemoryError_('schema_too_new',
+                                   f'this store declares {key} {found}; this runtime supports '
+                                   f'{current}. Upgrade the runtime rather than downgrading the '
+                                   'store. Nothing was written')
+            if found < current:
+                raise MemoryError_('schema_too_old',
+                                   f'this store declares {key} {found}; this runtime expects '
+                                   f'{current} and has no migration for it. Nothing was written')
 
     # --- schema helpers -------------------------------------------------------
 
@@ -272,7 +303,11 @@ class Store:
         retired = self.db.execute(
             'SELECT count(*), coalesce(sum(length(cast(consumer AS BLOB))+64),0) FROM retired'
         ).fetchone()
-        logical = body + count * ENTRY_OVERHEAD + frozen + idem_bytes + readers + retired[1]
+        shots = self.db.execute(
+            'SELECT count(*), coalesce(sum(length(cast(id AS BLOB))'
+            '+length(cast(consumer AS BLOB))+96),0) FROM snapshots').fetchone()
+        logical = (body + count * ENTRY_OVERHEAD + frozen + idem_bytes + readers
+                   + retired[1] + shots[1])
         page_size = self.db.execute('PRAGMA page_size').fetchone()[0]
         pages = self.db.execute('PRAGMA page_count').fetchone()[0]
         physical = page_size * pages
@@ -282,7 +317,35 @@ class Store:
             except OSError:
                 pass
         return dict(entries=count, logical=logical, physical=physical, idem=idem,
-                    retired=retired[0])
+                    retired=retired[0], snapshots=shots[0])
+
+    def physical(self):
+        """Bytes actually allocated, including the write-ahead log."""
+        page_size = self.db.execute('PRAGMA page_size').fetchone()[0]
+        total = page_size * self.db.execute('PRAGMA page_count').fetchone()[0]
+        for suffix in ('-wal', '-shm'):
+            try:
+                total += os.stat(str(self.path) + suffix).st_size
+            except OSError:
+                pass
+        return total
+
+    def enforce_physical(self, control):
+        """Check real allocation after a mutation, inside its transaction.
+
+        Estimating physical growth from payload bytes is not enforcement: SQLite
+        allocates pages, maintains indexes and appends to the write-ahead log by amounts
+        the payload does not predict. Measuring what was actually allocated and raising
+        rolls the mutation back, which makes the advertised bound a limit rather than a
+        projection.
+        """
+        cap = MAX_PHYSICAL_BYTES if control else MAX_PHYSICAL_BYTES - RESERVED_BYTES
+        actual = self.physical()
+        if actual > cap:
+            raise MemoryError_('capacity',
+                               f'this mutation would leave {actual} physical bytes stored, above '
+                               f'the {cap} byte limit; it was rolled back and stored data is '
+                               'intact')
 
     def admit(self, need, slots=0, control=False):
         """The single admission point for every durable mutation.
@@ -303,8 +366,13 @@ class Store:
             physical_cap = (MAX_PHYSICAL_BYTES if control
                             else MAX_PHYSICAL_BYTES - RESERVED_BYTES)
             # Project the mutation rather than testing only what is already stored.
+            # Leave room for write-ahead log growth before declaring the store full.
+            # The log can hold far more bytes than the payload predicts, and it is
+            # reclaimable by a checkpoint, so refusing on it without checkpointing first
+            # would report a full store that is merely un-checkpointed.
+            margin = max(need, WAL_MARGIN)
             if (use['entries'] + slots <= entry_cap and use['logical'] + need <= byte_cap
-                    and use['physical'] + need <= physical_cap):
+                    and use['physical'] + margin <= physical_cap):
                 return use
             if attempt == 0:
                 self.reclaim()
@@ -342,7 +410,8 @@ class Store:
                             'OR (acked IS NOT NULL AND acked_at < ?)',
                             (now - SNAPSHOT_TTL, now - ACK_RETENTION))
             self.db.execute('DELETE FROM snapshot_items WHERE id NOT IN (SELECT id FROM snapshots)')
-            self.db.execute('DELETE FROM idem WHERE ts < ?', (now - IDEM_TTL,))
+            # Retention follows the deadline the caller fixed, not a blanket age.
+            self.db.execute('DELETE FROM idem WHERE deadline < ?', (now,))
             self.db.execute('DELETE FROM retired WHERE at < ?', (now - RETIRED_TTL,))
             # A retired consumer leaves a tombstone. A later request from it gets an
             # explicit consumer_retired result instead of silently becoming a new
@@ -372,15 +441,28 @@ class Store:
         now = time.time()
         with self.db:
             prunable = self.db.execute(
-                'SELECT key FROM idem WHERE ts < ? ORDER BY ts LIMIT -1 OFFSET ?',
-                (now - IDEM_TTL, MAX_IDEM_ROWS)).fetchall()
+                'SELECT key FROM idem WHERE deadline < ? ORDER BY deadline LIMIT -1 OFFSET ?',
+                (now, MAX_IDEM_ROWS)).fetchall()
             self.db.executemany('DELETE FROM idem WHERE key=?', prunable)
+            # A tombstone's only job is to tell a returning consumer it was retired, so
+            # the oldest are droppable once the count is bounded. They are not recovery
+            # records promised to anyone still within a window.
+            excess = self.db.execute('SELECT consumer FROM retired ORDER BY at DESC '
+                                     'LIMIT -1 OFFSET ?', (MAX_RETIRED,)).fetchall()
+            self.db.executemany('DELETE FROM retired WHERE consumer=?', excess)
+        # Deleting rows frees pages inside the file; without these the file never
+        # shrinks and a store that reached its bound could never recover from it.
+        # Both pragmas must be driven to completion; preparing them without stepping
+        # through their results leaves the pages exactly where they were.
+        self.db.execute('PRAGMA incremental_vacuum').fetchall()
+        self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
         return removed
 
     # --- writes ---------------------------------------------------------------
 
     def note(self, consumer, kind, body, scope='repo', scope_target=None, path=None,
-             supersedes=None, revokes=None, expires=None, key=None, author=None, pid=None):
+             supersedes=None, revokes=None, expires=None, key=None, deadline=None,
+             author=None, pid=None):
         if kind not in TYPES:
             raise MemoryError_('invalid_request', f'unknown entry type: {kind}')
         if scope not in SCOPES:
@@ -402,17 +484,41 @@ class Store:
                                'byte page budget, so it could never be delivered')
         if supersedes and revokes:
             raise MemoryError_('invalid_request', 'an entry supersedes or revokes, never both')
+        # The reported source is part of the stored content, so it belongs in the
+        # fingerprint. The transport pid is not: the same write relayed by a different
+        # process is the same write.
         payload = dict(type=kind, body=body, scope=scope, scope_target=scope_target, path=path,
-                       supersedes=supersedes, revokes=revokes, expires=expires)
+                       supersedes=supersedes, revokes=revokes, expires=expires, author=author)
         mark = fingerprint(payload)
         scoped = f'{self.repo}\x00{consumer}\x00{key}' if key is not None else None
         if scoped:
+            # The caller fixes this deadline before its first send and repeats it on every
+            # retry. That is what lets a late retry be refused rather than appended;
+            # reporting a horizon in a successful response cannot reach the caller that
+            # never received one.
+            if deadline is None:
+                raise MemoryError_('invalid_request',
+                                   'an idempotent write requires a retry deadline in absolute '
+                                   'epoch seconds, chosen before the first send')
+            now = time.time()
+            if deadline > now + IDEM_TTL:
+                raise MemoryError_('invalid_request',
+                                   f'a retry deadline may not exceed {IDEM_TTL} seconds ahead, '
+                                   'because deduplication state is not retained beyond that')
             row = self.db.execute('SELECT fingerprint,seq FROM idem WHERE key=?', (scoped,)).fetchone()
             if row:
                 if row[0] != mark:
                     raise MemoryError_('idempotency_conflict',
                                        'this key is already used with different content')
-                return dict(seq=row[1], duplicate=True)
+                return dict(seq=row[1], duplicate=True, deadline=deadline)
+            if deadline <= now:
+                # Refuse before writing. Appending here is exactly the silent duplicate
+                # the contract forbids, because the caller cannot know whether its first
+                # attempt landed.
+                raise MemoryError_('retry_deadline_expired',
+                                   'this retry deadline has passed and deduplication state is no '
+                                   'longer retained; establish whether the earlier attempt landed, '
+                                   'then resend with a new key and deadline')
         variable = sum(measure(x) for x in (body, path or '', author or '',
                                            scope_target or '', consumer, key or ''))
         self.admit(variable + ENTRY_OVERHEAD, slots=1, control=bool(supersedes or revokes))
@@ -452,6 +558,7 @@ class Store:
                 if self.fts and int(self.meta('indexed_through') or 0) >= 0:
                     self.db.execute('INSERT INTO search(rowid,body) VALUES(?,?)', (seq, body))
                     self.set_meta('indexed_through', seq)
+                self.enforce_physical(bool(supersedes or revokes))
                 if scoped:
                     held = self.db.execute('SELECT count(*) FROM idem').fetchone()[0]
                     if held >= MAX_IDEM_ROWS:
@@ -460,15 +567,16 @@ class Store:
                         raise MemoryError_('idem_capacity',
                                            f'{held} idempotency keys are retained and none is past '
                                            f'its {IDEM_TTL} second horizon')
-                    self.db.execute('INSERT INTO idem(key,fingerprint,seq,ts) VALUES(?,?,?,?)',
-                                    (scoped, mark, seq, time.time()))
+                    self.db.execute(
+                        'INSERT INTO idem(key,fingerprint,seq,ts,deadline) VALUES(?,?,?,?,?)',
+                        (scoped, mark, seq, time.time(), deadline))
         except sqlite3.Error as exc:
             raise MemoryError_('write_failed', f'{type(exc).__name__}; nothing was written') from exc
         # State the retry horizon rather than leaving it implicit. A retry after this
         # many seconds is a new write, not a deduplicated one, and a caller that bounds
         # its own retries by this figure cannot append twice by accident.
         return dict(seq=seq, duplicate=False, conflicts_with=conflict,
-                    idempotency_horizon=IDEM_TTL if key is not None else None)
+                    deadline=deadline, idempotency_horizon=IDEM_TTL)
 
     # --- reads ----------------------------------------------------------------
 
@@ -528,6 +636,16 @@ def freeze(store, consumer):
             if tails[entry['type']] > cap:
                 continue
         ordered.append(entry)
+    held = store.db.execute(
+        'SELECT count(*) FROM snapshots WHERE consumer=? AND ((acked IS NULL AND created >= ?) '
+        'OR (acked IS NOT NULL AND acked_at >= ?))',
+        (consumer, time.time() - SNAPSHOT_TTL, time.time() - ACK_RETENTION)).fetchone()[0]
+    if held >= MAX_SNAPSHOTS_PER_CONSUMER:
+        # Refuse rather than evict. Every snapshot still inside its window is a promise:
+        # an unacknowledged one can still be paged, an acknowledged one can still replay.
+        raise MemoryError_('snapshot_capacity',
+                           f'this consumer already holds {held} snapshots within their retention; '
+                           'acknowledge or abandon one before opening another')
     sid = uuid.uuid4().hex
     payloads = [(i, e, json.dumps(e, ensure_ascii=True)) for i, e in enumerate(ordered)]
     # A snapshot copies every member, so it is a durable mutation and is charged for.
@@ -628,7 +746,8 @@ class Service:
                                    scope=r.get('scope', 'repo'), scope_target=r.get('scope_target'),
                                    path=r.get('path'), supersedes=r.get('supersedes'),
                                    revokes=r.get('revokes'), expires=r.get('expires'),
-                                   key=r.get('key'), author=r.get('author'), pid=pid)
+                                   key=r.get('key'), deadline=r.get('deadline'),
+                                   author=r.get('author'), pid=pid)
         if op == 'sync':
             return self.sync(r)
         if op == 'ack':
@@ -1061,18 +1180,61 @@ def serve(home, repo, store_factory):
 
 
 def release(home, control, generation):
-    """Remove the endpoint and the record only while this generation still owns them.
+    """Remove the endpoint and the record as one serialized ownership operation.
 
-    Cleanup takes no lock, because a caller waiting for this process to exit may hold
-    one. Ownership is what makes it safe: a successor that has already published its
-    own record is never clobbered by a predecessor tidying up late.
+    Checking the generation and then unlinking two files separately is a race: a
+    successor can bind and publish its own record between the two unlinks, and the
+    predecessor's second unlink then deletes it. Publication and removal therefore share
+    `start.lock`, and this critical section performs no waiting at all, so it cannot
+    participate in the wait cycle that invariant 4 forbids.
+
+    A missing record is not permission to delete. Absence means another process has
+    already taken over the bookkeeping, so cleanup declines.
     """
-    owner = read_owner(home)
-    if owner and owner.get('generation') != generation:
-        return False
-    control.unlink(missing_ok=True)
-    (Path(home) / 'owner.json').unlink(missing_ok=True)
-    return True
+    with (Path(home) / 'start.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        owner = read_owner(home)
+        if not owner or owner.get('generation') != generation:
+            return False
+        control.unlink(missing_ok=True)
+        (Path(home) / 'owner.json').unlink(missing_ok=True)
+        return True
+
+
+def stop_service(home, repo, timeout=20):
+    """Ask the service to stop, then wait for it to go, then tidy residue.
+
+    The wait happens with no lock held, because the exit path removes the endpoint
+    under `start.lock` and a caller holding it would be waiting on a process that is
+    waiting on the caller. That is the wait cycle invariant 4 forbids, and it is the
+    shape of the readiness deadlock this project already shipped once.
+    """
+    control = platform_support.control_socket_path(Path(home))
+    try:
+        reply = asyncio.run(request(home, dict(op='stop')))
+    except (ConnectionRefusedError, FileNotFoundError):
+        reply = dict(ok=True, result='not running')
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not control.exists():
+            return dict(status='stopped', residue=False)
+        try:
+            asyncio.run(request(home, dict(op='hello'), timeout=2))
+        except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
+            break
+        time.sleep(.05)
+    # Only now take the lock, and only to remove what a dead owner left behind.
+    with (Path(home) / 'start.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        owner = read_owner(home)
+        if owner and owner_is_dead(owner) and owner.get('socket') == str(control):
+            control.unlink(missing_ok=True)
+            (Path(home) / 'owner.json').unlink(missing_ok=True)
+            return dict(status='stopped', residue=True, removed=True)
+        if control.exists():
+            return dict(status='stop_requested', residue=True, removed=False,
+                        detail='the service has not exited yet and its owner is not proven dead')
+    return dict(status='stopped', residue=False, reply=reply.get('result'))
 
 
 def main():
@@ -1083,7 +1245,7 @@ def main():
     p.add_argument('--repo-path', default=os.getcwd())
     p.add_argument('--consumer', help='stable consumer key; required for note, sync and ack')
     sub = p.add_subparsers(dest='op', required=True)
-    for op in ('serve', 'status', 'stop'):
+    for op in ('serve', 'stop'):
         sub.add_parser(op)
     n = sub.add_parser('note')
     n.add_argument('body')
@@ -1094,16 +1256,23 @@ def main():
     n.add_argument('--author', help='reported source; recorded as provenance, never as authority')
     n.add_argument('--expires', type=float, help='absolute epoch seconds after which this lapses')
     n.add_argument('--key', help='idempotency key, scoped to repository and consumer')
+    n.add_argument('--deadline', type=float,
+                   help='absolute epoch seconds until which a retry of this key deduplicates; '
+                        'choose it before the first send and repeat it on every retry')
     n.add_argument('--supersedes', type=int)
     n.add_argument('--revokes', type=int)
     s = sub.add_parser('sync')
-    s.add_argument('--snapshot-id')
+    s.add_argument('--snapshot-id', help='required when continuing with --page-token')
     s.add_argument('--page-token', type=int, default=0)
     a = sub.add_parser('ack')
-    a.add_argument('--through', type=int, default=0)
-    a.add_argument('--snapshot-id')
+    a.add_argument('--through', type=int, default=0,
+                   help='next_cursor from a delta sync')
+    a.add_argument('--snapshot-id', help='snapshot_id from a snapshot sync, once fully paged')
     q = sub.add_parser('recall')
     q.add_argument('query')
+    q.add_argument('--before', type=int, help='continue from next_before of a previous page')
+    st = sub.add_parser('status')
+    st.add_argument('--after', help='continue from next_after of a previous page')
     args = vars(p.parse_args())
     root = Path(args.pop('state_dir')).absolute()
     repo = repo_identity(args.pop('repo_path'))
@@ -1113,6 +1282,9 @@ def main():
     op = args.pop('op')
     if op == 'serve':
         print(json.dumps(serve(home, repo, lambda: Store(home / 'memory.sqlite3', repo))))
+        return
+    if op == 'stop':
+        print(json.dumps(stop_service(home, repo), indent=2))
         return
     if op in ('note', 'sync', 'ack') and not args.get('consumer'):
         raise SystemExit(f'{op} requires --consumer, a stable key that outlives one command')

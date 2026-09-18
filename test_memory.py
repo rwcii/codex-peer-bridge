@@ -43,6 +43,8 @@ class Base(unittest.TestCase):
     def note(self, body, **kw):
         kw.setdefault('consumer', 'writer')
         kw.setdefault('kind', 'finding')
+        if kw.get('key') is not None and 'deadline' not in kw:
+            kw['deadline'] = time.time() + 600
         return self.s.note(kw.pop('consumer'), kw.pop('kind'), body, **kw)['seq']
 
     def drain(self, consumer='reader', limit_pages=50):
@@ -173,6 +175,50 @@ class WriteTests(Base):
             target = self.s.live()[0]['seq']
             self.assertTrue(self.note('withdrawn', kind='directive', revokes=target))
 
+    def test_growth_stops_at_the_physical_bound_and_space_is_recoverable(self):
+        """The bound must stop real growth, reserve room for a withdrawal, and recover.
+
+        A test that merely sets the limit below an existing file proves only that a
+        comparison happens. This drives actual allocation into the bound.
+        """
+        body = 'x' * 4000
+        cap = self.s.physical() + 2_000_000
+        reserve = 200_000
+        written = []
+        with patch.object(memory, 'MAX_PHYSICAL_BYTES', cap), \
+             patch.object(memory, 'RESERVED_BYTES', reserve), \
+             patch.object(memory, 'WAL_MARGIN', 512_000), \
+             patch.object(memory, 'MAX_ENTRIES', 100_000), \
+             patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40):
+            for _ in range(1000):
+                try:
+                    written.append(self.note(body, kind='decision'))
+                except memory.MemoryError_ as exc:
+                    self.assertEqual(exc.code, 'capacity')
+                    break
+            else:
+                self.fail('growth was never bounded')
+            self.assertGreater(len(written), 5, 'the bound must not stop growth immediately')
+            # Real allocation is what stopped, and it stopped below the hard limit.
+            self.assertLessEqual(self.s.physical(), cap)
+            stored = len(self.s.live())
+            # The reserve is what keeps a withdrawal possible at the bound; without
+            # reserved bytes a full store would pin a directive it can never retract.
+            withdrawal = self.note('withdrawn', kind='directive', revokes=written[0])
+            self.assertTrue(withdrawal)
+            self.assertEqual(len(self.s.live()), stored)
+
+            # Recovery: expire the bulk, reclaim, and prove the space returns and is
+            # reusable under the same limit.
+            at_bound = self.s.physical()
+            self.s.db.execute('UPDATE entries SET expires=? WHERE seq IN (%s)'
+                              % ','.join(str(s) for s in written[:len(written)//2]),
+                              (time.time()-1,))
+            self.s.db.commit()
+            self.s.reclaim()
+            self.assertLess(self.s.physical(), at_bound, 'reclaimed space must be returned')
+            self.assertTrue(self.note(body, kind='decision'), 'writes must resume after recovery')
+
     def test_physical_budget_also_refuses(self):
         self.note('one')
         with patch.object(memory,'MAX_PHYSICAL_BYTES',1):
@@ -195,18 +241,21 @@ class WriteTests(Base):
 
     def test_an_in_window_idempotency_key_is_never_evicted_to_make_room(self):
         with patch.object(memory,'MAX_IDEM_ROWS', 2):
-            self.note('one', key='k1')
-            self.note('two', key='k2')
+            deadline = time.time() + 600
+            self.note('one', key='k1', deadline=deadline)
+            self.note('two', key='k2', deadline=deadline)
             with self.assertRaises(memory.MemoryError_) as e:
-                self.note('three', key='k3')
+                self.note('three', key='k3', deadline=deadline)
             self.assertEqual(e.exception.code, 'idem_capacity')
             # Refusing protects the safe retry; evicting would turn it into a duplicate.
-            self.assertTrue(self.s.note('writer','finding','one', key='k1')['duplicate'])
+            self.assertTrue(self.s.note('writer','finding','one', key='k1',
+                                        deadline=deadline)['duplicate'])
 
-    def test_the_retry_horizon_is_reported_rather_than_implied(self):
-        result = self.s.note('writer', 'finding', 'bounded retry', key='k1')
+    def test_the_retry_deadline_is_echoed_and_the_horizon_reported(self):
+        deadline = time.time() + 600
+        result = self.s.note('writer', 'finding', 'bounded retry', key='k1', deadline=deadline)
+        self.assertEqual(result['deadline'], deadline)
         self.assertEqual(result['idempotency_horizon'], memory.IDEM_TTL)
-        self.assertIsNone(self.s.note('writer','finding','no key')['idempotency_horizon'])
 
     def test_lifetimes_are_enforced_at_the_request_boundary(self):
         self.note('ephemeral', kind='status', expires=time.time()-1)
@@ -228,12 +277,49 @@ class WriteTests(Base):
         self.s.expire()
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM retired').fetchone()[0], 0)
 
-    def test_idempotency_rows_have_a_finite_horizon(self):
-        self.note('kept', key='fresh')
-        self.s.db.execute('UPDATE idem SET ts=?', (time.time()-memory.IDEM_TTL-1,))
+    def test_deduplication_state_is_retained_only_to_its_deadline(self):
+        self.note('kept', key='fresh', deadline=time.time()+600)
+        self.s.db.execute('UPDATE idem SET deadline=?', (time.time()-1,))
         self.s.db.commit()
-        self.s.reclaim()
+        self.s.expire()
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM idem').fetchone()[0], 0)
+
+    def test_an_idempotent_write_requires_a_deadline_fixed_before_the_first_send(self):
+        with self.assertRaises(memory.MemoryError_) as e:
+            self.s.note('writer', 'finding', 'no deadline', key='k1')
+        self.assertEqual(e.exception.code, 'invalid_request')
+        with self.assertRaises(memory.MemoryError_) as e:
+            self.s.note('writer', 'finding', 'too far', key='k1',
+                        deadline=time.time()+memory.IDEM_TTL+60)
+        self.assertEqual(e.exception.code, 'invalid_request')
+
+    def test_a_retry_after_its_deadline_is_refused_rather_than_appended(self):
+        """The caller that never saw a response is the one this protects."""
+        deadline = time.time() + 600
+        first = self.s.note('writer', 'finding', 'uncertain outcome', key='k1', deadline=deadline)
+        self.assertFalse(first['duplicate'])
+        # Its response was lost, the deadline lapsed, and the state was reclaimed.
+        self.s.db.execute('DELETE FROM idem')
+        self.s.db.commit()
+        with self.assertRaises(memory.MemoryError_) as e:
+            self.s.note('writer', 'finding', 'uncertain outcome', key='k1',
+                        deadline=time.time()-1)
+        self.assertEqual(e.exception.code, 'retry_deadline_expired')
+        # Refused, not appended: one entry, not two.
+        self.assertEqual(len(self.s.live()), 1)
+
+    def test_the_reported_author_is_part_of_the_content_fingerprint(self):
+        deadline = time.time() + 600
+        self.s.note('writer', 'finding', 'same body', key='k1', deadline=deadline, author='peer-a')
+        with self.assertRaises(memory.MemoryError_) as e:
+            self.s.note('writer', 'finding', 'same body', key='k1', deadline=deadline,
+                        author='peer-b')
+        self.assertEqual(e.exception.code, 'idempotency_conflict')
+        # The transport pid is not content: the same write relayed by another process
+        # deduplicates rather than conflicting.
+        repeat = self.s.note('writer', 'finding', 'same body', key='k1', deadline=deadline,
+                             author='peer-a', pid=99999)
+        self.assertTrue(repeat['duplicate'])
 
 
 class SnapshotTests(Base):
@@ -713,9 +799,10 @@ class LifecycleTests(unittest.TestCase):
         """The window is commit to send, and recovery runs through the real path."""
         crasher = self.spawn('serve', env=dict(os.environ, MEMORY_TEST_CRASH_AFTER_COMMIT='1'))
         self.wait_for_socket(pid=crasher.pid)
+        deadline = time.time() + 600
         with self.assertRaises(memory.MemoryError_) as e:
             self.client(op='note', consumer='cli-1', type='decision',
-                        body='committed, never answered', key='k1')
+                        body='committed, never answered', key='k1', deadline=deadline)
         self.assertEqual(e.exception.code, 'no_reply')
         crasher.wait(timeout=10)
         self.assertEqual(crasher.returncode, 70)
@@ -728,7 +815,7 @@ class LifecycleTests(unittest.TestCase):
         status = self.client(op='status')['result']
         self.assertEqual(status['usage']['entries'], 1, 'the committed write must survive')
         retry = self.client(op='note', consumer='cli-1', type='decision',
-                            body='committed, never answered', key='k1')
+                            body='committed, never answered', key='k1', deadline=deadline)
         # The caller never saw a response, so its retry must deduplicate rather than
         # append a second copy of work that already happened.
         self.assertTrue(retry['result']['duplicate'])
@@ -820,6 +907,43 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(entry['scope_target'], 'T-7')
         self.assertEqual(entry['author'], 'reported by a peer')
         self.assertIsNotNone(entry['expires'])
+
+    def cli(self, *args):
+        return subprocess.run([sys.executable,'memory.py','--state-dir',str(self.state),
+                               '--repo-path',str(self.repo_path), *args],
+                              capture_output=True, text=True)
+
+    def test_stop_waits_for_the_service_to_exit_before_reporting(self):
+        service = self.spawn('serve')
+        control = self.wait_for_socket(pid=service.pid)
+        result = self.cli('stop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Completion means the endpoint is gone and the process has exited, not merely
+        # that a stop request was accepted.
+        self.assertEqual(json.loads(result.stdout)['status'], 'stopped')
+        self.assertFalse(control.exists())
+        service.wait(timeout=10)
+        self.assertEqual(service.returncode, 0)
+
+    def test_the_cli_can_continue_recall_and_status_pages(self):
+        self.spawn('serve')
+        self.wait_for_socket()
+        deadline = str(time.time()+600)
+        for i in range(4):
+            self.assertEqual(self.cli('--consumer','w','note',f'match {i}',
+                                      '--type','decision','--key',f'k{i}',
+                                      '--deadline',deadline).returncode, 0)
+        for name in ('c1','c2'):
+            self.cli('--consumer',name,'sync')
+        # Both continuations must be reachable from the command line, or the tokens the
+        # service returns are unusable by the interface it ships with.
+        first = json.loads(self.cli('recall','match').stdout)['result']
+        self.assertIn('next_before', first)
+        token = first['entries'][-1]['seq']
+        again = json.loads(self.cli('recall','match','--before',str(token)).stdout)['result']
+        self.assertTrue(all(e['seq'] < token for e in again['entries']))
+        listed = json.loads(self.cli('status','--after','c1').stdout)['result']
+        self.assertEqual([c['consumer'] for c in listed['consumers']], ['c2'])
 
     def test_consumer_key_is_required_for_stateful_operations(self):
         p = subprocess.run([sys.executable,'memory.py','--state-dir',str(self.state),

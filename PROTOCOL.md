@@ -76,8 +76,23 @@ A response is `{"ok": true, "result": ...}` or `{"ok": false, "code": "...", "er
 The `code` names a recovery path and is the field a caller should branch on: `snapshot_expired`
 and `stale_page_token` require restarting `sync`; `snapshot_incomplete` requires paging to the
 end before acknowledging; `consumer_retired` requires a new consumer key; `capacity`,
-`entry_too_large`, `idempotency_conflict`, `revision_conflict` and `not_issued` describe a
-refused request that changed nothing.
+`entry_too_large`, `idempotency_conflict`, `retry_deadline_expired`, `not_issued`,
+`foreign_snapshot`, `snapshot_open` and `not_bootstrapped` describe a refused request that changed
+nothing. There is no conflict code for competing revisions: a second replacement of the same entry
+is a successful write whose result carries `conflicts_with`, naming the replacement it competes
+with, and both remain live.
+
+A `note` carrying `key` must also carry `deadline`, an absolute epoch second fixed before the first
+send and repeated on every retry. Within it a repeat returns the original sequence with
+`duplicate` true; past it the request is refused with `retry_deadline_expired` rather than appended,
+because the service cannot tell whether the first attempt landed. The result echoes `deadline` and
+reports `idempotency_horizon`, the longest deadline the service will accept.
+
+A `sync` returns either `kind: snapshot` with `snapshot_id`, `entries`, `page_token`, `total` and
+`more`, or `kind: delta` with `entries`, `cursor`, `next_cursor`, `head` and `more`. Continuing a
+snapshot requires both `snapshot_id` and `page_token`. An `ack` carries `snapshot_id` once every
+page has been issued, or `through` for a delta. `recall` and `status` return `more` with
+`next_before` and `next_after` respectively, null when nothing remains.
 
 Operations are `hello`, `note`, `sync`, `ack`, `recall`, `status` and `stop`. `hello` is the
 reuse handshake and reports the service name, repository key, protocol and schema versions,
