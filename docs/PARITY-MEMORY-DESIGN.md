@@ -219,9 +219,11 @@ lock in the repository's state directory, held by a caller that is starting or s
 A database transaction is held by the serving process alone. When both are held the order is
 `start.lock` then transaction, never the reverse.
 
-**Invariant 1: the serving process never acquires `start.lock`.** A starting caller holds that
-lock while it probes the running service, so a service that needed the lock to answer could never
-answer, and the probe could only time out. Nothing in the request path may take it.
+**Invariant 1: the request-serving path never acquires `start.lock`.** A starting caller holds
+that lock while it probes the running service, so a service that needed the lock to answer could
+never answer, and the probe could only time out. Nothing that serves a request may take it. The
+same process does take it once, after its listener has closed and it is removing its endpoint, which
+is invariant 3; by then it serves nothing and no probe is waiting on it.
 
 **Invariant 2: no transaction is held across a wait.** A transaction never spans an `await`, a
 socket read, or a subprocess call. A reader blocked on a peer must not hold write access to the
@@ -246,9 +248,61 @@ report success with work still in flight. A stop is bound to the generation it a
 successor is never mistaken for it.
 
 **Wait graph.** A starting caller waits on the serving process answering a handshake. A stopping
-caller waits on the serving process exiting. The serving process waits on neither: it holds no
-file lock, and its transactions are internal and bounded. The graph is therefore acyclic by
-construction, and a regression test asserts each edge rather than trusting the reasoning.
+caller waits on the serving process exiting. The serving process waits on neither: while it serves
+requests it holds no file lock, and its transactions are internal and bounded. It takes
+`start.lock` only during its final endpoint removal, where it waits for nothing and no one is
+waiting on a reply from it. The graph is therefore acyclic by construction, and a regression test
+asserts each edge rather than trusting the reasoning.
+
+A stop is addressed to one instance. The request carries the repository and the generation it
+intends to stop, and the serving process validates both before changing any state. Deciding the
+target from a record read beforehand would be a race: a successor can replace the endpoint between
+that read and the connection, and an unqualified request would then stop the wrong service.
+
+### Storage bound
+
+A single measured total cannot be enforced. The file's size includes a write-ahead log whose
+size depends on checkpoint timing and on whether a concurrent reader is holding an old
+snapshot, so a limit on the total makes admission depend on unrelated timing: the same write
+succeeds or fails according to when the last checkpoint ran. A constant margin does not fix
+that; it only chooses how often the wrong answer appears.
+
+The bound is therefore split into three budgets, each enforceable by a different mechanism.
+
+**Durable data** is the committed content of the main database, measured as `page_count`
+multiplied by `page_size`. Admission compares projected growth against this figure alone, so a
+transient log never makes admission flap.
+
+**Log workspace** is bounded by configuration rather than by measurement.
+`PRAGMA wal_autocheckpoint` bounds the pages accumulated between automatic checkpoints, and
+`PRAGMA journal_size_limit` bounds the bytes the log file retains after one. Both are set when
+the store opens and read back to confirm they took effect, because a pragma that is silently
+ignored is the failure mode this project has already met once with `auto_vacuum`. A single
+transaction may exceed the autocheckpoint threshold while it runs; that is the one unbounded
+term, and it is bounded in turn by the per-entry and per-page limits, which cap how much any
+one transaction can write.
+
+**Maintenance workspace** is headroom inside the data budget that ordinary admission may not
+consume. It exists so that progress and cleanup always have room to commit. Reserving it is
+what makes "bounded progress" a property rather than a hope: an acknowledgement, a retirement
+record, a snapshot removal or an index rebuild draws on this reserve and is therefore never
+refused for space, while still being subject to a real limit.
+
+So `MAX_PHYSICAL_BYTES = DATA_BUDGET + WAL_BUDGET`, and an ordinary write is admitted only up
+to `DATA_BUDGET - MAINT_RESERVE - RESERVED_BYTES`, where `RESERVED_BYTES` remains the room kept
+for a withdrawal.
+
+**Enforcement points.** Admission checks projected data bytes before the transaction. The
+transaction's own end checks measured data pages and rolls back on breach. After commit, the
+checkpoint result is inspected rather than assumed: `PRAGMA wal_checkpoint` reports a busy flag
+and the pages it moved, and a checkpoint that could not complete is reported instead of being
+treated as success. A rebuild that would exceed the maintenance reserve is refused before it
+starts rather than part way through, since a partially rebuilt index is worse than a stale one.
+
+**Verification.** Tests assert the log pragmas are in effect after open; drive durable data to
+its budget and then prove that a withdrawal, an acknowledgement, a retirement and an index
+rebuild each still complete; assert the log stays within its budget across those operations;
+and assert that a checkpoint reporting busy is surfaced rather than swallowed.
 
 ### Durable transitions
 
@@ -265,7 +319,16 @@ did not enforce.
 | Issue a page | the snapshot's consumer | one | none; updates a counter | the highest position issued | with its snapshot |
 | Acknowledge | the snapshot's consumer | one | none | the acknowledgement, for replay | `ACK_RETENTION` |
 | Register a consumer | the consumer key | one | key plus row overhead | the cursor | `CONSUMER_TTL` idle, then a tombstone |
-| Retire a consumer | the service | one | tombstone row | the tombstone, reporting `consumer_retired` | `RETIRED_TTL` |
+| Retire a consumer | the service | one | charged in advance at registration | the tombstone, reporting `consumer_retired` | `RETIRED_TTL` |
+
+Registration is bounded by live consumers and by the tombstones they will become: it is refused
+when live consumers reach `MAX_CONSUMERS`, or when live consumers plus retirement records reach
+`MAX_CONSUMERS + MAX_RETIRED`. The combined form is deliberate and is not a cap of `MAX_RETIRED`
+tombstones: if every live consumer retires, the number of tombstones can reach
+`MAX_CONSUMERS + MAX_RETIRED` before a further registration is refused. That is the accurate
+statement of the bound. The charge taken at registration is an admission buffer rather than stored
+usage, held so that retirement can never be refused for space later; `usage` reports a tombstone
+only once one exists.
 
 Progress transitions — acknowledgement, page issuance and activity refresh — are bounded rather
 than admitted. They may never be refused for space: a reader that cannot acknowledge can never

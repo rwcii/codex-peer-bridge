@@ -356,17 +356,19 @@ class Store:
             elif kind == 'snapshot':
                 total += sum(measure(v or '') for v in values) + 96
             elif kind == 'frozen':
-                total += sum(values) + 64 * len(values)
+                # The same figure usage() sums from the stored `bytes` column. A charge
+                # that differs from the measurement is not accounting, it is two opinions.
+                total += sum(values)
         return total
 
     @contextlib.contextmanager
     def mutation(self, need=0, slots=0, control=False):
         """Run a durable change under admission and end-of-transaction enforcement.
 
-        Every transition that can grow the store passes through here: appends, frozen
-        snapshots, consumer registration, retirement, page issuance, acknowledgement and
-        index maintenance. Checking only the append path left most growth unmeasured
-        while the advertised bound implied otherwise.
+        Appends, frozen snapshots and consumer registration pass through here, because
+        a caller controls how much they grow the store. Progress transitions and index
+        maintenance use `progress()` instead, and removal is outside admission entirely;
+        both are documented in the contract rather than skipped silently.
         """
         self.admit(need, slots, control)
         with self.db:
@@ -730,14 +732,15 @@ def freeze(store, consumer):
     # A snapshot copies every member, so it is a durable mutation and is charged for.
     # Writing around admission is what let the store grow while the budget said
     # otherwise.
-    need = store.charge(frozen=[measure(p) for _, _, p in payloads], snapshot=(sid, consumer))
+    sizes = {i: len(encode(e)) for i, e, _ in payloads}
+    need = store.charge(frozen=list(sizes.values()), snapshot=(sid, consumer))
     with store.mutation(need):
         store.db.execute(
             'INSERT INTO snapshots(id,consumer,head,created,items,issued,acked,acked_at) '
             'VALUES(?,?,?,?,?,0,NULL,NULL)', (sid, consumer, head, time.time(), len(ordered)))
         store.db.executemany(
             'INSERT INTO snapshot_items(id,position,seq,payload,bytes) VALUES(?,?,?,?,?)',
-            [(sid, i, e['seq'], p, len(encode(e))) for i, e, p in payloads])
+            [(sid, i, e['seq'], p, sizes[i]) for i, e, p in payloads])
         store.db.execute('UPDATE cursors SET snapshot=?,updated=? WHERE consumer=?',
                          (sid, time.time(), consumer))
         # Bound retained snapshots per consumer, but only prune ones already outside
@@ -838,8 +841,19 @@ class Service:
         if op == 'status':
             return self.status(r)
         if op == 'stop':
+            # Validate the target here, at the point of action. Deciding which instance
+            # to stop from a record read beforehand is a race: a successor can replace
+            # the endpoint between that read and this connection, and an unqualified
+            # request would then stop the wrong service.
+            if r.get('repo') != self.repo:
+                raise MemoryError_('wrong_repository',
+                                   'this service serves another repository')
+            if r.get('generation') != self.generation:
+                raise MemoryError_('not_this_instance',
+                                   'this endpoint is served by a different instance than the one '
+                                   'you asked to stop; it is still running')
             self.stop.set()
-            return 'stopping'
+            return dict(stopping=True, generation=self.generation)
         raise MemoryError_('invalid_request', f'unknown operation: {op}')
 
     # --- protocol state -------------------------------------------------------
@@ -866,6 +880,9 @@ class Service:
             raise MemoryError_('capacity',
                                f'{live} consumers and {graves} retirement records are held, at the '
                                f'limit of {MAX_CONSUMERS} and {MAX_RETIRED}')
+        # The tombstone charge is an admission buffer, not stored usage: it holds room
+        # for the record this consumer becomes when it is retired, so retirement can never
+        # be refused later. usage() reports a tombstone only once one exists.
         need = self.store.charge(reader=(consumer,), tombstone=(consumer,))
         with self.store.mutation(need):
             self.store.db.execute(
@@ -1310,7 +1327,12 @@ def stop_service(home, repo, timeout=20):
                            'the recorded owner serves another repository; refusing to stop it')
     generation = target.get('generation')
     try:
-        asyncio.run(request(home, dict(op='stop'), timeout=5))
+        reply = asyncio.run(request(home, dict(op='stop', repo=repo, generation=generation),
+                                    timeout=5))
+        if not reply.get('ok') and reply.get('code') == 'not_this_instance':
+            # A successor already owns the endpoint, so the instance we meant to stop is
+            # gone and the one now running must be left alone.
+            return dict(status='stopped', generation=generation, superseded=True)
     except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
         # It may already be draining or gone. The wait below decides, not this call.
         pass

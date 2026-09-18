@@ -1020,6 +1020,35 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.client(op='status')['result']['usage']['entries'], 1)
         self.assertNotEqual(memory.read_owner(self.home)['generation'], generation)
 
+    def test_a_stop_addressed_to_another_instance_is_refused(self):
+        """The target is validated where the state changes, not where it was read."""
+        service = self.spawn('serve')
+        self.wait_for_socket(pid=service.pid)
+        record = memory.read_owner(self.home)
+        refused = self.client(op='stop', repo=self.repo, generation='a-different-generation')
+        self.assertFalse(refused['ok'])
+        self.assertEqual(refused['code'], 'not_this_instance')
+        wrong_repo = self.client(op='stop', repo='f'*16, generation=record['generation'])
+        self.assertEqual(wrong_repo['code'], 'wrong_repository')
+        # Still serving: neither request was allowed to stop it.
+        self.assertTrue(self.client(op='hello')['ok'])
+        self.assertIsNone(service.poll())
+
+    def test_a_stale_generation_reports_superseded_and_leaves_the_successor_running(self):
+        service = self.spawn('serve')
+        self.wait_for_socket(pid=service.pid)
+        record = memory.read_owner(self.home)
+        # Simulate a successor having replaced the endpoint between the caller reading the
+        # record and connecting: the record names a generation the live service does not
+        # have, exactly as a stale read would.
+        (self.home/'owner.json').write_text(json.dumps(dict(record, generation='stale-one')))
+        result = memory.stop_service(self.home, self.repo, timeout=5)
+        self.assertEqual(result['status'], 'stopped')
+        self.assertTrue(result.get('superseded'))
+        # The running service must be untouched.
+        self.assertTrue(self.client(op='hello')['ok'])
+        self.assertIsNone(service.poll())
+
     def test_the_cli_can_continue_recall_and_status_pages(self):
         self.spawn('serve')
         self.wait_for_socket()
