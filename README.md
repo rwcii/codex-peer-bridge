@@ -309,3 +309,21 @@ scripts/setup-repo.sh
 ## License
 
 [MIT](LICENSE) © 2026 Robert Capps.
+
+### Bridge startup and control failures
+
+The bridge reserves its control and messaging socket paths before opening the inbox
+database. It listens only after database initialization commits. An existing path
+refuses startup without opening the inbox; `serve` reports `endpoint_unavailable`
+and exits 78. No status probe or new advisory lock substitutes for this reservation.
+Shutdown keeps the reservation until accepted database operations finish.
+
+Control timeouts, lost replies, transport failures and invalid replies produce
+structured CLI errors and exit 1. A failed reply does not establish whether a
+mutation committed. The CLI does not automatically repeat that mutation.
+
+On Linux, installed systemd bridge and session services do not restart on exit 78.
+On macOS, the manual process exits and must be started again after correction; see
+[macOS setup](docs/INSTALL.md#macos). For a leftover socket, follow [recovery from a killed instance](docs/INSTALL.md#recovering-from-a-killed-instance).
+Remove a socket only after verifying that its owner is dead. Unsafe startup
+directories also produce a structured ownership refusal with exit 78.

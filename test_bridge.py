@@ -15,6 +15,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.b = bridge.Bridge(Path(self.tmp.name))
+        self.b.worker = bridge.DatabaseWorker(lambda: bridge.InboxStore(Path(self.tmp.name)))
         self.sock = Path(self.tmp.name) / 'test.sock'
         self.server = await asyncio.start_unix_server(self.b.handle, str(self.sock), limit=bridge.LIMIT)
 
@@ -91,6 +92,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.b.store(os.getpid(), {'type':'user','message':{'content':'x'*65536}})
         other = bridge.Bridge(Path(self.tmp.name))
+        other.worker = bridge.DatabaseWorker(lambda: bridge.InboxStore(Path(self.tmp.name)))
         try:
             rows = await other.command({'op':'inbox'})
             self.assertEqual(rows[0]['frame']['message']['content'], 'saved')

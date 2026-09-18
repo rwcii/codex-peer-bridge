@@ -54,11 +54,19 @@ nothing would load.
 
 A start binds exclusively and never removes a socket it did not create, so a bridge killed
 with `SIGKILL` leaves its socket behind and blocks the next start. The failure names the
-path:
+path in a JSON diagnostic on stdout and exits with status 78. For example
+(the operating-system error number can differ):
 
-```text
-OSError: cannot bind /tmp/cc-socks/<hash>-control.sock: [Errno 48] Address already in use
+```json
+{"ok": false, "code": "endpoint_unavailable", "error": "cannot bind /tmp/cc-socks/<hash>-control.sock: [Errno 48] Address already in use"}
 ```
+
+On Linux, installed systemd bridge and session services prevent automatic restart
+on exit 78. On macOS, this refusal ends the manually started process; after
+correcting the path, start it again with the command described in the
+[macOS setup](#macos). The macOS leftover-socket note at the end of this recovery
+section also applies. An unsafe startup directory also reports this refusal. Correct the named path
+before starting the service again; do not bypass its ownership checks.
 
 Proving the owner is gone cannot be done by connecting. A live listener whose accept queue
 is full refuses a connection on macOS exactly as a dead owner does, so a refusal is not

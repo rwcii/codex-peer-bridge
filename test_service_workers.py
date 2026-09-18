@@ -143,6 +143,7 @@ class ServiceWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bridge_control_is_reachable_with_sixteen_open_peers(self):
         service = bridge.Bridge(self.root)
+        service.worker = bridge.DatabaseWorker(lambda: bridge.InboxStore(self.root))
         self.services.append(service)
         peer_path = await self.listen(service.handle, 'peer.sock')
         await self.listen(lambda r, w: service.handle(r, w, True))
@@ -195,6 +196,7 @@ class ServiceWorkerTests(unittest.IsolatedAsyncioTestCase):
                 return super().store(*args)
         with mock.patch.object(bridge, 'InboxStore', BlockingInbox):
             service = bridge.Bridge(self.root)
+            service.worker = bridge.DatabaseWorker(lambda: bridge.InboxStore(self.root))
         self.services.append(service)
         await self.listen(lambda r,w: service.handle(r,w,True))
         write = asyncio.create_task(service.store(4242, dict(type='user', message=dict(content='accepted'))))

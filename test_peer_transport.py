@@ -73,11 +73,9 @@ class ControlTransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'not a messaging'):
             transport.target_path('uds:'+str(path))
         instance = bridge.Bridge(self.root)
-        try:
-            with self.assertRaisesRegex(ValueError, 'not a messaging'):
-                await instance.send('uds:'+str(path), 'synthetic message')
-        finally:
-            await instance.worker.close()
+        with self.assertRaisesRegex(ValueError, 'not a messaging'):
+            await instance.send('uds:'+str(path), 'synthetic message')
+        self.assertIsNone(instance.worker)
 
     async def test_discovery_does_not_publish_a_control_socket_as_a_peer(self):
         path = await self.server(root=self.root/('x'*120))

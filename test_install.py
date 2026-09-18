@@ -18,12 +18,12 @@ class InstallTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             installer.unit_arg('bad\nExecStart=bad')
 
-    def test_ownership_refusals_do_not_restart_either_notifier_service_form(self):
+    def test_ownership_refusals_do_not_restart_bridge_or_notifier_services(self):
         args = (Path('/app'), Path('/state'), 'target', 'peer', '/repo',
                 '/usr/bin/python3', '/bin/codex')
-        legacy = installer.units(*args)['codex-peer-notify.service']
+        legacy = installer.units(*args).values()
         supervised = next(iter(installer.units(*args, instance='a'*16).values()))
-        for unit in (legacy, supervised):
+        for unit in (*legacy, supervised):
             self.assertIn('\nRestartPreventExitStatus=78\n', unit)
             self.assertIn('\nRestart=on-failure\n', unit)
             self.assertNotIn('\nSuccessExitStatus=78\n', unit)

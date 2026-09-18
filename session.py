@@ -174,7 +174,10 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
         try:
             children.append(subprocess.Popen([sys.executable,str(prefix/'bridge.py'),'--state-dir',str(state),'serve']))
             for _ in range(100):
-                if stopped or children[0].poll() is not None:
+                bridge_exit = children[0].poll()
+                if bridge_exit == platform_support.CONFIGURATION_EXIT_STATUS:
+                    raise SystemExit(bridge_exit)
+                if stopped or bridge_exit is not None:
                     raise RuntimeError('bridge exited during startup')
                 if bridge_status(prefix,state):
                     break
@@ -184,8 +187,8 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
             children.append(subprocess.Popen(notify_command(prefix,config,state,thread,repo,name,agent,model)))
             for _ in range(100):
                 notifier_exit = children[-1].poll()
-                if notifier_exit == platform_support.CONFIGURATION_EXIT_STATUS:
-                    raise SystemExit(notifier_exit)
+                if any(p.poll() == platform_support.CONFIGURATION_EXIT_STATUS for p in children):
+                    raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS)
                 if stopped or notifier_exit is not None:
                     raise RuntimeError('notifier exited during startup')
                 if notifier_ready(state,bridge_status(prefix,state)):
@@ -197,7 +200,7 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
             while not stopped and all(p.poll() is None for p in children):
                 time.sleep(.2)
             if not stopped:
-                if children[-1].poll() == platform_support.CONFIGURATION_EXIT_STATUS:
+                if any(p.poll() == platform_support.CONFIGURATION_EXIT_STATUS for p in children):
                     raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS)
                 raise RuntimeError('session child exited; restart the complete session')
         finally:

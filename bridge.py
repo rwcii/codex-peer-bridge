@@ -18,7 +18,7 @@ from service_runtime import Admission, close_writer, drain_handlers, database_st
 from peer_guidance import PEER_GUIDANCE
 import platform_support
 
-from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange, UnsafeServiceEndpoint
+from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange, UnsafeServiceEndpoint, NoControlReply
 DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge')
 
 
@@ -54,6 +54,17 @@ def peers():
         except (OSError,ValueError,TypeError,KeyError,IndexError,subprocess.SubprocessError):
             continue
     return found
+
+
+class BridgeOwnershipError(OSError):
+    """A required endpoint could not be reserved before database access."""
+
+
+def startup_directory(path):
+    try:
+        private_dir(path)
+    except (ValueError, OSError) as exc:
+        raise BridgeOwnershipError(f'unsafe startup directory {path}: {exc}') from exc
 
 
 class InboxStore:
@@ -112,7 +123,8 @@ class Bridge:
         self.root = root
         self.address = f'uds:/tmp/cc-socks/{os.getpid()}.sock'
         self.stop = asyncio.Event()
-        self.worker = DatabaseWorker(lambda: InboxStore(root))
+        # Construction must not open or migrate a database before endpoint ownership.
+        self.worker = None
         self.admission = Admission()
         self.tasks = set()
         self.closing = False
@@ -228,14 +240,16 @@ class Bridge:
         raise ValueError('unknown operation')
 
     async def run(self):
-        sockets, servers = [], []
+        if self.worker is not None or self.closing:
+            raise RuntimeError('bridge instance cannot be started twice')
+        sockets, servers, identities = [], [], {}
         try:
-            private_dir(Path('/tmp/cc-socks'))
+            startup_directory(Path('/tmp/cc-socks'))
             peer = Path(self.address[4:])
             control = platform_support.control_socket_path(self.root)
-            private_dir(control.parent)
+            startup_directory(control.parent)
             # Bind exclusively. Never remove a pre-existing process socket.
-            for path, is_control in [(peer, False), (control, True)]:
+            for path in (control, peer):
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
                     # Bind exclusively. A pre-existing socket is never removed, on
@@ -249,16 +263,22 @@ class Bridge:
                     # Carry the path. A bare "Address already in use" does not say
                     # which socket is in the way, and deciding whether its owner is
                     # gone is the operator's call, so the message must name it.
-                    raise OSError(f'cannot bind {path}: {exc}') from exc
+                    raise BridgeOwnershipError(f'cannot bind {path}: {exc}') from exc
                 except BaseException:
                     sock.close()
                     raise
                 sockets.append((sock, path))
-                sock.listen(16)
+                info = path.lstat()
+                identities[path] = (info.st_dev, info.st_ino)
                 sock.setblocking(False)
                 os.chmod(path, 0o600)
-            servers.append(await asyncio.start_unix_server(self.handle, sock=sockets[0][0], limit=LIMIT))
-            servers.append(await asyncio.start_unix_server(lambda r,w: self.handle(r,w,True), sock=sockets[1][0], limit=LIMIT))
+            # A bind reserves the path without admitting connections. Both paths
+            # are owned before the worker can create or migrate the database.
+            self.worker = DatabaseWorker(lambda: InboxStore(self.root))
+            for sock, _path in sockets:
+                sock.listen(16)
+            servers.append(await asyncio.start_unix_server(lambda r,w: self.handle(r,w,True), sock=sockets[0][0], limit=LIMIT))
+            servers.append(await asyncio.start_unix_server(self.handle, sock=sockets[1][0], limit=LIMIT))
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, self.stop.set)
@@ -266,19 +286,33 @@ class Bridge:
             await self.stop.wait()
         finally:
             self.closing = True
-            for server in servers:
-                server.close()
+            # Keep the endpoint reservation until accepted database work drains.
+            # New handlers see closing and cannot submit work. Some Python
+            # versions unlink Unix paths when Server.close() is called.
             try:
                 await drain_handlers(self.tasks)
             finally:
                 try:
-                    await self.worker.close()
+                    if self.worker is not None:
+                        await self.worker.close()
                 finally:
                     for server in servers:
-                        await server.wait_closed()
-                    for sock, path in sockets:
-                        sock.close()
-                        path.unlink(missing_ok=True)
+                        server.close()
+                    try:
+                        await drain_handlers(self.tasks)
+                        for server in servers:
+                            await server.wait_closed()
+                    finally:
+                        for sock, path in sockets:
+                            sock.close()
+                            # Python may already have removed its listener path.
+                            # Never remove a successor's socket after that release.
+                            try:
+                                info = path.lstat()
+                            except FileNotFoundError:
+                                continue
+                            if (info.st_dev, info.st_ino) == identities.get(path):
+                                path.unlink()
 
 
 async def client(root, request):
@@ -291,7 +325,31 @@ async def client(root, request):
     except (ConnectionRefusedError, FileNotFoundError) as exc:
         # Keep the existing CLI diagnostic for a missing or stale endpoint.
         raise SystemExit(f'no bridge is running for {root} (nothing is listening on {control})') from exc
+    except TimeoutError:
+        print(json.dumps(dict(ok=False, code='service_unresponsive',
+                              error='control request timed out; mutation outcome is unknown')))
+        return 1
+    except NoControlReply:
+        print(json.dumps(dict(ok=False, code='no_reply',
+                              error='service closed without a reply; mutation outcome is unknown')))
+        return 1
+    except OSError:
+        print(json.dumps(dict(ok=False, code='service_unavailable',
+                              error='control exchange failed; mutation outcome is unknown')))
+        return 1
+    except ValueError:
+        print(json.dumps(dict(ok=False, code='invalid_service_response',
+                              error='invalid control reply; mutation outcome is unknown')))
+        return 1
+    if type(result.get('ok')) is not bool or (result['ok'] and 'result' not in result):
+        print(json.dumps(dict(ok=False, code='invalid_service_response',
+                              error='invalid control reply; mutation outcome is unknown')))
+        return 1
     if request['op'] == 'inbox' and result.get('ok'):
+        if not isinstance(result['result'], list) or any(not isinstance(entry, dict) for entry in result['result']):
+            print(json.dumps(dict(ok=False, code='invalid_service_response',
+                                  error='invalid inbox reply')))
+            return 1
         # Also protect reads from servers started before a runtime upgrade.
         for entry in result['result']:
             entry['guidance'] = PEER_GUIDANCE
@@ -299,7 +357,7 @@ async def client(root, request):
     return 0 if result['ok'] else 1
 
 
-def main():
+def cli_main():
     os.umask(0o077)
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state-dir', default=DEFAULT)
@@ -316,13 +374,21 @@ def main():
     s.add_argument('through', type=int)
     a = vars(p.parse_args())
     root = Path(a.pop('state_dir')).absolute()
-    private_dir(root)
+    startup_directory(root)
     if a['op'] == 'peers':
         print(json.dumps(peers(), indent=2))
     elif a['op'] == 'serve':
         asyncio.run(Bridge(root).run())
     else:
         raise SystemExit(asyncio.run(client(root, a)))
+
+
+def main():
+    try:
+        cli_main()
+    except BridgeOwnershipError as exc:
+        print(json.dumps(dict(ok=False, code='endpoint_unavailable', error=str(exc))))
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None
 
 
 if __name__ == '__main__':

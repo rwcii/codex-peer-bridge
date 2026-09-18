@@ -191,6 +191,48 @@ class SystemdStartupTests(unittest.TestCase):
         self.processes.append(process)
         return process
 
+    def test_bridge_refusal_propagates_during_notifier_startup_and_running(self):
+        from unittest.mock import Mock
+        self.state.mkdir(parents=True, exist_ok=True)
+        for phase in ('notifier_startup', 'running'):
+            with self.subTest(phase=phase):
+                bridge_child, notifier_child = Mock(), Mock()
+                bridge_child.poll.return_value = None
+                notifier_child.poll.return_value = None
+                children = []
+                def spawn(*args, **kwargs):
+                    child = bridge_child if not children else notifier_child
+                    children.append(child)
+                    if child is notifier_child and phase == 'notifier_startup':
+                        bridge_child.poll.return_value = 78
+                    return child
+                def readiness(*args):
+                    bridge_child.poll.return_value = 78
+                    return True
+                with patch.object(session.subprocess, 'Popen', side_effect=spawn), \
+                     patch.object(session, 'bridge_status', side_effect=lambda *a: {'pid':123} if children else None), \
+                     patch.object(session, 'notifier_ready', side_effect=readiness), \
+                     patch.object(session, 'notify_command', return_value=['synthetic-notifier']), \
+                     patch.object(session, 'result', return_value={'status':'running'}), \
+                     patch.object(session.signal, 'signal'), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        session.supervisor(self.app, self.config, self.state, self.thread, self.repo, 'synthetic')
+                self.assertEqual(caught.exception.code, 78)
+                notifier_child.terminate.assert_called_once()
+                notifier_child.wait.assert_called_once_with(timeout=20)
+                bridge_child.terminate.assert_not_called()
+
+    def test_supervisor_preserves_bridge_startup_refusal(self):
+        script = self.app/'bridge.py'
+        source = script.read_text().split("if __name__ == '__main__':", 1)[0]
+        script.write_text(source + "if __name__ == '__main__':\n    import sys\n    if sys.argv[-1] == 'serve':\n        raise SystemExit(78)\n    main()\n")
+        process = self.spawn([sys.executable, str(self.app/'session.py'), 'run',
+                              '--thread', self.thread, '--repo', self.repo])
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 78, stderr)
+        self.assertNotIn('Traceback', stderr)
+        self.assertFalse((self.state/'inbox.sqlite3').exists())
+
     def test_supervisor_preserves_configuration_refusal_and_stops_bridge(self):
         notifier = self.app/'notify.py'
         source = notifier.read_text().split("if __name__ == '__main__':", 1)[0]

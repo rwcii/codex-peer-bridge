@@ -7,6 +7,12 @@ into a dated release section when promoted to `main`.
 
 ### Added
 
+- Bridge startup reserves both socket paths before opening the inbox and retains
+  ownership until database shutdown completes. Endpoint refusal exits 78 without
+  changing the store. Directory ownership refusals use the same status, and both
+  direct and supervised services preserve it without automatic restart. Control timeouts and invalid or lost replies report structured
+  errors without automatically repeating mutations.
+
 - Private directory creation now gives missing parent directories mode 0700 even under
   a permissive process umask, while preserving existing parent permissions.
 
