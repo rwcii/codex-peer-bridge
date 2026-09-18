@@ -250,9 +250,8 @@ class SchemaPublicTests(unittest.IsolatedAsyncioTestCase):
         try:
             status = await service.command({'op':'status'})
             self.assertEqual(status['inbox_schema'], 2)
-            self.assertEqual(set(status['capabilities']), set(schema.CAPABILITIES))
+            self.assertEqual(set(status['capabilities']), set(schema.CAPABILITIES) | {'inbox_subscription'})
             self.assertNotIn('memory_binding', status['capabilities'])
-            self.assertNotIn('inbox_subscription', status['capabilities'])
             self.assertTrue(schema.hex_value(status['generation'], 32))
             await service.worker.call('command', {'op':'test-drop-metadata'})
             status = await service.command({'op':'status'})

@@ -278,7 +278,7 @@ A DeepSeek participant additionally reads the harness signing secret at `$DSH_HO
 
 Incoming controls are stored as inert data. Message bodies never execute shell commands. Attachment metadata may be stored, but attachments are never fetched. Notices omit peer bodies and are submitted using subprocess argument arrays, without a shell.
 
-Limits: 16 active connections, six-second handler deadline, 32 frames per incoming connection, 256 KiB wire frames, 64 KiB stored frames, and 1,000 inbox records. Full inboxes reject new records; read and acknowledge regularly. A successful send means transport completion, not processing by a model. The bridge emits no peer delivery receipts, idle notifications, or artifact-yield responses.
+Ordinary peer limits: 16 active connections, six-second handler deadline, 32 frames per incoming connection, 256 KiB wire frames, 64 KiB stored frames, and 1,000 inbox records. Full inboxes reject new records; read and acknowledge regularly. A successful send means transport completion, not processing by a model. The bridge emits no peer delivery receipts, idle notifications, or artifact-yield responses. Explicit local change subscriptions have separate connection and write limits; see [the subscription contract](PROTOCOL.md#change-subscriptions).
 
 ## Development
 
@@ -334,5 +334,8 @@ directories also produce a structured ownership refusal with exit 78.
 The bridge now maintains a transactional acknowledgement watermark and durable
 journal activation evidence in inbox schema 2. Migration preserves retained messages
 and sequence allocation. See [the schema contract](PROTOCOL.md#inbox-schema-2-and-journal-activation).
-Subscriptions, repository bindings, memory pointers and the notifier journal remain
-pending; the bridge does not advertise those features.
+Repository bindings, memory pointers and the notifier journal remain pending.
+Local bridge and memory services now support explicit content-free change subscriptions.
+Subscribers read durable state after each hint; hints never acknowledge records or
+call a provider. The existing notifier still uses periodic polling. See
+[subscription protocol](PROTOCOL.md#change-subscriptions).

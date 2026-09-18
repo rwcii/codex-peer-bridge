@@ -23,6 +23,7 @@ a defect in review:
 """
 import argparse
 import asyncio
+import subscriptions
 import contextlib
 import fcntl
 import hashlib
@@ -451,9 +452,13 @@ class Store:
         self.require_writable()
         self.reset_log()
         self.db.execute('BEGIN IMMEDIATE')
+        callback = getattr(self, 'on_change', None)
+        changed = False
         try:
+            previous = self.head() if callback is not None else None
             yield
             self.enforce_pages(control)
+            changed = callback is not None and self.head() != previous
             self.db.execute('COMMIT')
         except BaseException as exc:
             # The rollback comes first and unconditionally, so no path can leave a
@@ -472,6 +477,8 @@ class Store:
                     f'the engine refused a page at the {MAX_PAGES} page ceiling; the '
                     'transaction was rolled back and stored data is intact') from exc
             raise
+        if changed:
+            callback()
 
     def block(self, reason):
         """Record that writes cannot proceed until recovery is asked for explicitly.
@@ -1670,12 +1677,16 @@ class Service:
     def __init__(self, root, repo, store_factory):
         self.root, self.repo = Path(root), repo
         self.generation = uuid.uuid4().hex
+        self.hints = subscriptions.HintHub(self.generation)
         self.stop = asyncio.Event()
         self.tasks = set()
         self.closing = False
         self.admission = Admission()
-        self.worker = DatabaseWorker(
-            lambda: MemoryCommands(root, repo, store_factory(), self.generation))
+        def owned_store():
+            store = store_factory()
+            store.on_change = self.hints.notify_committed
+            return MemoryCommands(root, repo, store, self.generation)
+        self.worker = DatabaseWorker(owned_store)
 
     async def command(self, request, pid):
         if not isinstance(request, dict) or not isinstance(request.get('op'), str):
@@ -1693,6 +1704,7 @@ class Service:
         else:
             result = await self.worker.call('command', request, pid)
         if request['op'] in ('hello', 'status'):
+            result['capabilities'] = ['memory_subscription']
             fault = (result['database_observed_fault'] if request['op'] == 'status'
                      else self.worker.fault)
             if request['op'] == 'hello':
@@ -1715,6 +1727,12 @@ class Service:
                     request = json.loads(await reader.readline())
                 if not isinstance(request, dict):
                     raise MemoryError_('invalid_request', 'expected an operation object')
+                if request.get('op') == 'subscribe':
+                    self.admission.leave(slot)
+                    slot = None
+                    subscriptions.validate(request, self.generation, repo=self.repo)
+                    await self.hints.serve(reader, writer)
+                    return
                 async with asyncio.timeout(10):
                     self.admission.leave(slot)
                     slot = None
@@ -1763,6 +1781,7 @@ class Service:
             await self.stop.wait()
         finally:
             self.closing = True
+            self.hints.close()
             if server is not None:
                 server.close()
             try:

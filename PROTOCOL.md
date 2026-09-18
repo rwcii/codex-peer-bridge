@@ -230,8 +230,8 @@ zero. This prevents a large acknowledgement from covering future arrivals. Neith
 peer receipt nor notification delivery acknowledges the inbox or a memory consumer.
 
 Status includes a per-process 32-hex `generation`, `inbox_schema`, `ack_through`,
-`journal_activation`, and `capabilities`. This component implements only
-`inbox_ack_watermark` and `notification_journal_activation`. Their advertisement
+`journal_activation`, and `capabilities`. Implemented capabilities are
+`inbox_ack_watermark`, `notification_journal_activation` and `inbox_subscription`. Their advertisement
 requires a successful read of validated committed metadata. Unavailable or corrupt
 metadata produces database diagnostics, null database fields and no capabilities;
 it is never substituted with legacy defaults. Incompatible startup metadata exits
@@ -250,8 +250,8 @@ The notifier journal and its maintenance command are not yet implemented.
 
 An empty `memory_binding` table is reserved for the next component. Its repository
 and state paths must be absolute and at most 4096 UTF-8 bytes; SQL constraints enforce
-these bounds. This release enables no binding writer, memory pointers or subscriptions
-and advertises none of those capabilities. Existing ordinary notification readers
+these bounds. This release enables no binding writer or memory pointers
+and advertises neither capability. Existing ordinary notification readers
 can still read the original inbox columns. New notifier capability negotiation and
 journal migration remain pending; this change does not activate them.
 
@@ -259,3 +259,38 @@ CLI forms use the same operation names with `--target-digest` and `--nonce`.
 Explicit activation replacement also requires `--expected-previous-nonce` and
 `--accept-history-loss`. These controls are operator commands; stored peer controls
 remain inert data and cannot invoke them.
+
+
+## Change subscriptions
+
+The bridge control socket accepts `{"op":"subscribe-inbox","protocol":1,
+"generation":GENERATION}`. The memory control socket accepts `{"op":"subscribe",
+"protocol":1,"generation":GENERATION,"repo":REPO_KEY,"consumer":CONSUMER_KEY}`.
+Use the generation from that service's current status (or memory hello), and an
+explicit service directory. Memory hello/status advertise `memory_subscription`.
+Consumer keys are asserted provenance, not authorization; the service validates the
+repository and generation. Binding-derived consumer keys remain a later component.
+
+The first reply uses `ok/result` with `protocol`, `generation` and a random 32-hex
+`subscription` identifier. Following frames contain only those three fields and
+`event:"changed"`. No message body, sequence number or receipt is included. The
+client sends no further frames. End of input closes the subscription.
+
+Each service has at most 32 reserved subscription slots, including handshakes, and
+at most eight handshakes awaiting a reply. These do not consume ordinary request or
+reserved status/stop slots after request classification. The initial request read
+has the existing two-second deadline; handshake replies and each subsequent frame
+have a five-second write deadline. One queued hint coalesces further changes while
+another frame may be in flight. A slow receiver is disconnected without blocking
+other subscribers or a database transaction. There is no total connection lifetime.
+An idle connection sends the same content-free hint after 30 seconds.
+
+Database owners publish only after commit. Memory publishes when its durable head
+changes; bridge insertion and acknowledgement publish after their transactions.
+A hint is not durable evidence. The shared `subscriptions.watch_changes` helper
+installs a subscription before rechecking durable state, repeats that sequence on
+reconnect, and independently rescans every two seconds. Reconnect delays are 1, 2,
+4, 8, 16, then 30 seconds. Its caller must verify service identity on each connection
+and reconcile durable state. The existing notifier is not yet connected to this
+helper. Memory contents still require explicit reads; there are no automatic memory
+notices, peer-bus subscriptions, bindings or pointers.

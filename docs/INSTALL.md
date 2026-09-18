@@ -404,8 +404,8 @@ Do not run an older bridge against a schema-2 inbox after activation: its `ack` 
 does not maintain the new watermark. Restore a consistent pre-upgrade backup for a
 rollback instead of mixing runtime and metadata versions. The schema change preserves
 ordinary-reader compatibility but does not itself implement a notifier journal or
-upgrade an old notifier to the new delivery protocol. Bindings and subscriptions also
-remain pending. The explicit bridge activation controls store evidence only; they are
+upgrade an old notifier to the new delivery protocol. Local change subscriptions are available after both service runtimes are restarted,
+but the existing notifier does not yet use them. Bindings remain pending. The explicit bridge activation controls store evidence only; they are
 not a substitute for the planned stopped-notifier rebuild procedure.
 
 Migration and acknowledgements use SQLite transactions. Process-termination tests

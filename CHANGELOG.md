@@ -7,10 +7,14 @@ into a dated release section when promoted to `main`.
 
 ### Added
 
+- Explicit bridge and memory change subscriptions with bounded connections, coalesced
+  content-free hints after commit, and a shared reconnect/rescan helper. The existing
+  notifier still polls; bindings and automatic memory notices remain pending.
+
 - Inbox schema 2 with atomic migration, a bounded acknowledgement watermark and
   durable journal activation evidence. Status advertises only those implemented
   capabilities. Bridge software faults preserve exit 70 through the supervisor and
-  stop automatic restarts. Subscription, binding and notifier-journal delivery remain pending.
+  stop automatic restarts. Binding and notifier-journal delivery remain pending.
 
 - Bridge startup reserves both socket paths before opening the inbox and retains
   ownership until database shutdown completes. Endpoint refusal exits 78 without

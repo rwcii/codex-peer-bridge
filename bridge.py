@@ -18,6 +18,7 @@ from service_runtime import Admission, close_writer, drain_handlers, database_st
 from peer_guidance import PEER_GUIDANCE
 import platform_support
 import inbox_schema
+import subscriptions
 
 from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange, UnsafeServiceEndpoint, NoControlReply
 DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge')
@@ -70,6 +71,7 @@ def startup_directory(path):
 
 class InboxStore:
     def __init__(self, root):
+        self.on_change = None
         self.db = sqlite3.connect(root / 'inbox.sqlite3')
         try:
             inbox_schema.initialize(self.db)
@@ -97,6 +99,8 @@ class InboxStore:
             raise ValueError('inbox full; acknowledge older entries')
         with self.db:
             self.db.execute('INSERT INTO inbox(received,pid,frame) VALUES(?,?,?)', (time.time(), pid, json.dumps(frame)))
+        if self.on_change is not None:
+            self.on_change()
 
     def command(self, r):
         op = r['op']
@@ -118,7 +122,10 @@ class InboxStore:
                 entries.append(item)
             return entries
         if op == 'ack':
-            return inbox_schema.acknowledge(self.db, r['through'])
+            result = inbox_schema.acknowledge(self.db, r['through'])
+            if self.on_change is not None:
+                self.on_change()
+            return result
         if op in ('activate-notification-journal', 'rebuild-notification-journal-activation'):
             return inbox_schema.activate(self.db, r)
         raise ValueError('unknown database operation')
@@ -130,6 +137,7 @@ class Bridge:
         self.address = f'uds:/tmp/cc-socks/{os.getpid()}.sock'
         self.stop = asyncio.Event()
         self.generation = uuid.uuid4().hex
+        self.hints = subscriptions.HintHub(self.generation)
         # Construction must not open or migrate a database before endpoint ownership.
         self.worker = None
         self.admission = Admission()
@@ -177,6 +185,12 @@ class Bridge:
             if control:
                 async with asyncio.timeout(HANDSHAKE_TIMEOUT):
                     request = json.loads(await reader.readline())
+            if control and isinstance(request, dict) and request.get('op') == 'subscribe-inbox':
+                self.admission.leave(slot)
+                slot = None
+                subscriptions.validate(request, self.generation)
+                await self.hints.serve(reader, writer)
+                return
             async with asyncio.timeout(6):
                 if control:
                     if not isinstance(request, dict):
@@ -230,6 +244,8 @@ class Bridge:
             if state is None:
                 state = dict(inbox_count=None, inbox_schema=None, ack_through=None,
                              journal_activation=None, capabilities=[])
+            if state['inbox_schema'] == inbox_schema.SCHEMA:
+                state['capabilities'].append('inbox_subscription')
             return dict(pid=os.getpid(), address=self.address, generation=self.generation,
                         **state, **diagnostics,
                         delivery='inbox available; run notify.py to notify the selected participant session')
@@ -290,7 +306,11 @@ class Bridge:
                 os.chmod(path, 0o600)
             # A bind reserves the path without admitting connections. Both paths
             # are owned before the worker can create or migrate the database.
-            self.worker = DatabaseWorker(lambda: InboxStore(self.root))
+            def store_factory():
+                store = InboxStore(self.root)
+                store.on_change = self.hints.notify_committed
+                return store
+            self.worker = DatabaseWorker(store_factory)
             for sock, _path in sockets:
                 sock.listen(16)
             servers.append(await asyncio.start_unix_server(lambda r,w: self.handle(r,w,True), sock=sockets[0][0], limit=LIMIT))
@@ -302,6 +322,7 @@ class Bridge:
             await self.stop.wait()
         finally:
             self.closing = True
+            self.hints.close()
             # Keep the endpoint reservation until accepted database work drains.
             # New handlers see closing and cannot submit work. Some Python
             # versions unlink Unix paths when Server.close() is called.

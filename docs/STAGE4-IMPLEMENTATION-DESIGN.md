@@ -1,6 +1,6 @@
 # Stage 4 implementation design for review
 
-Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented in the current candidate, pending review. Subscriptions, bindings/pointers and the notifier journal remain pending. No stage 4 runtime changes are deployed.
+Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented and reviewed. Subscriptions and the shared reconnect/rescan helper are implemented in the current candidate, pending review. Bindings/pointers, notifier integration and the notifier journal remain pending. No stage 4 runtime changes are deployed.
 Baseline: develop 84f35e727b0f17a9469de182db9a843e7a28d092, integrated by signed merge 7503dc1.
 Codex is the sole driver. Claude is the reviewer. The merged baseline was independently verified. Implementation branch: feature/shared-transport-delivery.
 
@@ -119,8 +119,9 @@ Before code: close participant namespace derivation, exact wire fields, queue/co
 These decisions apply to new stage 4 behavior. Existing peer envelopes and memory sync,
 acknowledgement, and snapshot formats remain unchanged. Transport-helper extraction,
 the participant ownership boundary, endpoint-role separation and bridge/memory worker
-ownership are implemented on this feature branch. Subscriptions, pointers, the notifier
-journal and its delivery-health reporting remain pending. This branch is not deployed.
+ownership are implemented on this feature branch. Subscription services and their shared
+client helper are implemented in the current candidate. Pointers, notifier integration,
+the journal and its delivery-health reporting remain pending. This branch is not deployed.
 
 ### Participant identity and lock scope
 
@@ -428,4 +429,4 @@ uses `rebuild-notification-journal-activation` with `expected_previous_nonce` an
 `accept_history_loss: true`, preserving the target. These are bridge-side operations;
 the planned notifier rebuild must still enforce stopped ownership and local evidence
 before invoking replacement. The current candidate does not implement that notifier
-workflow or advertise bindings/subscriptions.
+workflow or advertise bindings. Subscription capabilities are implemented separately.
