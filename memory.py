@@ -37,7 +37,7 @@ import subprocess
 import time
 import uuid
 
-from bridge import LIMIT, credentials, encode, private_dir
+from peer_transport import LIMIT, credentials, encode, private_dir
 import platform_support
 
 PROTOCOL = 1

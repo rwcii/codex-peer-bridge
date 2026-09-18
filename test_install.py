@@ -40,7 +40,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertTrue((root/'app/docs/INSTALL.md').exists())
             self.assertTrue((root/'app/LICENSE').exists())
-            for script in ('bridge.py', 'notify.py', 'session.py'):
+            for script in ('bridge.py', 'notify.py', 'session.py', 'memory.py'):
                 check = subprocess.run([sys.executable, str(root/'app'/script), '--help'],
                                        cwd=root, capture_output=True, text=True)
                 self.assertEqual(check.returncode, 0, check.stderr)
