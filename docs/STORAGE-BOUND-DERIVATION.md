@@ -337,12 +337,38 @@ though the log had been proved empty. For the log file itself only `FileNotFound
 absence: a permission or I/O error is a failure to obtain the proof and must not be read as an
 empty log.
 
-**A rolled-back initialisation must be completable.** The pragmas applied at open write a
-database header, so an initialisation that rolls back leaves a nonempty file with no tables.
-Reading that as a foreign store made the rollback clean and the store permanently unopenable.
-The test for adoption is therefore "no tables this store does not own", not "no metadata": an
-unfinished start is finished, a store holding entries without an identity is refused, and
-another application's database is refused and named in the error.
+**A rolled-back initialisation must be completable, and nothing else may be.** The pragmas
+applied at open write a database header, so an initialisation that rolls back leaves a nonempty
+file with no tables. Reading that as a foreign store made the rollback clean and the store
+permanently unopenable.
+
+Widening the rule to fix that opened an adoption hole, and closing it properly took one
+read-only classification, `Store.classify`, which runs **before** `configure` so that no file
+is modified before it has been judged. It answers `empty`, `unfinished` or `initialised`, and
+refuses everything else:
+
+| File | Outcome |
+|---|---|
+| No objects at all, including a header-only file | `empty`, initialised |
+| Exactly this schema, shapes matching, no data, no identity | `unfinished`, completed |
+| An identity is recorded | `initialised`, judged by `inspect` |
+| Any object this schema does not own | refused, the object named |
+| A familiar name with a different definition | refused |
+| Any stored row without an identity, whether `meta` is empty **or absent** | refused |
+| A schema that cannot be read | refused, never treated as empty |
+
+Two earlier attempts at this were wrong in instructive ways. Excluding every `search`-prefixed
+name let a database whose only table was `search_history` be adopted: a prefix cannot prove a
+table is an FTS5 shadow. The shadow set is now exact -- `search_config`, `search_data`,
+`search_docsize`, `search_idx`, verified against a real contentless index rather than assumed
+-- and admitted only when the virtual table that owns them is present and its definition
+matches. And returning as soon as the metadata table was missing meant the check that stops
+data being adopted ran only when an empty `meta` table happened to exist, so dropping the table
+was enough to have an entry adopted with the head reset to zero.
+
+Shapes are compared, not just names, because a familiar name with another definition is a
+different table. The comparison normalises away `IF NOT EXISTS`, which SQLite strips from the
+text it stores; without that every table in a healthy store read as differently defined.
 
 Two pragmas run their own transactions rather than sitting inside one, because
 `incremental_vacuum` cannot usefully be wrapped. Both are bracketed by resets.
@@ -406,9 +432,16 @@ asserted by a test in `test_memory.StorageBoundTests`:
 | Recovery clears the block once the log can be reset | `ResetFailureTests.test_recovery_clears_the_block_once_the_log_can_be_reset` |
 | Recovery is reachable from the command line | `LifecycleTests.test_recovery_is_reachable_from_the_command_line` |
 | Another application's database is never adopted | `InitialisationBoundaryTests.test_another_application_database_is_never_adopted` |
+| A search-prefixed table is not evidence of an index | `InitialisationBoundaryTests.test_a_search_prefixed_table_is_not_evidence_of_an_index` |
+| A shadow table without its virtual table is not owned | `InitialisationBoundaryTests.test_a_shadow_table_without_its_virtual_table_is_not_owned` |
+| A table named `search` that is not the index is not owned | `InitialisationBoundaryTests.test_a_table_named_search_that_is_not_the_index_is_not_owned` |
+| Data without identity is refused whether `meta` is empty or absent | `InitialisationBoundaryTests.test_data_without_identity_is_refused_whether_meta_is_empty_or_absent` |
+| A table defined differently is a different table | `InitialisationBoundaryTests.test_a_table_defined_differently_is_a_different_table` |
+| An unfinished schema without data is completed | `InitialisationBoundaryTests.test_an_unfinished_schema_without_data_is_completed` |
+| A schema that cannot be read is an error, not an empty file | `InitialisationBoundaryTests.test_a_schema_that_cannot_be_read_is_an_error_not_an_empty_file` |
 | A raising checkpoint holds writes until recovery | `CheckpointExceptionTests.test_a_raising_checkpoint_holds_writes_until_recovery` |
 | Only a missing log proves a missing log | `CheckpointExceptionTests.test_only_a_missing_log_proves_a_missing_log` |
-| An unreadable log is a failed proof | `CheckpointExceptionTests.test_a_real_unreadable_log_directory_is_a_failed_proof` |
+| An unreadable log file is a failed proof | `CheckpointExceptionTests.test_an_unreadable_log_file_is_a_failed_proof` |
 | A scan-mode store expires across batches without touching the index | `ScanModeExpiryTests.test_a_scan_mode_store_expires_across_batches_without_touching_the_index` |
 | Index maintenance that cannot fit invalidates and still removes the rows | `ScanModeExpiryTests.test_index_maintenance_that_cannot_fit_invalidates_and_still_removes_the_rows` |
 | A rebuild that cannot fit still opens the store in scan mode | `test_a_rebuild_that_cannot_fit_still_opens_the_store_in_scan_mode` |

@@ -348,11 +348,13 @@ rows they describe are one transaction. Split across two, an interruption left a
 tables and no identity, which could only be read as belonging to another repository; that state
 is now completed rather than refused, while a file holding entries without an identity is
 refused outright, because adopting it would take another store's data under this repository's
-name. The test for completing an unfinished start is "no tables this store does not own",
-not "no metadata", so another application's database stays refused and is named in the error.
-A rolled-back initialisation leaves a nonempty file with no tables, because the pragmas applied
-at open write a database header; reading that as foreign made the rollback clean and the store
-permanently unopenable. The connection runs in autocommit and every transaction is opened explicitly, because the
+name. One read-only classification, `Store.classify`, decides what a file is, and it runs
+before any pragma can modify it. Only an empty file or exactly this schema with no data and no
+identity may be initialised. Object names are not evidence: definitions are compared, the FTS5
+shadow set is exact and admitted only alongside the virtual table that owns it, a schema that
+cannot be read is an error rather than an empty file, and any stored row without an identity is
+refused whether the metadata table is empty or missing. A refused file is left byte for byte
+alone. The connection runs in autocommit and every transaction is opened explicitly, because the
 driver starts an implicit transaction only for `INSERT`, `UPDATE`, `DELETE` and `REPLACE` -- so
 DDL committed statement by statement whatever it was wrapped in.
 

@@ -70,11 +70,32 @@ CREATE TABLE IF NOT EXISTS entries(
     PRIMARY KEY(id, position))""",
 """CREATE INDEX IF NOT EXISTS entries_live ON entries(superseded_by, revoked_by, expires)""",
 )
-# Tables this schema owns. A file carrying only these, or none at all, may be initialised;
-# anything else is another application's database and is refused rather than adopted. FTS5
-# adds shadow tables under the `search` prefix, which belong to the index this store creates.
+# Objects this schema owns. A file carrying only these, with no application data and no
+# identity, is an unfinished start and may be completed; anything else is another
+# application's database and is refused untouched. Names alone are not enough: a definition
+# that differs is a different table wearing the same name, so shapes are compared too.
 SCHEMA_TABLES = frozenset(('meta', 'entries', 'idem', 'cursors', 'retired', 'snapshots',
                            'snapshot_items'))
+SCHEMA_INDEXES = frozenset(('entries_live',))
+# Tables holding what a caller stored. Any row here without an identity means the file is
+# somebody's data, whether the metadata table is empty or missing altogether.
+DATA_TABLES = ('entries', 'snapshot_items', 'snapshots', 'cursors', 'retired', 'idem')
+FTS_TABLE = 'search'
+FTS_TABLE_SQL = 'CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(body, content="")'
+# The shadow tables FTS5 creates for a contentless `search`, verified against a real one
+# rather than assumed from a prefix. `search_content` is absent because the table is
+# contentless. A prefix cannot prove a table is a shadow: `search_history` is not one.
+FTS_SHADOWS = frozenset(('search_config', 'search_data', 'search_docsize', 'search_idx'))
+
+
+def normalised_sql(text):
+    """Compare definitions without being defeated by whitespace, case or SQLite's rewriting.
+
+    SQLite stores a definition with `IF NOT EXISTS` removed, so the authored statement and
+    the stored one never match literally. Comparing them raw reported every table in a
+    perfectly good store as differently defined.
+    """
+    return ' '.join((text or '').split()).casefold().replace('if not exists ', '')
 
 TYPES = ('decision', 'finding', 'gotcha', 'handoff', 'status', 'directive')
 SCOPES = ('repo', 'task', 'session')
@@ -254,23 +275,26 @@ class Store:
     def __init__(self, path, repo, fts=None):
         self.repo, self.path = repo, path
         self.expired_at = 0.0
-        # An existing store is inspected before anything is written to it. Enabling WAL
-        # or creating tables first would modify a store this runtime has already decided
-        # it cannot understand, which is the opposite of refusing to touch it.
-        existing = Path(path).exists() and Path(path).stat().st_size > 0
         # Autocommit, with every transaction opened explicitly below. The driver starts an
         # implicit transaction only for INSERT, UPDATE, DELETE and REPLACE, so DDL ran in
         # autocommit however it was wrapped, and the schema stayed several transactions.
         self.db = sqlite3.connect(path, isolation_level=None)
         self.blocked = None
         try:
-            if existing:
+            # Exclusive locking is set first because it writes nothing itself and because a
+            # read must not create a shared-memory file beside a database this runtime may
+            # be about to refuse. Then the file is classified, reading only. `configure`
+            # comes after, because setting the journal mode writes a database header and no
+            # file may be modified before it has been judged.
+            self.db.execute('PRAGMA locking_mode=EXCLUSIVE').fetchall()
+            state = self.classify(repo)
+            if state == 'initialised':
                 self.inspect(repo)
             self.configure()
             # The schema and the metadata that identifies it are one transaction. Split
             # across two, an interruption between them left a store with tables and no
-            # identity, which `inspect` could only read as belonging to another repository.
-            if self.uninitialised():
+            # identity, which could only be read as belonging to another repository.
+            if state != 'initialised':
                 with self.transaction():
                     for statement in SCHEMA_STATEMENTS:
                         self.db.execute(statement)
@@ -517,47 +541,114 @@ class Store:
             residual = 0
         return busy, log_pages, residual
 
-    def user_tables(self):
-        """Tables in this file, excluding SQLite's own and the search index's shadows."""
-        try:
-            rows = self.db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%'").fetchall()
-        except sqlite3.Error:
-            return set()
-        return {name for (name,) in rows if not name.startswith('search')}
+    def classify(self, repo):
+        """Decide what this file is, reading only, before anything can write to it.
 
-    def uninitialised(self):
-        """Does this file still need its schema and identity written?
+        This runs before `configure`, because the pragmas there write a database header and a
+        file must not be modified before it has been judged. It answers one of three things,
+        and refuses everything else:
 
-        A file can exist with neither, and it can exist with tables but no identity if an
-        older runtime was interrupted between the two transactions that used to create
-        them. Both are the same recoverable state: nothing has been recorded, so
-        initialisation may complete. A file carrying entries but no identity is NOT this
-        state and is refused by `inspect`, because completing initialisation there would
-        adopt another store's data under this repository's name.
+        `empty`       nothing has been created yet, including the nonempty-but-tableless file
+                      an initialisation that rolled back leaves behind.
+        `unfinished`  exactly this schema, with no application data and no identity: this
+                      runtime's own interrupted start, which may be completed.
+        `initialised` an identity is recorded, so `inspect` judges whether it is ours.
+
+        Names are not evidence. A definition that differs is a different table wearing a
+        familiar name, and a prefix proves nothing at all -- `search_history` is not an FTS5
+        shadow table. So shapes are compared, the shadow set is exact, and it is admitted only
+        when the virtual table it belongs to is present and matches.
         """
-        foreign = self.user_tables() - SCHEMA_TABLES
-        if foreign:
+        try:
+            objects = self.db.execute(
+                "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            if owned_elsewhere(exc):
+                raise MemoryError_(
+                    'store_busy',
+                    'another owner holds this store. The service keeps one exclusive '
+                    'connection so that its storage bound holds, so a second reader is '
+                    'refused rather than admitted; reach it through the control socket. '
+                    'Nothing was written') from exc
+            # A schema that cannot be read is an error, not an empty file. Treating it as
+            # empty would initialise over whatever is actually there.
             raise MemoryError_(
                 'incompatible_store',
-                f'this file holds tables this store does not own '
-                f'({", ".join(sorted(foreign)[:4])}); it was left untouched')
+                f'this file\'s schema could not be read ({type(exc).__name__}: {exc}), so it '
+                'cannot be judged; it was left untouched') from exc
+        if not objects:
+            return 'empty'
+        if self.identity():
+            return 'initialised'
+
+        # No identity, so this may only be adopted if it is exactly an unfinished start.
+        expected = {}
+        for statement in SCHEMA_STATEMENTS:
+            name = statement.split('EXISTS', 1)[1].split('(', 1)[0].split()[0]
+            expected[name] = normalised_sql(statement)
+        fts_present = any(name == FTS_TABLE and normalised_sql(sql) == normalised_sql(FTS_TABLE_SQL)
+                          for _type, name, sql in objects)
+        unknown, malformed = [], []
+        for _type, name, sql in objects:
+            if name == FTS_TABLE:
+                if not fts_present:
+                    malformed.append(name)
+                continue
+            if name in FTS_SHADOWS:
+                # Admitted only alongside the virtual table that owns them.
+                if not fts_present:
+                    unknown.append(name)
+                continue
+            if name not in expected:
+                unknown.append(name)
+                continue
+            if normalised_sql(sql) != expected[name]:
+                malformed.append(name)
+        if unknown:
+            raise MemoryError_(
+                'incompatible_store',
+                f'this file holds objects this store does not own '
+                f'({", ".join(sorted(unknown)[:4])}), so it belongs to another application; '
+                'it was left untouched')
+        if malformed:
+            raise MemoryError_(
+                'incompatible_store',
+                f'this file defines {", ".join(sorted(malformed)[:4])} differently from this '
+                'schema, so it is not an unfinished store of ours; it was left untouched')
+        held = self.application_rows()
+        if held:
+            raise MemoryError_(
+                'incompatible_store',
+                f'this file holds data ({held}) but records no repository identity, so it '
+                'cannot be adopted; it was left untouched')
+        return 'unfinished'
+
+    def identity(self):
+        """The recorded identity rows, or an empty mapping when none has been written.
+
+        A missing metadata table and an empty one mean the same thing here: nothing has been
+        recorded. They must not diverge, because the checks that follow are what stop a file
+        with data being adopted, and reaching them depended on which of the two it was.
+        """
         try:
-            self.db.execute('SELECT 1 FROM meta LIMIT 1').fetchone()
+            return dict(self.db.execute(
+                "SELECT key,value FROM meta WHERE key IN ('repo','schema','protocol')"
+            ).fetchall())
         except sqlite3.Error:
-            return True                      # no meta table at all
-        if self.db.execute('SELECT count(*) FROM meta').fetchone()[0]:
-            return False
-        try:
-            if self.db.execute('SELECT 1 FROM entries LIMIT 1').fetchone():
-                raise MemoryError_(
-                    'incompatible_store',
-                    'this file holds entries but records no repository identity, so it '
-                    'cannot be adopted; it was left untouched')
-        except sqlite3.OperationalError:
-            pass                             # no entries table either
-        return True
+            return {}
+
+    def application_rows(self):
+        """A description of any stored data, or None. Missing tables hold nothing."""
+        for table in DATA_TABLES:
+            try:
+                count = self.db.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
+            except sqlite3.Error:
+                continue
+            if count:
+                return f'{count} row(s) in {table}'
+        return None
+
 
     def inspect(self, repo):
         """Read-only compatibility check on an existing store. Writes nothing."""
@@ -572,22 +663,9 @@ class Store:
                     'connection so that its storage bound holds, so a second reader is '
                     'refused rather than admitted; reach it through the control socket. '
                     'Nothing was written') from exc
-            # The metadata table may be missing because nothing was ever written: the
-            # pragmas applied at open write a database header, so an initialisation that
-            # rolled back leaves a nonempty file with no tables at all. That is this
-            # runtime's own unfinished work and must be completable, not condemned.
-            foreign = self.user_tables() - SCHEMA_TABLES
-            if not foreign:
-                return
             raise MemoryError_('incompatible_store',
-                               f'this file holds tables this store does not own '
-                               f'({", ".join(sorted(foreign)[:4])}), so it is another '
-                               f'application\'s database ({type(exc).__name__}); it was '
-                               'left untouched') from exc
-        if not rows:
-            # Nothing recorded yet. `uninitialised` decides whether that is recoverable;
-            # reporting another repository here would misname an interrupted first start.
-            return
+                               f'this file is not a memory store ({type(exc).__name__}); it '
+                               'was left untouched') from exc
         if rows.get('repo') != repo:
             raise MemoryError_('wrong_repository',
                                'state directory belongs to another repository; it was left '

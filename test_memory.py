@@ -1730,6 +1730,102 @@ class InitialisationBoundaryTests(unittest.TestCase):
         self.assertEqual(store.meta('repo'), REPO)
         self.assertTrue(store.note('writer', 'finding', 'usable after a rolled-back start'))
 
+    def prepared(self, name, statements, auto_vacuum=True):
+        """A database in a stated shape, with the pragmas a real store would carry."""
+        path = self.home/name
+        db = sqlite3.connect(path, isolation_level=None)
+        if auto_vacuum:
+            db.execute('PRAGMA auto_vacuum=INCREMENTAL')
+        db.execute('PRAGMA page_size=4096')
+        db.execute('PRAGMA journal_mode=WAL')
+        for statement in statements:
+            db.execute(statement)
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+        db.close()
+        return path
+
+    def refused(self, path, code='incompatible_store'):
+        before = path.read_bytes()
+        with self.assertRaises(memory.MemoryError_) as e:
+            memory.Store(path, REPO)
+        self.assertEqual(e.exception.code, code)
+        self.assertEqual(path.read_bytes(), before,
+                         'a file this store refuses must be left byte for byte alone')
+        return e.exception
+
+    def test_a_search_prefixed_table_is_not_evidence_of_an_index(self):
+        """A prefix cannot prove a table is an FTS5 shadow.
+
+        `search_history` is an ordinary table belonging to something else, and excluding
+        every `search`-prefixed name from the check let a foreign database be adopted.
+        """
+        path = self.prepared('history.sqlite3', [
+            'CREATE TABLE search_history(body TEXT)',
+            "INSERT INTO search_history VALUES('someone else browsing history')"])
+        self.assertIn('search_history', str(self.refused(path)))
+
+    def test_a_shadow_table_without_its_virtual_table_is_not_owned(self):
+        """The shadow set is admitted only alongside the index that creates it."""
+        path = self.prepared('orphan.sqlite3', list(memory.SCHEMA_STATEMENTS) + [
+            'CREATE TABLE search_data(id INTEGER PRIMARY KEY, block BLOB)'])
+        self.assertIn('search_data', str(self.refused(path)))
+
+    def test_a_table_named_search_that_is_not_the_index_is_not_owned(self):
+        path = self.prepared('impostor.sqlite3', list(memory.SCHEMA_STATEMENTS) + [
+            'CREATE TABLE search(whatever TEXT)'])
+        self.assertIn('search', str(self.refused(path)))
+
+    def test_data_without_identity_is_refused_whether_meta_is_empty_or_absent(self):
+        """The refusal must not depend on which of the two states the file is in.
+
+        `uninitialised` returned as soon as the metadata table was missing, so the check
+        that stops data being adopted ran only when an empty `meta` table happened to exist.
+        Dropping the table was enough to have an entry adopted, with head reset to zero.
+        """
+        entry = ("INSERT INTO entries(seq,ts,type,scope,body,author,revision) "
+                 "VALUES(1,1.0,'finding','repo','someone else data','a',1)")
+        empty_meta = self.prepared('empty-meta.sqlite3',
+                                   list(memory.SCHEMA_STATEMENTS) + [entry])
+        absent_meta = self.prepared('absent-meta.sqlite3',
+                                    list(memory.SCHEMA_STATEMENTS) + [entry, 'DROP TABLE meta'])
+        for label, path in (('empty', empty_meta), ('absent', absent_meta)):
+            with self.subTest(meta=label):
+                self.assertIn('records no repository identity', str(self.refused(path)))
+
+    def test_a_table_defined_differently_is_a_different_table(self):
+        """Names are not evidence; a familiar name with another shape is not ours."""
+        path = self.prepared('malformed.sqlite3', ['CREATE TABLE entries(x TEXT)'])
+        self.assertIn('differently', str(self.refused(path)))
+
+    def test_an_unfinished_schema_without_data_is_completed(self):
+        """Including one that already carries a real search index."""
+        for name, extra in (('plain.sqlite3', []),
+                            ('indexed.sqlite3', [memory.FTS_TABLE_SQL]),
+                            ('no-meta.sqlite3', ['DROP TABLE meta'])):
+            with self.subTest(shape=name):
+                path = self.prepared(name, list(memory.SCHEMA_STATEMENTS) + extra)
+                store = memory.Store(path, REPO)
+                self.addCleanup(store.close)
+                self.assertEqual(store.meta('repo'), REPO)
+                self.assertTrue(store.note('writer', 'finding', 'usable'))
+
+    def test_a_schema_that_cannot_be_read_is_an_error_not_an_empty_file(self):
+        """Reading a schema as empty would initialise over whatever is really there.
+
+        Driven with a file SQLite genuinely cannot parse, rather than a substituted error,
+        because the point is what this code concludes from a real unreadable database.
+        """
+        path = self.home/'garbage.sqlite3'
+        path.write_bytes(b'this is not a database, it is something else entirely' * 200)
+        before = path.read_bytes()
+        with self.assertRaises(memory.MemoryError_) as e:
+            memory.Store(path, REPO)
+        self.assertEqual(e.exception.code, 'incompatible_store')
+        self.assertIn('could not be read', str(e.exception))
+        self.assertEqual(path.read_bytes(), before,
+                         'a file that could not be judged must be left alone')
+
+
     def test_another_application_database_is_never_adopted(self):
         """Completing initialisation must not be a way to take over any nonempty file.
 
@@ -1977,19 +2073,30 @@ class CheckpointExceptionTests(Base):
             self.assertIn('PermissionError', self.s.blocked)
         self.assertTrue(self.s.recover()['recovered'])
 
-    def test_a_real_unreadable_log_directory_is_a_failed_proof(self):
-        """Drive the stat failure itself rather than only a substituted exception."""
+    def test_an_unreadable_log_file_is_a_failed_proof(self):
+        """Drive the `os.stat` branch inside `log_state`, not a substitute for the method.
+
+        Replacing `log_state` and raising from it proves only that the caller handles an
+        exception. What must be proved is that `log_state` itself does not read a stat
+        failure as an empty log, so only the stat is replaced and the real method runs. If
+        `except OSError` returned to that method, the write below would succeed and this
+        test would fail.
+        """
         self.note('seed')
-        real = memory.Store.log_state
+        wal = str(self.s.path) + '-wal'
+        real_stat = os.stat
 
-        def clean_checkpoint_unreadable_file(self_):
-            busy, log_pages, _ = real(self_)
-            # The checkpoint succeeded; the log file cannot be examined to confirm it.
-            raise PermissionError(f'cannot stat {self_.path}-wal')
+        def unreadable_log_only(target, *args, **kwargs):
+            if str(target) == wal:
+                raise PermissionError(f'cannot stat {wal}')
+            return real_stat(target, *args, **kwargs)
 
-        with patch.object(memory.Store, 'log_state', clean_checkpoint_unreadable_file):
+        with patch.object(memory.os, 'stat', unreadable_log_only):
             with self.assertRaises(memory.MemoryError_) as e:
                 self.note('unverifiable')
             self.assertEqual(e.exception.code, 'storage_blocked')
+            self.assertIn('PermissionError', self.s.blocked)
+            # The reads the block promises are still available while the stat fails.
+            self.assertIsNotNone(self.call(op='status')['blocked'])
         self.assertTrue(self.s.recover()['recovered'])
         self.assertTrue(self.note('resumed'))
