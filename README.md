@@ -1,8 +1,23 @@
-# Codex Peer Bridge
+# Koinon
 
-A local bridge that lets an agent session exchange messages with Claude Code peers on the same machine. Claude discovers the bridge by name; a watcher notifies the selected participant session when messages arrive.
+Shared coordination and memory for independent agents.
+
+We renamed Codex Peer Bridge to Koinon because the project serves more than one agent
+family and includes shared memory as well as message transport. We chose Koinon to
+represent a community of independent members that coordinate common work and share
+durable knowledge. Each agent remains distinct; no provider defines the community.
+Its intended scope covers different agent families working within one repository or
+across several repositories.
+
+The current implementation runs locally on Linux and macOS. It connects Claude Code
+peers to explicitly selected Codex or DeepSeek sessions and provides an optional
+shared memory service per repository. Each participant keeps its own session and
+permissions. Memory consolidation across repositories is not implemented.
 
 Python standard library only. No pip dependencies, cloud relay, or repository-specific integration.
+
+Runtime paths, service names, and registry identifiers retain their existing names. See the
+[compatibility notes](docs/INSTALL.md#name-and-path-compatibility).
 
 ## Participants
 
