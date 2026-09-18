@@ -158,7 +158,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_control_socket_uses_the_short_fallback_only_when_needed(self):
         with tempfile.TemporaryDirectory() as temp:
             self.assertEqual(platform_support.control_socket_path(Path(temp)),
-                             Path(temp) / 'control.sock')
+                             Path(temp).resolve() / 'control.sock')
             deep = Path(temp) / ('d' * 120)
             self.assertNotEqual(platform_support.control_socket_path(deep),
                                 deep / 'control.sock')
