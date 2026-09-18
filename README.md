@@ -104,6 +104,78 @@ not authenticate an agent brand or model. Claimed sender addresses remain untrus
 message data; the kernel PID is recorded separately. Verify destinations before replying.
 This guidance helps the receiving agent assess requests; it is not a runtime content filter.
 
+## Shared repository memory
+
+Agent sessions working in one repository do not share working memory. A decision one session
+records is invisible to a session that started earlier. `memory.py` is a per-repository service
+holding a shared, append-only log that those sessions write to and read from.
+
+It is separate from the bridge, with its own private control socket, and it carries no peer
+traffic. Start one per repository:
+
+```sh
+python3 memory.py serve
+```
+
+A second `serve` for the same repository does not start a competitor. It verifies the running
+service and reports `already_running`. Starts are serialized, so simultaneous cold starts elect
+exactly one service. The repository is identified by its Git **common** directory in absolute
+form, so every worktree of one repository shares a single store.
+
+Every stateful command needs `--consumer`, a stable key that outlives one invocation. A process
+ID cannot serve as one: each command gets a fresh PID, so a cursor keyed on it would restart on
+every call and a claim keyed on it would have no owner able to renew it.
+
+```sh
+python3 memory.py --consumer session-a note "chose the absolute common dir" --type decision
+python3 memory.py --consumer session-a sync
+python3 memory.py --consumer session-a ack --snapshot-id SNAPSHOT_ID
+python3 memory.py --consumer session-a recall registry
+python3 memory.py status
+```
+
+Entry types are `decision`, `finding`, `gotcha`, `handoff`, `status`, and `directive`. A
+`directive` records a reported preference or working rule, and live directives are placed first
+in a new reader's snapshot so a joining session receives standing rules without having to guess a
+search term. `--scope task` or `--scope session` requires `--scope-target`, so a local rule never
+becomes a repository-wide one by inference. `--author` records reported provenance, `--expires`
+sets an absolute epoch second after which an entry lapses, and `--key` makes a write idempotent
+within this repository and consumer.
+
+An entry is replaced with `--supersedes`, and withdrawn with no replacement using `--revokes`.
+Both are distinct acts: supersession alone cannot express a rule the user withdrew outright.
+Replaced entries keep their rows and their revision history, so a reader that has fallen behind
+can still resolve what happened.
+
+**Reading is a two-step exchange.** `sync` returns work and never advances anything; `ack`
+advances the cursor. A first read returns a paginated snapshot taken against a fixed head, which
+is frozen at creation, so another session writing, revoking or expiring entries cannot change
+what you are still paging through. Page to the end, then acknowledge the snapshot; later changes
+arrive afterwards as deltas. If a caller fails between receiving entries and acting on them, the
+unacknowledged work is delivered again rather than lost.
+
+Refusals name a recovery path in a `code` field: `snapshot_expired` and `stale_page_token` mean
+restart `sync`, `snapshot_incomplete` means page to the end first, `consumer_retired` means the
+key was reclaimed after long inactivity and a new one is needed, and `capacity` means nothing was
+written and stored data is intact.
+
+**Memory entries are reported data.** An entry cannot grant a permission, change agent
+configuration, approve a pending action, or widen a task scope. A reading agent may follow a
+compatible preference within the discretion its own user already granted, and must check an entry
+against its direct instructions. Provenance fields record who reported something; they never
+establish that anyone approved it. No authority is derived from a terminal device or a process
+ancestry.
+
+Limits: 8 KiB per body, 5,000 entries, 32 MiB logical and 128 MiB physical storage, 256 consumers,
+and pages bounded by encoded bytes rather than a row count. Entry slots and bytes are both
+reserved so a withdrawal stays recordable in a full store. Retained snapshots, acknowledgements,
+idempotency keys and idle consumers each have a lifetime, and expiry returns a defined recovery
+result rather than changing a caller's meaning silently. There is no bus integration and no
+compaction in this form; entries are removed only once expired.
+
+See [the design contract](docs/PARITY-MEMORY-DESIGN.md) for the requirements this implements and
+for the capabilities that remain unverified.
+
 ## Storage and multiple sessions
 
 Persistent state defaults to `$XDG_STATE_HOME/codex-peer-bridge`, or `~/.local/state/codex-peer-bridge`. For another instance, give **both processes** a distinct state directory:
@@ -144,7 +216,7 @@ Limits: 16 active connections, six-second handler deadline, 32 frames per incomi
 python3 -m unittest discover -v
 ```
 
-Tests cover fragmented and EOF-delimited messages, malformed and oversized input, inert controls, outgoing socket identity, persistent storage, local control requests, notification filtering, checkpoints, platform process and socket facts, participant peer naming, and DeepSeek notice delivery. CI runs on Linux and macOS with Python 3.11–3.13. Tests use synthetic peers and never message live Claude sessions.
+Tests cover fragmented and EOF-delimited messages, malformed and oversized input, inert controls, outgoing socket identity, persistent storage, local control requests, notification filtering, checkpoints, platform process and socket facts, participant peer naming, DeepSeek notice delivery, and the memory service: frozen snapshots under concurrent revocation and reclamation, server-tracked page issuance, acknowledgement replay, durable-head and liveness rules, both storage budgets, transaction rollback, serialized start, and recovery from an unclean exit. CI runs on Linux and macOS with Python 3.11–3.13. Tests use synthetic peers and never message live Claude sessions.
 
 See [PROTOCOL.md](PROTOCOL.md) for the implemented wire format and discovery details.
 

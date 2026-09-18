@@ -7,6 +7,26 @@ into a dated release section when promoted to `main`.
 
 ### Added
 
+- `memory.py`, a shared per-repository memory service, in its pull-only form. Agents working
+  in one repository append typed entries and read them back through a private control socket,
+  so a session that started earlier can still learn what a later session recorded. Repository
+  identity is the absolute Git common directory, so every worktree of one repository shares one
+  store. Liveness is recorded on the entry it affects rather than derived, so reclaiming a
+  replacement cannot resurrect what it replaced. A snapshot is frozen as immutable copies against
+  a fixed head, so a revocation or a reclamation cannot change what a reader is still paging
+  through. The server records page issuance and completion, so a cursor advances only on an
+  acknowledgement it actually issued, and a retained acknowledgement replays after a lost
+  response. Responses are bounded by encoded bytes with continuation. Storage enforces logical
+  and physical budgets with slots and bytes reserved so a withdrawal stays recordable, and every
+  retained record has a lifetime whose expiry returns a defined recovery result. Start is
+  serialized, and a socket left by an unclean exit is recovered only after its recorded owner is
+  proved dead. Entries are reported data and grant no authority. There is no bus integration and
+  no compaction in this form.
+- `docs/PARITY-MEMORY-DESIGN.md`, the agreed design and acceptance contract for peer
+  capability parity and a shared per-repository memory service. It records the contracts
+  for identity, delivery, presence, and memory, the capabilities that remain unverified
+  until they are measured, and the acceptance criteria that judge completion. No runtime
+  behaviour changes with this entry.
 - Generic peer-origin and permission-laundering guidance on inbox records, queued
   notifications, and managed session instructions, separate from peer message content.
 - Updated inbox CLI adds guidance when reading from an older running bridge, allowing
