@@ -43,6 +43,8 @@ DeepSeek participants, with separate markers and setup commands. Koinon supplies
 peer-input guidance in those managed instructions, each inbox result, and each queued
 notice. This does not depend on the participant runtime adding its own peer framing.
 
+The repository's `CLAUDE.md` includes `AGENTS.md` for agents working on Koinon itself;
+these are separate from guidance installed into a participant's configuration.
 Koinon installs no Claude instructions and adds no guidance field to outbound peer
 frames. In observed Claude Code sessions, Claude's own runtime wraps incoming peer
 messages with its peer-input framing. That is an observed internal behaviour, not a
