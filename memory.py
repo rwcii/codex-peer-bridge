@@ -39,7 +39,7 @@ import uuid
 
 from peer_transport import LIMIT, credentials, encode, private_dir
 import platform_support
-from peer_transport import control_exchange, NoControlReply
+from peer_transport import control_exchange, NoControlReply, UnsafeServiceEndpoint
 
 PROTOCOL = 1
 SCHEMA = 3
@@ -1750,6 +1750,8 @@ async def request(root, payload, timeout=10):
     try:
         reply, _pid = await control_exchange(Path(root), payload, timeout)
         return reply
+    except UnsafeServiceEndpoint as exc:
+        raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
     except NoControlReply:
         raise MemoryError_('no_reply', 'the service closed the connection without replying') from None
 
@@ -1763,6 +1765,8 @@ async def verify_running(root, repo):
     """
     try:
         reply, connected_pid = await control_exchange(Path(root), dict(op='hello'), timeout=5)
+    except UnsafeServiceEndpoint as exc:
+        raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
     except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
         return None
     result = reply.get('result') if reply.get('ok') else None

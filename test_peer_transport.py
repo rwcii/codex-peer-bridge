@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import bridge
 import memory
@@ -99,6 +99,56 @@ class ControlTransportTests(unittest.IsolatedAsyncioTestCase):
             await transport.control_exchange(self.root, {'op': 'status'})
         with self.assertRaisesRegex(ValueError, 'absolute'):
             transport.service_path(Path('relative'))
+
+    async def test_unsafe_endpoint_is_not_reported_as_an_absent_memory_service(self):
+        path = await self.server()
+        path.chmod(0o666)
+        for call in (memory.verify_running(self.root, 'synthetic'),
+                     memory.request(self.root, {'op': 'hello'})):
+            with self.assertRaises(memory.MemoryError_) as caught:
+                await call
+            self.assertEqual(caught.exception.code, 'unsafe_service_endpoint')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(await bridge.client(self.root, {'op': 'status'}), 1)
+        self.assertEqual(json.loads(output.getvalue())['code'], 'unsafe_service_endpoint')
+
+    async def test_unsafe_directory_is_refused_even_when_socket_is_absent(self):
+        self.root.chmod(0o755)
+        with self.assertRaises(memory.MemoryError_) as caught:
+            await memory.verify_running(self.root, 'synthetic')
+        self.assertEqual(caught.exception.code, 'unsafe_service_endpoint')
+
+    async def test_cancellation_during_cleanup_aborts_and_stays_cancelled(self):
+        await self.server()
+        entered = asyncio.Event()
+        class Writer:
+            transport = Mock()
+            def get_extra_info(self, name):
+                return None
+            def write(self, data):
+                pass
+            async def drain(self):
+                pass
+            def close(self):
+                pass
+            async def wait_closed(self):
+                entered.set()
+                await asyncio.Future()
+        class Reader:
+            async def readline(self):
+                return b'{"ok":true}\n'
+        writer = Writer()
+        async def connect(*args, **kwargs):
+            return Reader(), writer
+        with patch('peer_transport.asyncio.open_unix_connection', connect), \
+                patch('peer_transport.credentials', return_value=os.getpid()):
+            task = asyncio.create_task(transport.control_exchange(self.root, {'op': 'status'}))
+            await asyncio.wait_for(entered.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        writer.transport.abort.assert_called_once()
 
     async def test_reply_frame_bound_includes_the_newline(self):
         prefix, suffix = b'{"ok":true,"result":"', b'"}\n'

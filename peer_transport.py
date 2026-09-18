@@ -95,6 +95,10 @@ def peer_token(pid, path):
 
 
 
+class UnsafeServiceEndpoint(ValueError):
+    """The configured endpoint cannot be validated; it is not an absent service."""
+
+
 def service_path(root):
     """Validate the control endpoint derived from an explicitly configured root.
 
@@ -105,17 +109,28 @@ def service_path(root):
     """
     root = Path(root)
     if not root.is_absolute():
-        raise ValueError('service root must be absolute')
+        raise UnsafeServiceEndpoint('service root must be absolute')
     control = platform_support.control_socket_path(root)
     # A client must not create directories while a service is starting. In
     # particular, mkdir(parents=True) can create intermediate state directories
     # with the client umask before the owner applies its private-mode policy.
-    info = control.parent.lstat()
+    try:
+        info = control.parent.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError:
+        raise UnsafeServiceEndpoint('service endpoint metadata cannot be read') from None
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or
             info.st_mode & 0o077):
-        raise ValueError('service directory must be private and owned by this user')
-    if not platform_support.socket_mode_ok(control.lstat()):
-        raise ValueError('service socket must be private and owned by this user')
+        raise UnsafeServiceEndpoint('service directory must be private and owned by this user')
+    try:
+        socket_info = control.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError:
+        raise UnsafeServiceEndpoint('service endpoint metadata cannot be read') from None
+    if not platform_support.socket_mode_ok(socket_info):
+        raise UnsafeServiceEndpoint('service socket must be private and owned by this user')
     return control
 
 
@@ -155,3 +170,6 @@ async def control_exchange(root, payload, timeout=10):
                 await asyncio.wait_for(writer.wait_closed(), 1)
             except (OSError, TimeoutError):
                 writer.transport.abort()
+            except asyncio.CancelledError:
+                writer.transport.abort()
+                raise

@@ -59,6 +59,8 @@ control paths placed in the peer socket directory. These endpoints do not appear
 endpoint from an explicitly configured state root and checks the directory and socket
 ownership and modes without creating directories. Control replies use the same bounded
 JSON framing as peer messages; a missing reply does not prove that a mutation rolled back.
+An endpoint that fails its permission or metadata checks reports `unsafe_service_endpoint`;
+it is not treated as an absent memory service or a reason to start a replacement.
 
 These path checks do not authenticate a service role. Memory-service reuse additionally
 requires agreement between the connected kernel PID, the hello response and the owner

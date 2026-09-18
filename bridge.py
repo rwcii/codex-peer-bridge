@@ -16,7 +16,7 @@ import uuid
 from peer_guidance import PEER_GUIDANCE
 import platform_support
 
-from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange
+from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange, UnsafeServiceEndpoint
 DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge')
 
 
@@ -224,6 +224,9 @@ async def client(root, request):
     control = platform_support.control_socket_path(root)
     try:
         result, _pid = await control_exchange(root, request)
+    except UnsafeServiceEndpoint as exc:
+        print(json.dumps(dict(ok=False, code='unsafe_service_endpoint', error=str(exc))))
+        return 1
     except (ConnectionRefusedError, FileNotFoundError) as exc:
         # Keep the existing CLI diagnostic for a missing or stale endpoint.
         raise SystemExit(f'no bridge is running for {root} (nothing is listening on {control})') from exc
