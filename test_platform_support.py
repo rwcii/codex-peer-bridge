@@ -247,3 +247,50 @@ class ExistingSocketTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AsyncProcessProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_callers_do_not_release_running_probe_capacity(self):
+        import asyncio
+        release = threading.Event()
+        entered = 0
+        lock = threading.Lock()
+        def blocked(pid):
+            nonlocal entered
+            with lock:
+                entered += 1
+            if not release.wait(5):
+                raise RuntimeError('synthetic probe barrier expired')
+            return 'synthetic'
+        with patch.object(platform_support, 'proc_start', side_effect=blocked):
+            tasks = [asyncio.create_task(platform_support.async_proc_start(42)) for _ in range(2)]
+            try:
+                async with asyncio.timeout(2):
+                    while entered != 2:
+                        await asyncio.sleep(.001)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                with self.assertRaises(BlockingIOError):
+                    await platform_support.async_proc_start(42)
+            finally:
+                release.set()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            async with asyncio.timeout(2):
+                while True:
+                    try:
+                        self.assertEqual(await platform_support.async_proc_start(42), 'synthetic')
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(.001)
+
+    async def test_async_probe_preserves_current_process_identity(self):
+        self.assertEqual(await platform_support.async_proc_start(os.getpid()),
+                         platform_support.proc_start(os.getpid()))
+
+    async def test_macos_process_query_has_a_finite_subprocess_budget(self):
+        from types import SimpleNamespace
+        with patch.object(platform_support, 'LINUX', False), patch.object(
+                platform_support.subprocess, 'run', return_value=SimpleNamespace(stdout='synthetic')) as run:
+            self.assertEqual(await platform_support.async_proc_start(42), 'synthetic')
+        self.assertEqual(run.call_args.kwargs['timeout'], platform_support.PROCESS_QUERY_TIMEOUT)

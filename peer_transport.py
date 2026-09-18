@@ -14,6 +14,7 @@ import stat
 import platform_support
 
 LIMIT = 262144
+CONTROL_CLOSE_TIMEOUT = 1
 
 
 def private_dir(path):
@@ -172,7 +173,7 @@ async def control_exchange(root, payload, timeout=10):
         if writer is not None:
             writer.close()
             try:
-                await asyncio.wait_for(writer.wait_closed(), 1)
+                await asyncio.wait_for(writer.wait_closed(), CONTROL_CLOSE_TIMEOUT)
             except (OSError, TimeoutError):
                 writer.transport.abort()
             except asyncio.CancelledError:

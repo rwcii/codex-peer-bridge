@@ -220,7 +220,8 @@ The bridge migrates its inbox in one explicit `BEGIN IMMEDIATE` transaction afte
 reserving both endpoints and before listening. Existing rows and AUTOINCREMENT
 allocation are preserved. Rows gain `kind` (initially `peer`) and nullable `binding`.
 A fixed-key `inbox_meta` table stores JSON values for `schema`, `ack_through`, and
-`journal_activation`. Initial values are 2, 0 and null. No historical acknowledgement
+`journal_activation`. Current initial values are 3, 0 and null. Schema 2 introduced
+these fields; schema 3 adds binding observations as described below. No historical acknowledgement
 is inferred. The inbox keeps its journal mode; migration does not enable WAL.
 
 `ack` deletes rows and updates the monotone `ack_through` value in the same explicit
@@ -231,7 +232,8 @@ peer receipt nor notification delivery acknowledges the inbox or a memory consum
 
 Status includes a per-process 32-hex `generation`, `inbox_schema`, `ack_through`,
 `journal_activation`, and `capabilities`. Implemented capabilities are
-`inbox_ack_watermark`, `notification_journal_activation` and `inbox_subscription`. Their advertisement
+`inbox_ack_watermark`, `notification_journal_activation`, `inbox_subscription` and
+`memory_binding`. Their advertisement
 requires a successful read of validated committed metadata. Unavailable or corrupt
 metadata produces database diagnostics, null database fields and no capabilities;
 it is never substituted with legacy defaults. Incompatible startup metadata exits
@@ -248,12 +250,11 @@ matching target's expected nonce. Repeating the resulting pair is safe after a l
 reply. This is the bridge-side evidence operation, not a complete notifier rebuild.
 The notifier journal and its maintenance command are not yet implemented.
 
-An empty `memory_binding` table is reserved for the next component. Its repository
-and state paths must be absolute and at most 4096 UTF-8 bytes; SQL constraints enforce
-these bounds. This release enables no binding writer or memory pointers
-and advertises neither capability. Existing ordinary notification readers
-can still read the original inbox columns. New notifier capability negotiation and
-journal migration remain pending; this change does not activate them.
+The `memory_binding` table stores explicit bindings. Repository and state paths
+are absolute and at most 4096 UTF-8 bytes; SQL constraints enforce these bounds.
+Existing ordinary notification readers can still read the original inbox columns.
+New notifier binding integration, capability negotiation and journal migration
+remain pending; binding controls alone do not activate them.
 
 CLI forms use the same operation names with `--target-digest` and `--nonce`.
 Explicit activation replacement also requires `--expected-previous-nonce` and
@@ -293,4 +294,82 @@ reconnect, and independently rescans every two seconds. Reconnect delays are 1, 
 4, 8, 16, then 30 seconds. Its caller must verify service identity on each connection
 and reconcile durable state. The existing notifier is not yet connected to this
 helper. Memory contents still require explicit reads; there are no automatic memory
-notices, peer-bus subscriptions, bindings or pointers.
+notices or peer-bus subscriptions. Explicit bindings and pointer refresh controls
+are described below; no subscription automatically invokes them yet.
+
+
+## Memory bindings and pointers
+
+These bridge controls require explicit operator action. Session registration does
+not bind memory automatically. `bind-memory` accepts only `repo_path` and
+`memory_state_dir`; the CLI uses `--repo-path` and `--memory-state-dir`. Paths must
+exist. The bridge derives the canonical Git common directory and repository key,
+resolves the memory state root, and hashes the compact JSON array of repository key
+and resolved state root with SHA-256 for the binding key. At most 16 bindings exist.
+Each creation also assigns a durable random 32-hex `binding_instance`. An idempotent
+bind preserves it; unbind followed by rebind changes it even when the key is the same.
+Internal pointer rows retain this instance so later journal work can distinguish an
+obsolete prior binding from unexpected missing data. The pointer frame stays binding-only.
+
+Before binding or refresh, the bridge verifies the memory service name, protocol,
+repository, recorded owner, kernel PID, process-start marker and generation.
+Memory schema 4 is required for its durable 32-hex `store_id`. An older live memory
+service yields `memory_upgrade_required`; restart it with the new runtime. Missing
+memory yields `memory_unavailable`; incompatible identity or unhealthy storage is
+refused. Binding refusals include `recovery:"retry"` for transient failures or
+`recovery:"operator_action"` for conditions such as an old runtime. These are
+operation replies, not process exits. Expiry of the bridge request deadline
+returns `binding_timeout`, `recovery:"retry"`, and `outcome:"unknown"`. A timeout
+is not proof of rollback; reread durable state before retrying.
+Binding operations retain ordinary admission slots but use a 19-second deadline:
+three seconds for Git, five for hello, five for process identity, two for status,
+two one-second socket cleanup allowances and two seconds of margin. The binding
+CLI allows 23 seconds, including request-header, response and cleanup margin.
+These values are derived from the inner policies; they are not hard disk-latency
+bounds. Other ordinary bridge operations retain their six-second deadline.
+Process identity probes run outside the event loop, with at most two accepted
+probes per process. Cancellation does not release a probe slot before completion.
+The macOS process query has a five-second subprocess timeout. Probe saturation
+returns a retryable service-busy refusal and leaves status/stop admission intact. Automatic integration must not repeatedly
+refresh an unchanged service that requires an operator action. These failures do
+not change a binding observation or pointer. The bridge's
+`memory_binding` capability describes implemented controls, not the readiness of
+any optional memory service. Each service must independently pass verification.
+
+`refresh-memory BINDING` accepts no caller-supplied head or message. It reads the
+verified memory store ID and head outside the inbox transaction. In one transaction,
+it compares that exact observation with the saved one, deletes the previous pointer,
+inserts a new pointer with a new inbox sequence, and saves the observation. A concurrent
+refresh that changed the saved observation causes `binding_observation_changed`;
+a caller must reread rather than apply a stale observation. A recreated binding
+instead returns `binding_instance_changed`, also requiring a fresh lookup. Identical observations
+do nothing, even after inbox acknowledgement or bridge restart. The first refresh
+also creates a pointer for an empty store so a consumer can bootstrap explicitly.
+
+Pointer frames contain only `type:"memory-pointer"` and `binding`. They carry no
+memory body, store ID, head or sequence range. Ordinary peer input cannot mint this
+row kind. Inbox and CLI projections label them `kind:"memory-pointer"`, include
+`source_service_pid` instead of `peer_pid`, and carry separate inert pointer
+guidance. Ordinary frame fields cannot claim that internal provenance. Up to 16 pointer rows have their own allowance; the 1,000 ordinary-row
+allowance is unchanged. `unbind-memory BINDING` atomically removes the binding and
+its pointer as obsolete, without advancing inbox or memory acknowledgements.
+
+`memory-bindings [--after BINDING]` returns a bounded page with `bindings`, `more`
+and `next_after`. Each binding exposes its paths, repository key, binding instance, observed store ID
+and head, and persistent `anomalies` flags: bit 1 means store replacement; bit 2
+means head regression within the same store ID. Both cause a replacement pointer;
+`ack-binding-health BINDING` clears these flags without deleting a pointer,
+changing the observed head, or acknowledging either inbox or memory. A clone restored with identical store ID
+and head is indistinguishable here; content verification is outside this mechanism.
+The binding instance is intentional diagnostic metadata on this listing; it is
+not part of a pointer frame.
+`service_state` is `verified`, `refused`, or `unknown`, with a classified
+`service_reason` on refusal. It is a bounded process-local observation, expires to
+unknown after 30 seconds, and starts unknown after restart. Listing does not contact
+memory or infer current health from a retained pointer. An unpageable single record
+fails explicitly as `binding_row_too_large` rather than returning an empty loop.
+
+No binding operation advances memory consumer cursors. The saved observation means
+only that the bridge issued a pointer. The planned notifier integration will own
+per-binding subscriptions and finite recovery scans; each recovery scan must reread
+memory to catch advances after the previous remote read. It is not yet implemented.

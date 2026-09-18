@@ -24,7 +24,10 @@ Three differences matter:
 
 Python standard library only.
 """
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import threading
 import os
 from pathlib import Path
 import socket
@@ -102,6 +105,27 @@ def _getpeereid(fd):
     return uid.value, gid.value
 
 
+PROCESS_QUERY_TIMEOUT = 5
+_PROCESS_PROBES = ThreadPoolExecutor(max_workers=2, thread_name_prefix='process-identity')
+_PROCESS_PROBE_SLOTS = threading.BoundedSemaphore(2)
+
+
+async def async_proc_start(pid):
+    """Keep accepted OS probes bounded and off the service event loop."""
+    if not _PROCESS_PROBE_SLOTS.acquire(blocking=False):
+        raise BlockingIOError('process identity probe capacity reached')
+    try:
+        future = _PROCESS_PROBES.submit(proc_start, pid)
+    except BaseException:
+        _PROCESS_PROBE_SLOTS.release()
+        raise
+    # Release on actual completion, never merely because a caller stopped waiting.
+    future.add_done_callback(lambda result: _PROCESS_PROBE_SLOTS.release())
+    wrapped = asyncio.wrap_future(future)
+    wrapped.add_done_callback(lambda result: None if result.cancelled() else result.exception())
+    return await asyncio.shield(wrapped)
+
+
 def proc_start(pid):
     """Local process-start marker for one pid, in this platform's own form.
 
@@ -130,7 +154,7 @@ def proc_start(pid):
     try:
         result = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)],
                                 capture_output=True, text=True, check=True,
-                                env={**os.environ, 'TZ': 'UTC'})
+                                env={**os.environ, 'TZ': 'UTC'}, timeout=PROCESS_QUERY_TIMEOUT)
     except subprocess.CalledProcessError as exc:
         raise ProcessLookupError(f'no such process: {pid}') from exc
     value = result.stdout.strip()

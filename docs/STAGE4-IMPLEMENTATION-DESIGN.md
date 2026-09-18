@@ -1,6 +1,6 @@
 # Stage 4 implementation design for review
 
-Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented and reviewed. Subscriptions and the shared reconnect/rescan helper are implemented in the current candidate, pending review. Bindings/pointers, notifier integration and the notifier journal remain pending. No stage 4 runtime changes are deployed.
+Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented and reviewed. Subscriptions and the shared reconnect/rescan helper are implemented and reviewed. Explicit bindings/pointers and store identity migrations are implemented in the current candidate, pending review. Automatic notifier integration and the notifier journal remain pending. No stage 4 runtime changes are deployed.
 Baseline: develop 84f35e727b0f17a9469de182db9a843e7a28d092, integrated by signed merge 7503dc1.
 Codex is the sole driver. Claude is the reviewer. The merged baseline was independently verified. Implementation branch: feature/shared-transport-delivery.
 
@@ -120,7 +120,8 @@ These decisions apply to new stage 4 behavior. Existing peer envelopes and memor
 acknowledgement, and snapshot formats remain unchanged. Transport-helper extraction,
 the participant ownership boundary, endpoint-role separation and bridge/memory worker
 ownership are implemented on this feature branch. Subscription services and their shared
-client helper are implemented in the current candidate. Pointers, notifier integration,
+client helper are reviewed. Explicit pointer controls are implemented in the current
+candidate; automatic notifier integration,
 the journal and its delivery-health reporting remain pending. This branch is not deployed.
 
 ### Participant identity and lock scope
@@ -227,7 +228,7 @@ retained rows while preserving cumulative uncertainty. Acknowledged rows are not
 `notify-journal.sqlite3`, schema 1, separate from the read-only inbox. Tables:
 - `meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)` with a fixed key set for schema,
   provider/account-local/target digest, scan checkpoint, and aggregate outcome counters.
-- `work(seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, binding TEXT, disposition TEXT NOT
+- `work(seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, binding TEXT, binding_instance TEXT, disposition TEXT NOT
   NULL, attempts INTEGER NOT NULL, retry_at INTEGER NOT NULL, uncertain INTEGER NOT NULL)`.
 - `attempt(id INTEGER PRIMARY KEY, started INTEGER NOT NULL)` and
   `attempt_member(attempt_id INTEGER, seq INTEGER PRIMARY KEY)` for the single in-flight
@@ -429,4 +430,83 @@ uses `rebuild-notification-journal-activation` with `expected_previous_nonce` an
 `accept_history_loss: true`, preserving the target. These are bridge-side operations;
 the planned notifier rebuild must still enforce stopped ownership and local evidence
 before invoking replacement. The current candidate does not implement that notifier
-workflow or advertise bindings. Subscription capabilities are implemented separately.
+workflow. Subscription and explicit binding capabilities are implemented separately.
+
+
+### Binding observation and store replacement
+
+A binding records the last memory store UUID and head for which the bridge created
+an inbox pointer. These fields are not memory consumer cursors. Save them in the
+same transaction that deletes the old pointer and inserts its replacement. An
+unchanged observation does not write, even if the earlier pointer was acknowledged.
+The notifier owns per-binding subscriptions and finite recovery scans, with stable
+consumer keys derived from its configured provider/account-local/session/repository.
+Every recovery scan rereads memory; a missing pointer is not proof of no new work.
+
+Memory schema 4 introduces one durable random 32-hex store UUID. Schema 3 migrates
+transactionally; schema 4 with missing or invalid UUID is refused, never re-identified.
+The UUID persists across process restarts and changes for a newly created store.
+Inbox schema 3 adds bounded observation and diagnostic fields to each of at most
+16 bindings, migrating schema 2 transactionally. Older runtimes must refuse these
+newer schemas. No data, cursor or notification checkpoint is reset by migration.
+
+The bridge refresh route resolves a persisted binding, verifies the memory owner,
+process-start marker, connected PID, repository and generation, then reads store UUID
+and head. It accepts no caller-supplied head. It reads memory outside an inbox
+transaction, then compares and records exactly that observation inside the pointer
+transaction. Memory may advance afterwards; the next hint or finite rescan closes
+that window. Missing, blocked or invalid services produce a classified refusal and
+leave both pointer and observation unchanged. The wait graph is notifier -> bridge
+refresh -> memory read, followed by the bridge's inbox transaction; no transaction
+waits for a remote service and memory does not call back into the bridge.
+
+A different store UUID or a regressed head creates a replacement pointer and a
+bounded persistent diagnostic, rather than silently suppressing future work. An
+unchanged UUID/head does nothing. An identical restored clone with the same UUID
+and head cannot be distinguished without content verification; this mechanism does
+not claim that property. Binding status exposes observed identity/head and diagnostic
+state. It does not persist a counter on every unchanged recovery scan.
+
+
+Binding-version skew is explicit: a bridge at inbox schema 3 supports the binding
+controls but refuses an old memory service with `memory_upgrade_required`. This
+capability is service support, not a readiness claim about optional bound services.
+Service verification state is a process-local bounded cache (16 entries), expires
+after 30 seconds, and begins unknown after restart. Persistent anomaly bits record
+store replacement (1) and same-store head regression (2) until `ack-binding-health`.
+They do not clear merely because a later refresh succeeds. The current component
+exposes explicit refresh only; notifier-driven subscription/scan integration is next.
+
+Journal integration must account for explicit pointers that predate its deployment:
+the legacy notifier advances its checkpoint across pointer rows without notifying
+them. First journal migration must seed retained pointers once, independently of
+the imported ordinary-message checkpoint. Record completion and bounded seed work
+transactionally after ready publication and before provider delivery. Repeated
+startup must not reseed delivered pointers; ordinary messages must not be replayed.
+This integration requirement is pending and must have crash/retry coverage.
+
+
+Each binding creation has a durable random 32-hex `binding_instance`, separate from
+its deterministic binding key and the memory process generation. Idempotent binding
+preserves it; unbinding and rebinding produces a new instance. Internal pointer rows
+and future journal work retain that instance. A missing pointer whose binding is
+absent or has a different instance is obsolete, not unexplained loss. A stale remote
+observation from the previous instance cannot write into a recreated binding.
+`ack-binding-health` clears anomaly bits without deleting work or changing observed
+heads or either acknowledgement position. Rebinding is not a health-clearing procedure.
+
+
+Binding operation deadlines are derived rather than independently chosen: Git 3s,
+memory hello 5s, process-start query 5s, memory status 2s, two socket-cleanup
+allowances of 1s, and 2s margin give a 19s server deadline. Binding clients allow
+23s, including header/response/cleanup margin. The ordinary handler capacity stays
+16, and status/stop keep their reserved slots. A binding timeout is retryable with
+unknown mutation outcome. A real regression commits a pointer, delays its result
+past that deadline, and verifies the CLI reports uncertainty while the row remains.
+A separate successful slow hello/status path exceeds the old 6s deadline.
+
+Process-start probes use two bounded executor slots and do not block the service
+event loop. Slots are released by actual completion, not caller cancellation; the
+macOS subprocess has a finite 5s policy. This is not a claim that filesystem or
+kernel operations have hard physical latency bounds. Notifier binding refresh
+clients must use the complete binding client budget, not the generic RPC default.

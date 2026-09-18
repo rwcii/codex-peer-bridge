@@ -3,13 +3,14 @@ from contextlib import contextmanager
 import json
 import re
 import sqlite3
+import uuid
 
-SCHEMA = 2
+SCHEMA = 3
 MAX_SEQUENCE = (1 << 63) - 1
 CAPABILITIES = ('inbox_ack_watermark', 'notification_journal_activation')
 KEYS = {'schema', 'ack_through', 'journal_activation'}
 LEGACY_COLUMNS = ('seq', 'received', 'pid', 'frame')
-COLUMNS = LEGACY_COLUMNS + ('kind', 'binding')
+COLUMNS = LEGACY_COLUMNS + ('kind', 'binding', 'binding_instance')
 
 
 class InboxSchemaError(sqlite3.DatabaseError):
@@ -41,7 +42,7 @@ def hex_value(value, length):
     return isinstance(value, str) and re.fullmatch('[0-9a-f]{'+str(length)+'}', value) is not None
 
 
-def metadata(db):
+def metadata(db, *, versions=(SCHEMA,)):
     rows = db.execute('SELECT key,value FROM inbox_meta LIMIT 4').fetchall()
     if len(rows) != len(KEYS) or {row[0] for row in rows} != KEYS:
         raise InboxSchemaError('incomplete inbox metadata')
@@ -49,7 +50,7 @@ def metadata(db):
         values = {key: json.loads(value) for key, value in rows}
     except (TypeError, ValueError) as exc:
         raise InboxSchemaError('invalid inbox metadata encoding') from exc
-    if type(values['schema']) is not int or values['schema'] != SCHEMA:
+    if type(values['schema']) is not int or values['schema'] not in versions:
         raise InboxSchemaError('unsupported inbox schema')
     ack = values['ack_through']
     if type(ack) is not int or not 0 <= ack <= allocated_head(db):
@@ -73,10 +74,15 @@ def initialize(db):
         if 'inbox_meta' in tables:
             if not {'inbox', 'memory_binding', 'sqlite_sequence'} <= tables:
                 raise InboxSchemaError('incomplete inbox schema')
+            state = metadata(db, versions=(2, SCHEMA))
             columns = tuple(row[1] for row in db.execute('PRAGMA table_info(inbox)'))
-            if columns != COLUMNS:
+            expected = COLUMNS[:-1] if state['schema'] == 2 else COLUMNS
+            if columns != expected:
                 raise InboxSchemaError('incompatible inbox columns')
-            metadata(db)
+            if state['schema'] == 2:
+                add_binding_observations(db)
+                db.execute("UPDATE inbox_meta SET value=? WHERE key='schema'", (str(SCHEMA),))
+            validate_bindings(db)
             return
         if tables - {'inbox', 'sqlite_sequence'}:
             raise InboxSchemaError('unrecognized legacy inbox schema')
@@ -96,8 +102,40 @@ def initialize(db):
             memory_state_dir TEXT NOT NULL CHECK(substr(memory_state_dir,1,1)='/' AND length(CAST(memory_state_dir AS BLOB))<=4096)
         )""")
         db.executemany('INSERT INTO inbox_meta(key,value) VALUES(?,?)',
-                       [('schema', '2'), ('ack_through', '0'), ('journal_activation', 'null')])
+                       [('schema', str(SCHEMA)), ('ack_through', '0'), ('journal_activation', 'null')])
+        add_binding_observations(db)
+        validate_bindings(db)
         metadata(db)
+
+
+def add_binding_observations(db):
+    # A recreated deterministic binding key must not reuse its prior lifetime.
+    db.execute("ALTER TABLE inbox ADD COLUMN binding_instance TEXT")
+    db.execute("ALTER TABLE memory_binding ADD COLUMN binding_instance TEXT NOT NULL DEFAULT '00000000000000000000000000000000' CHECK(length(binding_instance)=32 AND binding_instance NOT GLOB '*[^0-9a-f]*')")
+    existing = db.execute('SELECT binding FROM memory_binding LIMIT 17').fetchall()
+    if len(existing) > 16:
+        raise InboxSchemaError('too many memory bindings')
+    for (key,) in existing:
+        db.execute('UPDATE memory_binding SET binding_instance=? WHERE binding=?', (uuid.uuid4().hex, key))
+    # These describe issued pointers, never memory consumer acknowledgements.
+    db.execute("ALTER TABLE memory_binding ADD COLUMN observed_store TEXT CHECK(observed_store IS NULL OR (length(observed_store)=32 AND observed_store NOT GLOB '*[^0-9a-f]*'))")
+    db.execute("ALTER TABLE memory_binding ADD COLUMN observed_head INTEGER CHECK(observed_head IS NULL OR (typeof(observed_head)='integer' AND observed_head>=0))")
+    db.execute("ALTER TABLE memory_binding ADD COLUMN anomalies INTEGER NOT NULL DEFAULT 0 CHECK(typeof(anomalies)='integer' AND anomalies BETWEEN 0 AND 3)")
+
+
+def validate_bindings(db):
+    columns = tuple(row[1] for row in db.execute('PRAGMA table_info(memory_binding)'))
+    if columns != ('binding', 'repo_path', 'repo_key', 'memory_state_dir',
+                   'binding_instance', 'observed_store', 'observed_head', 'anomalies'):
+        raise InboxSchemaError('incompatible binding columns')
+    rows = db.execute('SELECT binding_instance,observed_store,observed_head,anomalies FROM memory_binding LIMIT 17').fetchall()
+    if len(rows) > 16:
+        raise InboxSchemaError('too many memory bindings')
+    for instance, store_id, head, anomalies in rows:
+        if (not hex_value(instance, 32) or instance == '0'*32 or (store_id is None) != (head is None)
+                or (store_id is not None and (not hex_value(store_id, 32) or type(head) is not int or not 0 <= head <= MAX_SEQUENCE))
+                or type(anomalies) is not int or not 0 <= anomalies <= 3):
+            raise InboxSchemaError('invalid binding observation')
 
 
 def acknowledge(db, through):

@@ -394,18 +394,19 @@ only confirmed bridge units before migration.
 
 ## Inbox schema upgrade
 
-Schema 2 migrates on bridge startup after exclusive socket reservation. Stop the old
+Inbox schema 3 migrates legacy and schema-2 inboxes on bridge startup after exclusive socket reservation. Stop the old
 bridge and notifier together, install the new runtime at the existing target and paths,
 and restart both. Apply the same sequence to manual macOS processes. An installation
 with `--no-start` does not upgrade running processes. Preserve the inbox and legacy
 notification checkpoint; do not reset either to activate the schema.
 
-Do not run an older bridge against a schema-2 inbox after activation: its `ack` operation
-does not maintain the new watermark. Restore a consistent pre-upgrade backup for a
+Do not run an older bridge against an upgraded inbox. Schema-2 runtimes refuse
+schema 3; earlier runtimes do not maintain the acknowledgement watermark. Restore a consistent pre-upgrade backup for a
 rollback instead of mixing runtime and metadata versions. The schema change preserves
 ordinary-reader compatibility but does not itself implement a notifier journal or
 upgrade an old notifier to the new delivery protocol. Local change subscriptions are available after both service runtimes are restarted,
-but the existing notifier does not yet use them. Bindings remain pending. The explicit bridge activation controls store evidence only; they are
+but the existing notifier does not yet use them. Explicit bindings require memory
+schema 4; restart each optional memory service with the new runtime before binding. The explicit bridge activation controls store evidence only; they are
 not a substitute for the planned stopped-notifier rebuild procedure.
 
 Migration and acknowledgements use SQLite transactions. Process-termination tests
@@ -419,3 +420,31 @@ that a storage failure means the migration or a prior mutation was lost.
 The supervisor preserves bridge exit codes 70 and 78 through each startup phase
 and its running loop. All installer-managed units exclude both permanent statuses
 70 and 78 from automatic restart, while 75 remains retryable.
+
+
+## Explicit memory bindings
+
+Memory remains optional and is not started by the installer. After starting the
+repository's memory service, use its exact state directory to bind it:
+
+```sh
+python3 bridge.py --state-dir /private/bridge-state bind-memory \
+  --repo-path /path/to/repository --memory-state-dir /private/memory-state
+python3 bridge.py --state-dir /private/bridge-state memory-bindings
+python3 bridge.py --state-dir /private/bridge-state refresh-memory BINDING_KEY
+python3 bridge.py --state-dir /private/bridge-state ack-binding-health BINDING_KEY
+python3 bridge.py --state-dir /private/bridge-state unbind-memory BINDING_KEY
+```
+
+Binding verifies the live service but does not create a pointer until refresh.
+The legacy notifier does not deliver memory-pointer notices. Read memory with its
+existing sync commands; binding controls do not acknowledge or import memory.
+
+Memory schema 3 upgrades to schema 4 in a transaction that adds a durable store UUID
+and changes the schema version together. Records, snapshots and consumer cursors
+are retained. A schema-4 store with missing or invalid identity is refused, never
+silently assigned a replacement identity. Older runtimes refuse schema 4. Preserve
+consistent backups before upgrade; rollback means restoring a compatible backup,
+not changing a schema number. An inbox upgrade does not restart memory for you.
+If `memory_upgrade_required` is returned, stop that memory service and start it
+with the new runtime. Missing or unhealthy memory leaves existing bridge state intact.

@@ -276,6 +276,21 @@ class HubBoundTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(*tasks)
         self.assertFalse(hub.queues)
 
+    async def test_both_services_outlive_ordinary_request_deadlines(self):
+        async def check(kind):
+            fixture = SubscriptionTests()
+            await fixture.asyncSetUp()
+            try:
+                request, _ = await fixture.start(kind)
+                async with sub.open_hints(fixture.root, request) as connection:
+                    await asyncio.sleep(11)
+                    await fixture.write(kind)
+                    await asyncio.wait_for(connection.changed(), 2)
+                    self.assertEqual(await fixture.head(kind), 1)
+            finally:
+                await fixture.asyncTearDown()
+        await asyncio.gather(check('bridge'), check('memory'))
+
     async def test_watch_does_not_hide_programming_failure(self):
         @asynccontextmanager
         async def broken():

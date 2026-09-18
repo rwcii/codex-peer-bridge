@@ -332,9 +332,11 @@ directories also produce a structured ownership refusal with exit 78.
 ### Inbox migration progress
 
 The bridge now maintains a transactional acknowledgement watermark and durable
-journal activation evidence in inbox schema 2. Migration preserves retained messages
+journal activation evidence in inbox schema 3 (introduced in schema 2). Migration preserves retained messages
 and sequence allocation. See [the schema contract](PROTOCOL.md#inbox-schema-2-and-journal-activation).
-Repository bindings, memory pointers and the notifier journal remain pending.
+Explicit repository bindings and content-free memory pointers are available through
+[the binding controls](PROTOCOL.md#memory-bindings-and-pointers). Notifier integration
+and the notifier journal remain pending.
 Local bridge and memory services now support explicit content-free change subscriptions.
 Subscribers read durable state after each hint; hints never acknowledge records or
 call a provider. The existing notifier still uses periodic polling. See

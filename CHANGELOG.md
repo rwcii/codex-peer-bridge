@@ -7,14 +7,20 @@ into a dated release section when promoted to `main`.
 
 ### Added
 
+- Explicit verified memory bindings and atomic content-free pointer refresh, with
+  independent inbox quotas, durable observation state and replacement diagnostics.
+  Inbox schema 2 upgrades to 3; memory schema 3 upgrades to 4 with a stable store UUID.
+  Binding deadlines cover verification and cleanup; process identity probes stay
+  bounded and off the service loop. Notifier integration remains pending.
+
 - Explicit bridge and memory change subscriptions with bounded connections, coalesced
   content-free hints after commit, and a shared reconnect/rescan helper. The existing
-  notifier still polls; bindings and automatic memory notices remain pending.
+  notifier still polls; automatic memory notices remain pending.
 
 - Inbox schema 2 with atomic migration, a bounded acknowledgement watermark and
   durable journal activation evidence. Status advertises only those implemented
   capabilities. Bridge software faults preserve exit 70 through the supervisor and
-  stop automatic restarts. Binding and notifier-journal delivery remain pending.
+  stop automatic restarts. Notifier-journal delivery remains pending.
 
 - Bridge startup reserves both socket paths before opening the inbox and retains
   ownership until database shutdown completes. Endpoint refusal exits 78 without

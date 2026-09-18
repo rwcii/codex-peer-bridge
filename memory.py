@@ -45,7 +45,8 @@ import platform_support
 from peer_transport import control_exchange, NoControlReply, UnsafeServiceEndpoint
 
 PROTOCOL = 1
-SCHEMA = 3
+SCHEMA = 4
+VERIFY_TIMEOUT = 5
 
 # One statement per element. `executescript` runs a script in autocommit mode, so these
 # would be one separately committed transaction each: a mid-script failure left the earlier
@@ -308,6 +309,7 @@ class Store:
     def __init__(self, path, repo, fts=None):
         self.repo, self.path = repo, path
         self.expired_at = 0.0
+        self.on_change = None
         # Autocommit, with every transaction opened explicitly below. The driver starts an
         # implicit transaction only for INSERT, UPDATE, DELETE and REPLACE, so DDL ran in
         # autocommit however it was wrapped, and the schema stayed several transactions.
@@ -332,8 +334,13 @@ class Store:
                     for statement in SCHEMA_STATEMENTS:
                         self.db.execute(statement)
                     for key, value in (('repo', repo), ('protocol', PROTOCOL),
-                                       ('schema', SCHEMA), ('head', 0), ('floor', 0)):
+                                       ('schema', SCHEMA), ('head', 0), ('floor', 0),
+                                       ('store_id', uuid.uuid4().hex)):
                         self.set_meta(key, value)
+            elif int(self.meta('schema')) == 3:
+                with self.transaction(control=True):
+                    self.set_meta('store_id', uuid.uuid4().hex)
+                    self.set_meta('schema', SCHEMA)
             self.fts = False if fts is False else self._open_fts()
             self._reconcile_index()
         except sqlite3.Error as exc:
@@ -739,10 +746,18 @@ class Store:
                                    f'this store declares {key} {found}; this runtime supports '
                                    f'{current}. Upgrade the runtime rather than downgrading the '
                                    'store. Nothing was written')
-            if found < current:
+            if found < current and not (key == 'schema' and found == 3):
                 raise MemoryError_('schema_too_old',
                                    f'this store declares {key} {found}; this runtime expects '
                                    f'{current} and has no migration for it. Nothing was written')
+
+        store_id = self.meta('store_id')
+        if int(rows['schema']) == 3:
+            if store_id is not None:
+                raise MemoryError_('incompatible_store', 'legacy store has unexpected identity metadata')
+        elif (not isinstance(store_id, str) or len(store_id) != 32
+              or any(c not in '0123456789abcdef' for c in store_id)):
+            raise MemoryError_('incompatible_store', 'store identity is missing or invalid; it was left untouched')
 
     # --- schema helpers -------------------------------------------------------
 
@@ -1404,7 +1419,7 @@ class MemoryCommands:
             return self.store.recover()
         if op == 'hello':
             return dict(service='codex-peer-memory', repo=self.repo, protocol=PROTOCOL,
-                        schema=SCHEMA, generation=self.generation, pid=os.getpid(),
+                        schema=SCHEMA, store_id=self.store.meta('store_id'), generation=self.generation, pid=os.getpid(),
                         healthy=self.store.healthy(), fts=self.store.fts,
                         indexed=self.store.index_usable(), blocked=self.store.blocked)
         if op == 'note':
@@ -1651,7 +1666,7 @@ class MemoryCommands:
         # response grows past its frame while the count still looks safe.
         consumers, truncated = bounded((len(encode(x)), x) for x in listed)
         more = truncated or (beyond and len(consumers) == len(listed))
-        return dict(repo=self.repo, protocol=PROTOCOL, schema=SCHEMA, generation=self.generation,
+        return dict(repo=self.repo, protocol=PROTOCOL, schema=SCHEMA, store_id=self.store.meta('store_id'), generation=self.generation,
                     head=head, floor=self.store.floor(), healthy=self.store.healthy(),
                     fts=self.store.fts, usage=use,
                     # A blocked store still answers status; that is the point of blocking
@@ -1859,7 +1874,7 @@ async def verify_running(root, repo):
     between the answer and the durable ownership record.
     """
     try:
-        reply, connected_pid = await control_exchange(Path(root), dict(op='hello'), timeout=5)
+        reply, connected_pid = await control_exchange(Path(root), dict(op='hello'), timeout=VERIFY_TIMEOUT)
     except UnsafeServiceEndpoint as exc:
         raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
     except (ConnectionRefusedError, FileNotFoundError):
@@ -1915,7 +1930,9 @@ async def verify_running(root, repo):
                                f'the recorded owner disagrees with the running service on {field}; '
                                'stop it explicitly before reusing this state directory')
     try:
-        live = platform_support.proc_start(owner['pid'])
+        live = await platform_support.async_proc_start(owner['pid'])
+    except BlockingIOError:
+        raise MemoryError_('service_busy', 'process identity verification is at capacity') from None
     except (ProcessLookupError, OSError, subprocess.SubprocessError):
         raise MemoryError_('ownership_mismatch', 'the recorded owner is no longer readable') from None
     if not platform_support.same_process(owner.get('proc_start'), live):

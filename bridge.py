@@ -15,10 +15,11 @@ import uuid
 
 from database_worker import DatabaseWorker, CapacityError, WorkerFailure
 from service_runtime import Admission, close_writer, drain_handlers, database_status, HANDSHAKE_TIMEOUT
-from peer_guidance import PEER_GUIDANCE
+from peer_guidance import PEER_GUIDANCE, MEMORY_POINTER_GUIDANCE
 import platform_support
 import inbox_schema
 import subscriptions
+import memory_bindings
 
 from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange, UnsafeServiceEndpoint, NoControlReply
 DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge')
@@ -95,28 +96,58 @@ class InboxStore:
         elif kind != 'control':
             raise ValueError('unsupported frame')
         # Store controls as inert data; never execute rename or any other action.
-        if self.db.execute('SELECT count(*) FROM inbox').fetchone()[0] >= 1000:
+        if self.db.execute("SELECT count(*) FROM inbox WHERE kind='peer'").fetchone()[0] >= 1000:
             raise ValueError('inbox full; acknowledge older entries')
         with self.db:
             self.db.execute('INSERT INTO inbox(received,pid,frame) VALUES(?,?,?)', (time.time(), pid, json.dumps(frame)))
         if self.on_change is not None:
             self.on_change()
 
+    def bindings(self):
+        return memory_bindings.rows(self.db)
+
+    def binding(self, key):
+        return memory_bindings.get(self.db, key)
+
+    def bind_memory(self, binding):
+        return memory_bindings.bind(self.db, binding)
+
+    def unbind_memory(self, key):
+        result = memory_bindings.unbind(self.db, key)
+        if self.on_change is not None:
+            self.on_change()
+        return result
+
+    def acknowledge_binding_health(self, key):
+        return memory_bindings.acknowledge_health(self.db, key)
+
+    def refresh_memory(self, binding, observation):
+        result = memory_bindings.refresh(self.db, binding, observation)
+        if result['changed'] and self.on_change is not None:
+            self.on_change()
+        return result
+
     def command(self, r):
         op = r['op']
         if op == 'status':
             with inbox_schema.transaction(self.db, write=False):
                 state = inbox_schema.metadata(self.db)
+                inbox_schema.validate_bindings(self.db)
                 count = self.db.execute('SELECT count(*) FROM inbox').fetchone()[0]
             return dict(inbox_count=count, inbox_schema=state['schema'],
                         ack_through=state['ack_through'], journal_activation=state['journal_activation'],
                         capabilities=list(inbox_schema.CAPABILITIES))
         if op == 'inbox':
-            rows = self.db.execute('SELECT seq,received,pid,frame FROM inbox WHERE seq>? ORDER BY seq LIMIT 10', (int(r.get('after', 0)),)).fetchall()
+            rows = self.db.execute('SELECT seq,received,pid,frame,kind,binding FROM inbox WHERE seq>? ORDER BY seq LIMIT 10', (int(r.get('after', 0)),)).fetchall()
             entries = []
-            for seq, received, pid, frame in rows:
-                item = dict(seq=seq, received=received, peer_pid=pid,
-                            guidance=PEER_GUIDANCE, frame=json.loads(frame))
+            for seq, received, pid, frame, kind, binding in rows:
+                if kind == 'memory-pointer':
+                    item = dict(seq=seq, received=received, kind=kind, binding=binding,
+                                source_service_pid=pid, guidance=MEMORY_POINTER_GUIDANCE,
+                                frame=dict(type='memory-pointer', binding=binding))
+                else:
+                    item = dict(seq=seq, received=received, peer_pid=pid,
+                                guidance=PEER_GUIDANCE, frame=json.loads(frame))
                 if len(encode(entries)) + len(encode(item)) > LIMIT - 1000:
                     break
                 entries.append(item)
@@ -138,6 +169,7 @@ class Bridge:
         self.stop = asyncio.Event()
         self.generation = uuid.uuid4().hex
         self.hints = subscriptions.HintHub(self.generation)
+        self.binding_health = {}
         # Construction must not open or migrate a database before endpoint ownership.
         self.worker = None
         self.admission = Admission()
@@ -177,6 +209,7 @@ class Bridge:
         task = asyncio.current_task()
         self.tasks.add(task)
         slot = None
+        request = None
         try:
             if self.closing:
                 raise CapacityError('service is stopping')
@@ -191,7 +224,11 @@ class Bridge:
                 subscriptions.validate(request, self.generation)
                 await self.hints.serve(reader, writer)
                 return
-            async with asyncio.timeout(6):
+            binding_operation = (control and isinstance(request, dict)
+                                 and isinstance(request.get('op'), str)
+                                 and request['op'] in memory_bindings.OPERATIONS)
+            deadline = memory_bindings.REQUEST_TIMEOUT if binding_operation else 6
+            async with asyncio.timeout(deadline):
                 if control:
                     if not isinstance(request, dict):
                         raise ValueError('expected operation object')
@@ -211,7 +248,16 @@ class Bridge:
                         # Same-UID credentials are the peer authentication policy.
                         await self.store(pid, json.loads(line))
         except Exception as exc:
-            if isinstance(exc, CapacityError):
+            if (isinstance(exc, TimeoutError) and control and isinstance(request, dict)
+                    and isinstance(request.get('op'), str)
+                    and request['op'] in memory_bindings.OPERATIONS):
+                exc = memory_bindings.BindingError('binding_timeout')
+                key = request.get('binding')
+                if isinstance(key, str) and key in self.binding_health:
+                    self.record_binding_health(key, 'refused', exc.code)
+            if isinstance(exc, memory_bindings.BindingError):
+                code = exc.code
+            elif isinstance(exc, CapacityError):
                 code = 'capacity'
             elif isinstance(exc, WorkerFailure):
                 code = exc.code
@@ -221,7 +267,12 @@ class Bridge:
                 code = 'internal_error'
             if control:
                 try:
-                    writer.write(encode(dict(ok=False, code=code, error=type(exc).__name__)))
+                    error = dict(ok=False, code=code, error=type(exc).__name__)
+                    if isinstance(exc, memory_bindings.BindingError):
+                        error['recovery'] = exc.recovery
+                        if exc.code == 'binding_timeout':
+                            error['outcome'] = 'unknown'
+                    writer.write(encode(error))
                     await asyncio.wait_for(writer.drain(), 1)
                 except (OSError, TimeoutError):
                     pass
@@ -235,6 +286,12 @@ class Bridge:
                     self.admission.leave(slot)
                 self.tasks.discard(task)
 
+    def record_binding_health(self, key, state, reason=None):
+        self.binding_health[key] = (time.monotonic(), state, reason)
+        if len(self.binding_health) > memory_bindings.MAX_BINDINGS:
+            oldest = min(self.binding_health, key=lambda item: self.binding_health[item][0])
+            del self.binding_health[oldest]
+
     async def command(self, r):
         if not isinstance(r, dict) or not isinstance(r.get('op'), str):
             raise ValueError('expected operation object')
@@ -245,7 +302,7 @@ class Bridge:
                 state = dict(inbox_count=None, inbox_schema=None, ack_through=None,
                              journal_activation=None, capabilities=[])
             if state['inbox_schema'] == inbox_schema.SCHEMA:
-                state['capabilities'].append('inbox_subscription')
+                state['capabilities'].extend(('inbox_subscription', 'memory_binding'))
             return dict(pid=os.getpid(), address=self.address, generation=self.generation,
                         **state, **diagnostics,
                         delivery='inbox available; run notify.py to notify the selected participant session')
@@ -266,6 +323,44 @@ class Bridge:
             return await self.worker.call('command', request)
         if op in ('activate-notification-journal', 'rebuild-notification-journal-activation'):
             return await self.worker.call('command', r)
+        if op == 'bind-memory':
+            if set(r) != {'op', 'repo_path', 'memory_state_dir'}:
+                raise memory_bindings.BindingError('invalid_binding_request')
+            binding = await memory_bindings.resolve(r['repo_path'], r['memory_state_dir'])
+            await memory_bindings.observe(binding)
+            result = await self.worker.call('bind_memory', binding)
+            self.record_binding_health(binding['binding'], 'verified')
+            return result
+        if op in ('unbind-memory', 'refresh-memory', 'ack-binding-health'):
+            if set(r) != {'op', 'binding'}:
+                raise memory_bindings.BindingError('invalid_binding_request')
+            if op == 'ack-binding-health':
+                return await self.worker.call('acknowledge_binding_health', r['binding'])
+            if op == 'unbind-memory':
+                result = await self.worker.call('unbind_memory', r['binding'])
+                self.binding_health.pop(r['binding'], None)
+                return result
+            binding = await self.worker.call('binding', r['binding'])
+            try:
+                observation = await memory_bindings.observe(binding)
+                result = await self.worker.call('refresh_memory', binding, observation)
+            except memory_bindings.BindingError as exc:
+                self.record_binding_health(r['binding'], 'refused', exc.code)
+                raise
+            self.record_binding_health(r['binding'], 'verified')
+            return result
+        if op == 'memory-bindings':
+            if set(r) - {'op', 'after'}:
+                raise memory_bindings.BindingError('invalid_binding_request')
+            bindings = await self.worker.call('bindings')
+            known = {item['binding'] for item in bindings}
+            self.binding_health = {key: value for key, value in self.binding_health.items() if key in known}
+            for item in bindings:
+                checked, state, reason = self.binding_health.get(item['binding'], (0, 'unknown', None))
+                if time.monotonic()-checked > 30:
+                    state, reason = 'unknown', None
+                item['service_state'], item['service_reason'] = state, reason
+            return memory_bindings.page(bindings, r.get('after', ''))
         if op == 'stop':
             self.stop.set()
             return 'stopping'
@@ -355,7 +450,10 @@ class Bridge:
 async def client(root, request):
     control = platform_support.control_socket_path(root)
     try:
-        result, _pid = await control_exchange(root, request)
+        if isinstance(request.get('op'), str) and request['op'] in memory_bindings.OPERATIONS:
+            result, _pid = await control_exchange(root, request, timeout=memory_bindings.CLIENT_TIMEOUT)
+        else:
+            result, _pid = await control_exchange(root, request)
     except UnsafeServiceEndpoint as exc:
         print(json.dumps(dict(ok=False, code='unsafe_service_endpoint', error=str(exc))))
         return 1
@@ -389,7 +487,8 @@ async def client(root, request):
             return 1
         # Also protect reads from servers started before a runtime upgrade.
         for entry in result['result']:
-            entry['guidance'] = PEER_GUIDANCE
+            entry['guidance'] = (MEMORY_POINTER_GUIDANCE if entry.get('kind') == 'memory-pointer'
+                                 else PEER_GUIDANCE)
     print(json.dumps(result, indent=2))
     return 0 if result['ok'] else 1
 
@@ -416,6 +515,14 @@ def cli_main():
         if op.startswith('rebuild-'):
             s.add_argument('--expected-previous-nonce', required=True)
             s.add_argument('--accept-history-loss', action='store_true', required=True)
+    s = sub.add_parser('bind-memory')
+    s.add_argument('--repo-path', required=True)
+    s.add_argument('--memory-state-dir', required=True)
+    for op in ('unbind-memory', 'refresh-memory', 'ack-binding-health'):
+        s = sub.add_parser(op)
+        s.add_argument('binding')
+    s = sub.add_parser('memory-bindings')
+    s.add_argument('--after', default='')
     a = vars(p.parse_args())
     root = Path(a.pop('state_dir')).absolute()
     startup_directory(root)

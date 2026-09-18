@@ -53,7 +53,7 @@ class InboxSchemaTests(unittest.TestCase):
         before = self.path.read_bytes()
         other = self.store()
         self.assertEqual(self.path.read_bytes(), before)
-        self.assertEqual(schema.metadata(other.db)['schema'], 2)
+        self.assertEqual(schema.metadata(other.db)['schema'], schema.SCHEMA)
 
     def test_metadata_is_not_visible_before_migration_commit(self):
         self.legacy()
@@ -76,7 +76,7 @@ class InboxSchemaTests(unittest.TestCase):
         try:
             schema.initialize(db)
             self.assertEqual(observations, [schema.LEGACY_COLUMNS, 'metadata absent'])
-            self.assertEqual(schema.metadata(db)['schema'], 2)
+            self.assertEqual(schema.metadata(db)['schema'], schema.SCHEMA)
         finally:
             db.close()
 
@@ -173,9 +173,9 @@ class InboxSchemaTests(unittest.TestCase):
                 values = dict(binding=TARGET, repo_path='/repo', repo_key='a'*16, memory_state_dir='/state')
                 values[column] = path
                 with self.subTest(column=column, length=len(path)), self.assertRaises(sqlite3.IntegrityError):
-                    store.db.execute('INSERT INTO memory_binding VALUES (:binding,:repo_path,:repo_key,:memory_state_dir)', values)
+                    store.db.execute('INSERT INTO memory_binding(binding,repo_path,repo_key,memory_state_dir) VALUES (:binding,:repo_path,:repo_key,:memory_state_dir)', values)
                 store.db.rollback()
-        store.db.execute('INSERT INTO memory_binding VALUES (?,?,?,?)',
+        store.db.execute('INSERT INTO memory_binding(binding,repo_path,repo_key,memory_state_dir) VALUES (?,?,?,?)',
                          (TARGET, '/'+'x'*4095, 'a'*16, '/'+'x'*4095))
         store.db.commit()
         self.assertEqual(store.db.execute('SELECT count(*) FROM memory_binding').fetchone()[0], 1)
@@ -186,7 +186,7 @@ class InboxSchemaTests(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 store.db.execute('INSERT OR REPLACE INTO inbox_meta VALUES (?,?)', (key,value))
             store.db.rollback()
-        self.assertEqual(schema.metadata(store.db)['schema'], 2)
+        self.assertEqual(schema.metadata(store.db)['schema'], schema.SCHEMA)
 
     def crash(self, match, operation):
         code = '''
@@ -218,7 +218,7 @@ raise SystemExit('crash point not reached')
         finally:
             db.close()
         store = self.store()
-        self.assertEqual(schema.metadata(store.db)['schema'], 2)
+        self.assertEqual(schema.metadata(store.db)['schema'], schema.SCHEMA)
         self.assertEqual(schema.allocated_head(store.db), 7)
 
     def test_process_death_between_delete_and_watermark_rolls_back(self):
@@ -249,9 +249,9 @@ class SchemaPublicTests(unittest.IsolatedAsyncioTestCase):
         service.worker = bridge.DatabaseWorker(lambda: TestStore(self.root))
         try:
             status = await service.command({'op':'status'})
-            self.assertEqual(status['inbox_schema'], 2)
-            self.assertEqual(set(status['capabilities']), set(schema.CAPABILITIES) | {'inbox_subscription'})
-            self.assertNotIn('memory_binding', status['capabilities'])
+            self.assertEqual(status['inbox_schema'], schema.SCHEMA)
+            self.assertEqual(set(status['capabilities']), set(schema.CAPABILITIES) | {'inbox_subscription', 'memory_binding'})
+            self.assertIn('memory_binding', status['capabilities'])
             self.assertTrue(schema.hex_value(status['generation'], 32))
             await service.worker.call('command', {'op':'test-drop-metadata'})
             status = await service.command({'op':'status'})
@@ -293,7 +293,7 @@ class SchemaPublicTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_incompatible_and_corrupt_store_are_classified(self):
         path = self.root/'inbox.sqlite3'
         store = bridge.InboxStore(self.root)
-        store.db.execute("UPDATE inbox_meta SET value='3' WHERE key='schema'")
+        store.db.execute("UPDATE inbox_meta SET value=? WHERE key='schema'", (str(schema.SCHEMA+1),))
         store.db.commit()
         store.close()
         for corrupt in (False, True):
