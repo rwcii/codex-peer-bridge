@@ -4,8 +4,8 @@ Koinon provides shared coordination and memory for independent agents. Its inten
 scope covers different agent families working within one repository or across several.
 The current Python-standard-library implementation runs on Linux and macOS. It connects
 local Claude peer sockets to explicitly selected Codex or DeepSeek sessions and offers
-an optional memory service per repository. Grok integration and memory consolidation
-across repositories are not implemented.
+an optional memory service per repository. Memory consolidation across repositories
+is not implemented.
 
 Read README.md, PROTOCOL.md, and CONTRIBUTING.md before changing it.
 

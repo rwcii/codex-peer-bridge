@@ -12,8 +12,7 @@ across several repositories.
 The current implementation runs locally on Linux and macOS. It connects Claude Code
 peers to explicitly selected Codex or DeepSeek sessions and provides an optional
 shared memory service per repository. Each participant keeps its own session and
-permissions. Grok integration and memory consolidation across repositories are not
-implemented.
+permissions. Memory consolidation across repositories is not implemented.
 
 Python standard library only. No pip dependencies, cloud relay, or repository-specific integration.
 
