@@ -1,10 +1,12 @@
 import asyncio
+import ast
 from contextlib import redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -366,3 +368,141 @@ class ServiceWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(b'Traceback', stderr)
         finally:
             os.chmod(self.root/'state', 0o700)
+
+    async def test_wrapped_storage_failure_stays_visible_in_worker_diagnostics(self):
+        def factory():
+            store = memory.Store(self.root/'memory.sqlite3', REPO)
+            store.db.execute("CREATE TRIGGER refuse_note BEFORE INSERT ON entries "
+                             "BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+            return store
+        service = memory.Service(self.root, REPO, factory)
+        self.services.append(service)
+        await self.listen(service.handle)
+        reply = await memory.request(self.root, dict(op='note', consumer='synthetic',
+                                                    type='decision', body='will roll back'))
+        self.assertEqual(reply['code'], 'write_failed')
+        status = (await memory.request(self.root, dict(op='status')))['result']
+        self.assertEqual(status['head'], 0)
+        self.assertEqual(status['database_observed_fault'], 'storage_error')
+        self.assertFalse(status['healthy'])
+
+    async def test_wrapped_sqlite_programming_error_is_not_an_input_refusal(self):
+        class BadBinding:
+            def __init__(self, db):
+                self.db = db
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+            def execute(self, sql, *args):
+                if sql.startswith('INSERT INTO entries'):
+                    return self.db.execute(sql, ())  # Real SQLite binding error.
+                return self.db.execute(sql, *args)
+        def factory():
+            store = memory.Store(self.root/'memory.sqlite3', REPO)
+            store.db = BadBinding(store.db)
+            return store
+        service = memory.Service(self.root, REPO, factory)
+        self.services.append(service)
+        await self.listen(service.handle)
+        reply = await memory.request(self.root, dict(op='note', consumer='synthetic',
+                                                    type='decision', body='will roll back'))
+        self.assertEqual(reply['code'], 'internal_error')
+        status = (await memory.request(self.root, dict(op='status')))['result']
+        self.assertEqual(status['head'], 0)
+        self.assertEqual(status['database_observed_fault'], 'internal_error')
+        self.assertFalse(status['healthy'])
+
+    async def test_factory_programming_error_is_not_reported_as_incompatible_user_data(self):
+        repo_path = self.root/'repo'
+        repo_path.mkdir()
+        subprocess.run(['git', 'init', '-q', str(repo_path)], check=True, capture_output=True)
+        script = """import memory
+class ClosedDuringInspection(memory.Store):
+    def classify(self, repo):
+        self.db.close()
+        return super().classify(repo)
+memory.Store = ClosedDuringInspection
+memory.main()
+"""
+        child = await asyncio.create_subprocess_exec(
+            sys.executable, '-c', script, '--state-dir', str(self.root/'state'),
+            '--repo-path', str(repo_path), 'serve',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(child.communicate(), 5)
+        self.assertEqual(child.returncode, 70, stderr.decode())
+        reply = json.loads(stdout)
+        self.assertEqual(reply['code'], 'internal_error')
+        self.assertNotIn('incompatible', reply['error'])
+        home = memory.state_dir(self.root/'state', memory.repo_identity(repo_path))
+        self.assertFalse((home/'owner.json').exists())
+        self.assertFalse(memory.platform_support.control_socket_path(home).exists())
+
+
+class ErrorClassificationTests(unittest.TestCase):
+    def test_every_local_recovery_code_has_exactly_one_explicit_exit_class(self):
+        tree = ast.parse(Path(memory.__file__).read_text())
+        raised = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'MemoryError_':
+                self.assertTrue(node.args and isinstance(node.args[0], ast.Constant),
+                                'recovery codes must be explicit literals')
+                raised.add(node.args[0].value)
+        classes = memory.ERROR_EXIT_CLASSES
+        flattened = [code for codes in classes.values() for code in codes]
+        self.assertEqual(len(flattened), len(set(flattened)), 'exit classes must not overlap')
+        self.assertEqual(set(flattened), raised | memory.SYNTHESIZED_ERROR_CODES,
+                         'every recovery and synthesized code needs a deliberate exit policy')
+        for name, code in (('unsupported_runtime', 78), ('store_too_large', 78),
+                           ('service_refused', 78), ('storage_blocked', 78),
+                           ('stopping', 75), ('idem_capacity', 75), ('snapshot_capacity', 75),
+                           ('no_reply', 1), ('write_failed', 1), ('internal_error', 70), ('unknown-wire-code', 1)):
+            self.assertEqual(memory.memory_error_exit_status(name), code, name)
+
+    def test_every_chained_recovery_code_declares_its_database_fault_policy(self):
+        tree = ast.parse(Path(memory.__file__).read_text())
+        chained = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Raise) and node.cause is not None and
+                    not (isinstance(node.cause, ast.Constant) and node.cause.value is None) and
+                    isinstance(node.exc, ast.Call) and isinstance(node.exc.func, ast.Name) and
+                    node.exc.func.id == 'MemoryError_'):
+                self.assertIsInstance(node.exc.args[0], ast.Constant)
+                chained.add(node.exc.args[0].value)
+        self.assertEqual(set(memory.CHAINED_DATABASE_FAULTS), chained,
+                         'new chained recovery errors require an explicit fault decision')
+        self.assertEqual({code for code, fault in memory.CHAINED_DATABASE_FAULTS.items() if fault},
+                         {'write_failed', 'storage_blocked'})
+        for code, fault in memory.CHAINED_DATABASE_FAULTS.items():
+            self.assertEqual(memory.MemoryError_(code, 'synthetic').database_fault, fault)
+
+    def test_programming_cause_overrides_an_expected_no_fault_code(self):
+        db = sqlite3.connect(':memory:')
+        db.close()
+        try:
+            db.execute('SELECT 1')
+        except sqlite3.ProgrammingError as cause:
+            try:
+                raise memory.MemoryError_('incompatible_store', 'synthetic inspection failure') from cause
+            except memory.MemoryError_ as error:
+                self.assertIsNone(memory.CHAINED_DATABASE_FAULTS[error.code])
+                self.assertEqual(error.database_fault, 'internal_error')
+        else:
+            self.fail('closed SQLite connection did not raise ProgrammingError')
+
+    def test_locally_emitted_errors_cannot_bypass_classification(self):
+        reply = memory.local_error_reply('new-unclassified-local-code', 'synthetic')
+        self.assertEqual(reply['code'], 'internal_error')
+        self.assertEqual(memory.memory_error_exit_status(reply['code']), 70)
+        for invalid in (None, [], {}):
+            self.assertEqual(memory.memory_error_exit_status(invalid), 1)
+            self.assertEqual(memory.local_error_reply(invalid, 'synthetic')['code'], 'internal_error')
+        # Keep all local response construction behind this checked boundary. Received
+        # wire replies are printed unchanged and intentionally have a different policy.
+        tree = ast.parse(Path(memory.__file__).read_text())
+        constructors = []
+        for function in (node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))):
+            for node in ast.walk(function):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'dict':
+                    fields = {item.arg: item.value for item in node.keywords}
+                    if 'code' in fields and isinstance(fields.get('ok'), ast.Constant) and fields['ok'].value is False:
+                        constructors.append(function.name)
+        self.assertEqual(constructors, ['local_error_reply'])

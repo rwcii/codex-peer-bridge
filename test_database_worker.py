@@ -6,6 +6,7 @@ import threading
 import unittest
 
 from database_worker import DatabaseWorker, CapacityError, WorkerClosed, WorkerFailure
+from service_runtime import drain_handlers
 
 
 async def reached(event):
@@ -139,3 +140,18 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sqlite3.OperationalError):
             DatabaseWorker(fail)
         self.assertEqual(set(threading.enumerate()), before)
+
+    async def test_handler_drain_joins_cancellation_cleanup(self):
+        entered, cleaned = asyncio.Event(), asyncio.Event()
+        async def handler():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(.01)
+                cleaned.set()
+        task = asyncio.create_task(handler())
+        await entered.wait()
+        await drain_handlers({task}, timeout=.01)
+        self.assertTrue(cleaned.is_set())
+        self.assertTrue(task.cancelled())

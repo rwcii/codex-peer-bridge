@@ -216,3 +216,26 @@ class ControlTransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(memory.MemoryError_) as caught:
             await memory.verify_running(self.root, 'synthetic')
         self.assertEqual(caught.exception.code, 'ownership_mismatch')
+
+
+class PrivateDirectoryTests(unittest.TestCase):
+    def test_missing_ancestors_are_private_under_a_permissive_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prior = os.umask(0o022)
+            try:
+                transport.private_dir(root/'one'/'two'/'leaf')
+            finally:
+                os.umask(prior)
+            for path in (root/'one', root/'one'/'two', root/'one'/'two'/'leaf'):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    def test_existing_parent_permissions_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root/'existing'
+            parent.mkdir(mode=0o755)
+            parent.chmod(0o755)
+            transport.private_dir(parent/'leaf')
+            self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((parent/'leaf').stat().st_mode & 0o777, 0o700)

@@ -206,12 +206,33 @@ SNAPSHOT_ORDER = {'directive': 0, 'decision': 1, 'gotcha': 2, 'handoff': 3, 'fin
 SNAPSHOT_TAIL = {'finding': 25, 'handoff': 25, 'status': 10}
 
 
+# Chained recovery errors must explicitly declare whether their cause is a database
+# fault. Contention, ordinary capacity and configuration refusals are not worker faults.
+CHAINED_DATABASE_FAULTS = {
+    'write_failed': 'storage_error',
+    'storage_blocked': 'storage_error',
+    'repo_unresolved': None,
+    'store_busy': None,
+    'capacity': None,
+    'incompatible_store': None,
+    'socket_in_use': None,
+}
+
+
 class MemoryError_(ValueError):
     """A request the service refuses. `code` names the recovery path."""
 
     def __init__(self, code, detail):
         super().__init__(f'{code}: {detail}')
         self.code, self.detail = code, detail
+
+    @property
+    def database_fault(self):
+        # These recovery errors wrap actual storage failures. Preserve their recovery
+        # codes while keeping the owning worker's observation complete.
+        if isinstance(self.__cause__, sqlite3.ProgrammingError):
+            return 'internal_error'
+        return CHAINED_DATABASE_FAULTS.get(self.code)
 
 
 def private_state_dir(path):
@@ -1704,15 +1725,15 @@ class Service:
                     if REPLY_DELAY and request.get('op') == 'note':
                         await asyncio.sleep(REPLY_DELAY)
             except MemoryError_ as exc:
-                reply = dict(ok=False, code=exc.code, error=str(exc))
+                reply = local_error_reply(exc.code, str(exc))
             except CapacityError:
-                reply = dict(ok=False, code='capacity', error='service request capacity reached')
+                reply = local_error_reply('capacity', 'service request capacity reached')
             except WorkerFailure as exc:
-                reply = dict(ok=False, code=exc.code, error='database operation failed')
+                reply = local_error_reply(exc.code, 'database operation failed')
             except (ValueError, OSError, TimeoutError) as exc:
-                reply = dict(ok=False, code='rejected', error=type(exc).__name__)
+                reply = local_error_reply('rejected', type(exc).__name__)
             except Exception:
-                reply = dict(ok=False, code='internal_error', error='service operation failed')
+                reply = local_error_reply('internal_error', 'service operation failed')
             try:
                 writer.write(encode(reply))
                 await asyncio.wait_for(writer.drain(), 10)
@@ -2088,24 +2109,64 @@ def cli_main():
     raise SystemExit(0 if reply.get('ok') else memory_error_exit_status(reply.get('code')))
 
 
+# Every locally raised recovery code and synthesized error has an explicit CLI policy. Unknown wire
+# codes retain exit 1; they cannot make a client claim a known retry/configuration class.
+SYNTHESIZED_ERROR_CODES = frozenset(('internal_error', 'storage_error', 'rejected'))
+ERROR_EXIT_CLASSES = {
+    'software': frozenset(('internal_error',)),
+    'temporary': frozenset((
+        'service_busy', 'service_unresponsive', 'service_unavailable', 'store_busy',
+        'capacity', 'idem_capacity', 'snapshot_capacity', 'stopping',
+    )),
+    'configuration': frozenset((
+        'foreign_service', 'unsafe_service_endpoint', 'unsafe_state_directory',
+        'unknown_owner', 'ownership_mismatch', 'wrong_repository', 'incompatible_store',
+        'schema_too_new', 'schema_too_old', 'repo_unresolved', 'unhealthy_service',
+        'invalid_service_response', 'socket_in_use', 'unsupported_runtime',
+        'store_too_large', 'service_refused', 'storage_blocked',
+    )),
+    'request': frozenset((
+        'consumer_retired', 'entry_too_large', 'foreign_snapshot', 'idempotency_conflict',
+        'invalid_request', 'no_reply', 'no_such_entry', 'not_bootstrapped', 'not_issued',
+        'not_this_instance', 'retry_deadline_expired', 'snapshot_expired',
+        'snapshot_incomplete', 'snapshot_open', 'stale_page_token', 'stale_snapshot',
+        'write_failed', 'storage_error', 'rejected',
+    )),
+}
+
+
 def memory_error_exit_status(code):
-    if code in ('service_busy', 'service_unresponsive', 'service_unavailable',
-                'store_busy', 'capacity'):
+    if not isinstance(code, str):
+        return 1
+    if code in ERROR_EXIT_CLASSES['software']:
+        return platform_support.SOFTWARE_EXIT_STATUS
+    if code in ERROR_EXIT_CLASSES['temporary']:
         return platform_support.TEMPORARY_EXIT_STATUS
-    if code in ('foreign_service', 'unsafe_service_endpoint', 'unsafe_state_directory', 'unknown_owner',
-                'ownership_mismatch', 'wrong_repository', 'incompatible_store',
-                'schema_too_new', 'schema_too_old', 'repo_unresolved',
-                'unhealthy_service', 'invalid_service_response', 'socket_in_use'):
+    if code in ERROR_EXIT_CLASSES['configuration']:
         return platform_support.CONFIGURATION_EXIT_STATUS
     return 1
+
+
+def local_error_reply(code, detail):
+    # Local code may not emit an unclassified outcome. Unknown codes received from
+    # another version still use the CLI's deliberate exit-1 compatibility fallback.
+    if not isinstance(code, str) or not any(code in codes for codes in ERROR_EXIT_CLASSES.values()):
+        code, detail = 'internal_error', 'unclassified local error outcome'
+    return dict(ok=False, code=code, error=detail)
 
 
 def main():
     try:
         return cli_main()
     except MemoryError_ as exc:
-        print(json.dumps(dict(ok=False, code=exc.code, error=exc.detail)))
-        raise SystemExit(memory_error_exit_status(exc.code)) from None
+        # Factory failures happen before the worker's request classifier is active.
+        # Do not report a wrapped programming defect as an incompatible user file.
+        internal = exc.database_fault == 'internal_error'
+        code = 'internal_error' if internal else exc.code
+        detail = 'internal database operation failed' if internal else exc.detail
+        reply = local_error_reply(code, detail)
+        print(json.dumps(reply))
+        raise SystemExit(memory_error_exit_status(reply['code'])) from None
 
 
 if __name__ == '__main__':

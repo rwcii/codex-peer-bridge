@@ -32,18 +32,18 @@ async def close_writer(writer):
         raise
 
 
-async def drain_handlers(tasks):
+async def drain_handlers(tasks, timeout=10):
     # Cancelling a handler stops waiting for its answer, not its accepted mutation.
     # The owning worker is drained separately after these socket tasks settle.
     if not tasks:
         return
     pending = set(tasks)
     try:
-        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 10)
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout)
     except TimeoutError:
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        # wait_for cancels the gather and waits for its children to finish cancelling.
+        # Their accepted database jobs remain shielded and drain in worker.close().
+        pass
 
 
 async def database_status(worker, *args):

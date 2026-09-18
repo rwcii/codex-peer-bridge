@@ -17,10 +17,15 @@ LIMIT = 262144
 
 
 def private_dir(path):
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    s = path.lstat()
-    if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077:
-        raise ValueError('directory must be owned by this user and mode 0700')
+    """Create missing components privately; never change existing parent modes."""
+    pending = [path]
+    while not pending[-1].parent.exists():
+        pending.append(pending[-1].parent)
+    for directory in reversed(pending):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        s = directory.lstat()
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077:
+            raise ValueError('directory must be owned by this user and mode 0700')
 
 
 def credentials(sock):

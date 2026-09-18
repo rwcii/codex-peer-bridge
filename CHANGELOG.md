@@ -7,13 +7,17 @@ into a dated release section when promoted to `main`.
 
 ### Added
 
+- Private directory creation now gives missing parent directories mode 0700 even under
+  a permissive process umask, while preserving existing parent permissions.
+
 - Dedicated bridge and memory database workers with bounded queues, separate control
   admission, and shutdown that settles accepted writes even after caller cancellation.
   Status reports observed storage and programming faults separately from input refusals.
   Memory startup distinguishes a busy, unresponsive or invalid service from an absent
   listener and refuses replacement before constructing another database owner. The CLI
   reports expected lifecycle errors as structured responses, with exit 75 for temporary
-  conditions and exit 78 for refusals that need operator correction.
+  conditions, exit 70 for internal software errors, and exit 78 for refusals that need
+  operator correction.
 
 - Separate control endpoint validation and bounded exchanges for bridge and memory
   clients. Control sockets are excluded from generic messaging and discovery; memory

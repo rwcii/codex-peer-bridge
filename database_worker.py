@@ -81,14 +81,17 @@ class DatabaseWorker:
                 try:
                     value = getattr(owner, method)(*args)
                 except Exception as exc:
+                    domain_fault = getattr(exc, 'database_fault', None)
                     with self._condition:
-                        if isinstance(exc, sqlite3.ProgrammingError):
+                        if domain_fault in ('storage_error', 'internal_error'):
+                            self._fault = domain_fault
+                        elif isinstance(exc, sqlite3.ProgrammingError):
                             self._fault = 'internal_error'
                         elif isinstance(exc, (sqlite3.Error, OSError)):
                             self._fault = 'storage_error'
                         elif not isinstance(exc, ValueError):
                             self._fault = 'internal_error'
-                    if isinstance(exc, ValueError):
+                    if isinstance(exc, ValueError) and domain_fault != 'internal_error':
                         result.set_exception(exc)
                     else:
                         failure_result = WorkerFailure(self.fault)

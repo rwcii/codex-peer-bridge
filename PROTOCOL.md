@@ -69,7 +69,11 @@ path, which still requires the existing ownership checks before binding.
 The memory CLI prints structured errors for these refusals. Busy/unresponsive/unavailable
 services and capacity refusals exit 75 (retryable). Identity, ownership, permissions,
 configuration and invalid-handshake refusals exit 78 (operator correction required).
-Other request errors retain exit 1. A lost stop reply remains ambiguous: stop observes
+Blocked storage also exits 78 because it requires an explicit `recover` operation.
+Stopping and bounded idempotency/snapshot capacity exit 75. All locally raised recovery
+codes have an explicit class checked by the tests. Internal software errors use exit 70. Locally generated error replies pass through a
+checked classification boundary; an unclassified local outcome becomes `internal_error`.
+Other request errors, ambiguous `no_reply` and unclassified wire errors retain exit 1. A lost stop reply remains ambiguous: stop observes
 the selected generation before reporting its exit.
 
 These path checks do not authenticate a service role. Memory-service reuse additionally
@@ -121,7 +125,10 @@ is not proof of rollback. Use the existing memory idempotency contract for uncer
 replies. Services stop accepting connections, drain handlers, then close the worker after
 all accepted jobs settle. Socket waits cannot keep a database transaction open.
 
-Database failures return `storage_error`; programming failures return `internal_error`.
+Unwrapped database failures return `storage_error`; programming failures return
+`internal_error`, including programming errors wrapped by a storage recovery exception.
+Expected storage recovery errors retain codes such as `write_failed` and `storage_blocked`
+and also record an observed storage fault.
 Status waits at most one second for a priority database read, then returns known process
 identity and a lock-protected worker snapshot without waiting for that read to finish.
 `database_status` is `ready`, `busy`, `capacity`, `closing` or an error class. When the read

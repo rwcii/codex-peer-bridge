@@ -217,8 +217,13 @@ unit, and nothing starts it automatically. Memory CLI errors use a structured
 `ok:false` response with a recovery code. Exit 75 means temporary unavailability or
 capacity; retry after pending work settles. Exit 78 means an identity, ownership,
 configuration, permissions or invalid-handshake refusal that needs operator correction.
-Other request failures exit 1. If you manage memory with a separate service manager,
-keep 75 retryable and exclude 78 from automatic restarts. No memory service unit is
+A blocked store also exits 78: use `recover` explicitly after correcting its reported
+condition. Unsupported SQLite builds and oversized stores require correction, not a
+restart loop. Request-specific errors and ambiguous lost replies exit 1; do not treat
+an exit code alone as permission to repeat an uncertain write. If you manage memory with a separate service manager,
+keep 75 retryable and exclude both 70 (internal software error) and 78 from automatic
+restarts. Internal errors require investigation or a code correction; they are not
+reported as incompatible user data. No memory service unit is
 created by the installer.
 
 Run one per repository, from inside that repository:
