@@ -131,6 +131,14 @@ class OwnershipTests(unittest.TestCase):
         with locks.notifier_ownership(self.other, 'codex', 'a'):
             pass
 
+    def test_real_and_effective_uid_mismatch_is_refused(self):
+        with patch('os.geteuid', return_value=os.getuid()+1):
+            with self.assertRaises(locks.OwnershipError) as caught:
+                with locks.notifier_ownership(self.state, 'codex', 'a'):
+                    pass
+        self.assertEqual(caught.exception.code, 'uid_mismatch')
+        self.assertFalse(self.state.exists())
+
     def test_missing_account_home_has_explicit_failure(self):
         with patch('platform_support.account_home', side_effect=platform_support.AccountHomeUnavailable):
             with self.assertRaises(locks.OwnershipError) as caught:
@@ -150,7 +158,7 @@ runpy.run_module('notify', run_name='__main__')
 """
         result = subprocess.run([sys.executable, '-c', script, str(self.state)],
                                 capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, platform_support.CONFIGURATION_EXIT_STATUS)
         self.assertEqual(result.stderr, '')
         self.assertEqual(json.loads(result.stdout)['code'], 'account_home_unavailable')
         self.assertNotIn('synthetic-session', result.stdout)
@@ -194,7 +202,7 @@ with notifier_ownership(Path(sys.argv[2]), 'codex', 'a') as owner:
             p.kill()
             p.wait(timeout=10)
             os.kill(child, 0)  # The child survives its parent.
-            with locks.notifier_ownership(self.other, 'codex', 'a') as replacement:
+            with locks.notifier_ownership(self.state, 'codex', 'a') as replacement:
                 self.assertEqual(replacement, data['owner'])
         finally:
             if p.poll() is None:

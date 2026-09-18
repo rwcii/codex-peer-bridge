@@ -183,7 +183,10 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
                 raise RuntimeError('bridge did not become ready')
             children.append(subprocess.Popen(notify_command(prefix,config,state,thread,repo,name,agent,model)))
             for _ in range(100):
-                if stopped or children[-1].poll() is not None:
+                notifier_exit = children[-1].poll()
+                if notifier_exit == platform_support.CONFIGURATION_EXIT_STATUS:
+                    raise SystemExit(notifier_exit)
+                if stopped or notifier_exit is not None:
                     raise RuntimeError('notifier exited during startup')
                 if notifier_ready(state,bridge_status(prefix,state)):
                     break
@@ -194,6 +197,8 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
             while not stopped and all(p.poll() is None for p in children):
                 time.sleep(.2)
             if not stopped:
+                if children[-1].poll() == platform_support.CONFIGURATION_EXIT_STATUS:
+                    raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS)
                 raise RuntimeError('session child exited; restart the complete session')
         finally:
             for child in reversed(children):
@@ -271,11 +276,11 @@ def main():
                                     model=a.model or model)
             print(json.dumps(saved))
             return
-        healthy=notifier_ready(state,active)
+        ready=notifier_readiness(state,active)
+        healthy=ready is not None
         if a.action=='status' or (a.action=='ensure' and active):
             data=result(prefix,state,name,a.thread,repo,'running' if healthy else ('repair_required' if active else 'stopped'),agent,model)
             data['bridge']=active
-            ready=notifier_readiness(state,active) if healthy else None
             data['participant_lock']=ready.get('participant_lock') if ready else None
             if active and not healthy:
                 data['repair_command']=shlex.join([sys.executable,str(prefix/'session.py'),'stop','--thread',a.thread])

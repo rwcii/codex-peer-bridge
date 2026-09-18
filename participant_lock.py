@@ -79,6 +79,8 @@ def notifier_ownership(state_dir, provider, participant):
     distinct delivery namespace. File descriptors never pass through exec.
     """
     owner = identity(provider, participant)
+    if os.getuid() != os.geteuid():
+        raise OwnershipError('uid_mismatch', owner)
     try:
         namespace = platform_support.participant_lock_dir().resolve()
     except platform_support.AccountHomeUnavailable:

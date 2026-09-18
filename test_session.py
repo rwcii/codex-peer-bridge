@@ -191,6 +191,70 @@ class SystemdStartupTests(unittest.TestCase):
         self.processes.append(process)
         return process
 
+    def test_supervisor_preserves_configuration_refusal_and_stops_bridge(self):
+        notifier = self.app/'notify.py'
+        source = notifier.read_text().split("if __name__ == '__main__':", 1)[0]
+        notifier.write_text(source + "if __name__ == '__main__':\n    raise SystemExit(78)\n")
+        process = self.spawn([sys.executable, str(self.app/'session.py'), 'run',
+                              '--thread', self.thread, '--repo', self.repo])
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 78, stderr)
+        self.assertIn('address', stdout, 'the bridge must start before the child refusal')
+        self.assertNotIn('Traceback', stderr)
+        self.assertIsNone(session.bridge_status(self.app, self.state))
+
+    def test_supervisor_preserves_refusal_after_notifier_readiness(self):
+        # This test-owned child takes the real readiness lock, then exits with the
+        # permanent-refusal code after the supervisor has entered its running loop.
+        notifier = self.app/'notify.py'
+        source = notifier.read_text().split("if __name__ == '__main__':", 1)[0]
+        import textwrap
+        notifier.write_text(source + "if __name__ == '__main__':\n" + textwrap.indent("""
+import fcntl, json, os, sys, time
+from pathlib import Path
+import platform_support
+root = Path(sys.argv[sys.argv.index('--state-dir')+1])
+lock = (root/'notifier.lock').open('a')
+fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+# The bridge PID comes from the installed bridge CLI, not from a test assumption.
+import subprocess
+bridge = json.loads(subprocess.check_output([sys.executable,
+    str(Path(__file__).with_name('bridge.py')), '--state-dir', str(root), 'status']))['result']
+(root/'notify-ready.json').write_text(json.dumps(dict(owner='synthetic',
+    bridge_pid=bridge['pid'], notifier_pid=os.getpid(),
+    proc_start=platform_support.proc_start(os.getpid()))))
+while not (root/'exit-now').exists():
+    time.sleep(.02)
+raise SystemExit(78)
+""", '    '))
+        process = self.spawn([sys.executable, str(self.app/'session.py'), 'run',
+                              '--thread', self.thread, '--repo', self.repo])
+        # Read actual supervisor output until it reports the running state.
+        import select
+        deadline = time.monotonic()+15
+        running = False
+        buffered = b''
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stdout], [], [], .2)
+            if not readable:
+                continue
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            buffered += chunk
+            while b'\n' in buffered:
+                line, buffered = buffered.split(b'\n', 1)
+                if json.loads(line).get('status') == 'running':
+                    running = True
+            if running:
+                break
+        self.assertTrue(running, 'supervisor did not report running')
+        (self.state/'exit-now').touch()
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 78, stderr)
+        self.assertNotIn('Traceback', stderr)
+        self.assertIsNone(session.bridge_status(self.app, self.state))
+
     def start_session(self, before_start=None):
         real_run = subprocess.run
 

@@ -39,6 +39,8 @@ LINUX = sys.platform.startswith('linux')
 # themselves, so this module stays the only place that knows the differences.
 SUPPORTED = DARWIN or LINUX
 SERVICE_MANAGER = 'systemd' if LINUX else None
+# Explicit configuration/ownership refusals require operator action, not restart loops.
+CONFIGURATION_EXIT_STATUS = 78
 
 if not SUPPORTED:
     raise RuntimeError(f'unsupported platform: {sys.platform}')

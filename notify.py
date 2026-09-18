@@ -187,4 +187,4 @@ if __name__ == '__main__':
         run(p.parse_args())
     except OwnershipError as exc:
         print(json.dumps(exc.result()), flush=True)
-        raise SystemExit(1)
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS)

@@ -10,7 +10,9 @@ into a dated release section when promoted to `main`.
 - Account-local notifier ownership across state directories. Duplicate provider/session
   targets fail before registration; conflict diagnostics and session status expose a
   matching digest. Persistent Koinon lock paths do not depend on agent home overrides,
-  and delivery subprocesses cannot retain the lock after notifier exit.
+  and delivery subprocesses cannot retain the lock after notifier exit. Ownership
+  refusals exit with status 78; legacy and supervised services wait for an explicit
+  restart after correction instead of repeatedly restarting the refused instance.
 
 ## 2026-09-18 — Koinon
 

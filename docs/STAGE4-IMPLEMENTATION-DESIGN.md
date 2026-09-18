@@ -1,6 +1,6 @@
 # Stage 4 implementation design for review
 
-Status: implementation contract under review; shared helper extraction is complete. No stage 4 runtime changes are deployed.
+Status: all five concrete design gates accepted in independent review. Shared helper extraction and participant ownership are implemented; remaining stage 4 components are pending. No stage 4 runtime changes are deployed.
 Baseline: develop 84f35e727b0f17a9469de182db9a843e7a28d092, integrated by signed merge 7503dc1.
 Codex is the sole driver. Claude is the reviewer. The merged baseline was independently verified. Implementation branch: feature/shared-transport-delivery.
 
@@ -117,8 +117,8 @@ Before code: close participant namespace derivation, exact wire fields, queue/co
 ## Concrete gate decisions (review draft)
 
 These decisions apply to new stage 4 behavior. Existing peer envelopes and memory sync,
-acknowledgement, and snapshot formats remain unchanged. The completed transport-helper
-extraction is the only implementation on this branch so far.
+acknowledgement, and snapshot formats remain unchanged. Transport-helper extraction and the participant ownership boundary are implemented;
+subscriptions, pointers, worker ownership, notification journal and health remain pending.
 
 ### Participant identity and lock scope
 

@@ -291,8 +291,17 @@ The notifier takes its state-directory lock first, then a lock for the provider 
 session identity across the OS account. Both acquisitions are nonblocking. A conflict
 fails startup before registration or delivery, with `participant_in_use`, the provider,
 the `account-local` scope, and the lock digest. Match that digest to `participant_lock`
-in `session.py status` or the running notifier's private `notify-ready.json`. Stop an
+in `session.py status` or the running notifier's private `notify-ready.json`. Under systemd, read the refusal JSON with
+`journalctl --user -u codex-peer-notify -n 50 --no-pager` for the legacy pair, or
+`journalctl --user -u codex-peer-session-INSTANCE -n 50 --no-pager` for a session.
+Ownership refusals exit with status 78. Both service forms prevent automatic restart
+on that status; the supervisor preserves it after stopping its bridge child. Correct
+the reported condition before explicitly starting the instance again. Stop an
 unwanted instance through its own session command; do not remove a lock file to bypass it.
+
+Participant identity compares exact UTF-8 bytes; callers must supply the provider's
+canonical session ID. Different spellings are not normalized into one identity. Real
+and effective user IDs must match; set-user-ID execution is refused as `uid_mismatch`.
 
 The shared namespace is derived from the effective user's operating-system account
 entry, not `HOME`, `XDG_STATE_HOME`, `CODEX_HOME`, `DSH_HOME`, or the delivery URL:
