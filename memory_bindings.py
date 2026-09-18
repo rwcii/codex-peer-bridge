@@ -9,7 +9,7 @@ import uuid
 
 import inbox_schema as schema
 import memory
-from peer_transport import control_exchange, encode, LIMIT, CONTROL_CLOSE_TIMEOUT
+from peer_transport import encode, LIMIT, CONTROL_CLOSE_TIMEOUT
 from service_runtime import HANDSHAKE_TIMEOUT
 import platform_support
 
@@ -119,7 +119,7 @@ async def observe(binding):
             raise BindingError('memory_upgrade_required')
         if version != memory.SCHEMA:
             raise BindingError('memory_version_unsupported')
-        reply, pid = await control_exchange(root, dict(op='status'), timeout=STATUS_TIMEOUT)
+        reply, pid = await memory.control_exchange(root, dict(op='status'), timeout=STATUS_TIMEOUT)
         state = reply.get('result') if reply.get('ok') is True else None
         if not isinstance(state, dict):
             raise BindingError('memory_unavailable')

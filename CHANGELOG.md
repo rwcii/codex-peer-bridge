@@ -5,6 +5,8 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+- Select private control endpoints from canonical state paths on both platforms. Preserve validated legacy endpoints for clients and refuse duplicate or ambiguous old/new listeners during upgrades. Peer messaging paths remain literal.
+
 ### Added
 
 - Explicit verified memory bindings and atomic content-free pointer refresh, with

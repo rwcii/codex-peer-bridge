@@ -373,7 +373,11 @@ class Bridge:
         try:
             startup_directory(Path('/tmp/cc-socks'))
             peer = Path(self.address[4:])
-            control = platform_support.control_socket_path(self.root)
+            try:
+                control = platform_support.control_socket_path(self.root)
+                platform_support.refuse_legacy_control_conflict(self.root)
+            except (OSError, RuntimeError) as exc:
+                raise BridgeOwnershipError(f'control endpoint unavailable: {exc}') from exc
             startup_directory(control.parent)
             # Bind exclusively. Never remove a pre-existing process socket.
             for path in (control, peer):
@@ -448,7 +452,6 @@ class Bridge:
 
 
 async def client(root, request):
-    control = platform_support.control_socket_path(root)
     try:
         if isinstance(request.get('op'), str) and request['op'] in memory_bindings.OPERATIONS:
             result, _pid = await control_exchange(root, request, timeout=memory_bindings.CLIENT_TIMEOUT)
@@ -459,7 +462,7 @@ async def client(root, request):
         return 1
     except (ConnectionRefusedError, FileNotFoundError) as exc:
         # Keep the existing CLI diagnostic for a missing or stale endpoint.
-        raise SystemExit(f'no bridge is running for {root} (nothing is listening on {control})') from exc
+        raise SystemExit(f'no bridge is running for {root} (no control endpoint is listening)') from exc
     except TimeoutError:
         print(json.dumps(dict(ok=False, code='service_unresponsive',
                               error='control request timed out; mutation outcome is unknown')))

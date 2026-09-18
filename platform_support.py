@@ -258,11 +258,61 @@ def control_socket_path(root):
     socket and a saturated one are indistinguishable by probing, because a full
     accept queue refuses a connection on macOS just as a dead owner does.
     """
+    root = Path(root).resolve()
     direct = root / 'control.sock'
     if len(os.fsencode(direct)) < SUN_PATH_BYTES[DARWIN]:
         return direct
+    return fallback_control_socket(root)
+
+
+def fallback_control_socket(root):
+    """The stable private fallback used by both old and new service code."""
     digest = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:16]
     return Path('/tmp/cc-socks') / f'{digest}-control.sock'
+
+
+def legacy_control_socket(root, recorded=None):
+    """A bounded old direct endpoint; never a peer or registry address.
+
+    An old server could select a short alias before checking the path length.
+    Only that root's direct socket is a permitted compatibility destination.
+    """
+    candidate = Path(root) / 'control.sock' if recorded is None else recorded
+    if not isinstance(candidate, (str, Path)):
+        return None
+    candidate = Path(candidate)
+    try:
+        if (candidate.is_absolute() and len(os.fsencode(candidate)) < SUN_PATH_BYTES[DARWIN]
+                and candidate.resolve() == (Path(root).resolve() / 'control.sock')):
+            return candidate
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
+def same_control_socket(recorded, expected):
+    """Compare private service endpoint identities, never peer token paths."""
+    if not isinstance(recorded, str) or not Path(recorded).is_absolute():
+        return False
+    try:
+        return Path(recorded).resolve() == Path(expected).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def refuse_legacy_control_conflict(root):
+    """Never start a new endpoint beside either retained legacy endpoint."""
+    canonical = control_socket_path(root).resolve()
+    candidates = (Path(root).resolve() / 'control.sock', fallback_control_socket(root))
+    for candidate in candidates:
+        if candidate.resolve() == canonical:
+            continue
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        raise FileExistsError(f'legacy control endpoint remains at {candidate}; '
+                              'stop its owner and verify it is gone before removing a leftover socket')
 
 
 class AccountHomeUnavailable(RuntimeError):

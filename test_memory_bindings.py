@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import socket
 import subprocess
 import sys
 import tempfile
@@ -487,6 +488,75 @@ class BindingPublicTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reply['ok'])
         self.assertEqual(reply['result']['cleared'], 0)
         self.assertEqual((await self.request(dict(op='inbox')))['result'], before)
+
+    async def test_legacy_length_boundary_service_can_bind_refresh_and_stop(self):
+        await self.legacy_length_boundary_service_case(False)
+
+    async def test_legacy_fallback_service_can_bind_refresh_and_stop(self):
+        await self.legacy_length_boundary_service_case(True)
+
+    async def legacy_length_boundary_service_case(self, inverse):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temp:
+            base = Path(temp)
+            parent = base / ('real' if inverse else 'long-' + 'x' * 110)
+            root = parent / 'state'
+            memory.private_state_dir(root)
+            alias_parent = base / ('alias-parent-' + 'x' * 110) if inverse else base
+            alias_parent.mkdir(mode=0o700, exist_ok=True)
+            alias = alias_parent / 'alias'
+            alias.symlink_to(parent, target_is_directory=True)
+            old_path = (memory.platform_support.fallback_control_socket(root) if inverse
+                        else alias / 'state' / 'control.sock')
+            memory.private_state_dir(old_path.parent)
+            self.assertNotEqual(old_path.resolve(), memory.platform_support.control_socket_path(root).resolve())
+            service = memory.Service(root, self.repo_key,
+                                     lambda: memory.Store(root / 'memory.sqlite3', self.repo_key))
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(str(old_path))
+            sock.listen(16)
+            sock.setblocking(False)
+            old_path.chmod(0o600)
+            memory.write_owner(root, old_path, service.generation, self.repo_key)
+            async def run():
+                try:
+                    await service.run(sock)
+                finally:
+                    memory.release(root, old_path, service.generation)
+            running = asyncio.create_task(run())
+            try:
+                reply = await self.request(dict(op='bind-memory', repo_path=str(self.repo),
+                                                memory_state_dir=str(root)))
+                self.assertTrue(reply['ok'], reply)
+                result = await self.request(dict(op='refresh-memory', binding=reply['result']['binding']))
+                self.assertTrue(result['ok'], result)
+                stopped = await asyncio.to_thread(memory.stop_service, root, self.repo_key, 2)
+                self.assertEqual(stopped['status'], 'stopped')
+                self.assertFalse(old_path.exists())
+                self.assertIsNone(memory.read_owner(root))
+                await running
+                generation = 'c' * 32
+                replacement, canonical = memory.bind_exclusive(root, self.repo_key, generation)
+                try:
+                    self.assertEqual(str(canonical), memory.read_owner(root)['socket'])
+                    self.assertEqual(canonical, memory.platform_support.control_socket_path(root))
+                finally:
+                    replacement.close()
+                    memory.release(root, canonical, generation)
+            finally:
+                service.stop.set()
+                await asyncio.wait_for(running, 4)
+                sock.close()
+
+    async def test_owner_control_path_alias_identifies_the_same_service(self):
+        alias = self.root / 'state-alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        owner = memory.read_owner(self.memroot)
+        owner['socket'] = str(alias / 'memory' / 'control.sock')
+        (self.memroot / 'owner.json').write_text(json.dumps(owner))
+        # The owner can predate a caller that uses the canonical state spelling.
+        # This recreates /var versus /private/var without platform gating.
+        result = await memory.verify_running(self.memroot, self.repo_key)
+        self.assertEqual(result['generation'], self.mem.generation)
 
     async def test_slow_hello_and_status_complete_within_binding_budget(self):
         binding = await self.bind()

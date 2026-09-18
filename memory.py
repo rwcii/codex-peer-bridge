@@ -42,7 +42,7 @@ from database_worker import DatabaseWorker, CapacityError, WorkerFailure
 from service_runtime import Admission, close_writer, drain_handlers, database_status, HANDSHAKE_TIMEOUT
 from peer_transport import LIMIT, credentials, encode, private_dir
 import platform_support
-from peer_transport import control_exchange, NoControlReply, UnsafeServiceEndpoint
+from peer_transport import control_exchange as transport_exchange, service_path, NoControlReply, UnsafeServiceEndpoint
 
 PROTOCOL = 1
 SCHEMA = 4
@@ -1856,6 +1856,12 @@ def owner_is_dead(owner):
         return False
 
 
+async def control_exchange(root, payload, timeout=10):
+    owner = read_owner(root)
+    legacy = owner.get('socket') if owner else None
+    return await transport_exchange(root, payload, timeout=timeout, legacy_socket=legacy)
+
+
 async def request(root, payload, timeout=10):
     try:
         reply, _pid = await control_exchange(Path(root), payload, timeout)
@@ -1902,11 +1908,14 @@ async def verify_running(root, repo):
     # A listener with no ownership record is not evidence of a healthy service; it is
     # evidence that something is listening. Absence must refuse, not accept.
     owner = read_owner(root)
-    control = platform_support.control_socket_path(Path(root))
     if not owner:
         raise MemoryError_('unknown_owner',
                            'a service is listening with no ownership record; stop it explicitly '
                            'before reusing this state directory')
+    try:
+        control = service_path(Path(root), legacy_socket=owner.get('socket'))
+    except UnsafeServiceEndpoint as exc:
+        raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
     if (type(owner.get('pid')) is not int or type(result.get('pid')) is not int or
             owner['pid'] != connected_pid or result['pid'] != connected_pid):
         raise MemoryError_('ownership_mismatch', 'the connected process does not match the recorded service')
@@ -1921,7 +1930,7 @@ async def verify_running(root, repo):
         raise MemoryError_('ownership_mismatch', 'the service has no recorded process-start marker')
     checks = (('repo', owner.get('repo'), repo),
               ('protocol', owner.get('protocol'), PROTOCOL),
-              ('socket', owner.get('socket'), str(control)),
+              ('socket', platform_support.same_control_socket(owner.get('socket'), control), True),
               ('pid', owner.get('pid'), result.get('pid')),
               ('generation', owner.get('generation'), result.get('generation')))
     for field, recorded, expected in checks:
@@ -1943,7 +1952,11 @@ async def verify_running(root, repo):
 
 def bind_exclusive(home, repo, generation):
     """Bind the control socket, recovering only from a provably dead owner."""
-    control = platform_support.control_socket_path(Path(home))
+    try:
+        control = platform_support.control_socket_path(Path(home))
+        platform_support.refuse_legacy_control_conflict(home)
+    except (OSError, RuntimeError) as exc:
+        raise MemoryError_('socket_in_use', str(exc)) from exc
     private_state_dir(control.parent)
     for attempt in (0, 1):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1952,7 +1965,7 @@ def bind_exclusive(home, repo, generation):
         except OSError as exc:
             sock.close()
             owner = read_owner(home)
-            recoverable = (owner and owner.get('socket') == str(control)
+            recoverable = (owner and platform_support.same_control_socket(owner.get('socket'), control)
                            and owner.get('repo') == repo
                            and owner.get('protocol') == PROTOCOL and owner_is_dead(owner))
             if attempt == 0 and recoverable:
@@ -2036,6 +2049,12 @@ def stop_service(home, repo, timeout=20):
     """
     control = platform_support.control_socket_path(Path(home))
     target = read_owner(home)
+    try:
+        control = service_path(Path(home), legacy_socket=target.get('socket') if target else None)
+    except FileNotFoundError:
+        pass
+    except UnsafeServiceEndpoint as exc:
+        raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
     if not target:
         return dict(status='not_running', residue=control.exists())
     if target.get('repo') != repo:
@@ -2077,7 +2096,7 @@ def stop_service(home, repo, timeout=20):
         owner = read_owner(home)
         if not owner or owner.get('generation') != generation:
             return dict(status='stopped', generation=generation)
-        if owner_is_dead(owner) and owner.get('socket') == str(control):
+        if owner_is_dead(owner) and platform_support.same_control_socket(owner.get('socket'), control):
             control.unlink(missing_ok=True)
             (Path(home) / 'owner.json').unlink(missing_ok=True)
             return dict(status='stopped', generation=generation, residue=True, removed=True)

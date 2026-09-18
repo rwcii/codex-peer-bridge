@@ -105,7 +105,7 @@ class UnsafeServiceEndpoint(ValueError):
     """The configured endpoint cannot be validated; it is not an absent service."""
 
 
-def service_path(root):
+def service_path(root, *, legacy_socket=None):
     """Validate the control endpoint derived from an explicitly configured root.
 
     Service roots are filesystem configuration, not peer addresses. They are not
@@ -116,7 +116,28 @@ def service_path(root):
     root = Path(root)
     if not root.is_absolute():
         raise UnsafeServiceEndpoint('service root must be absolute')
-    control = platform_support.control_socket_path(root)
+    try:
+        control = platform_support.control_socket_path(root)
+        legacy = platform_support.legacy_control_socket(root, legacy_socket)
+        candidates = [control, platform_support.fallback_control_socket(root)]
+        if legacy is not None:
+            candidates.append(legacy)
+        present = {}
+        for candidate in candidates:
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                continue
+            present.setdefault(candidate.resolve(), candidate)
+        if len(present) > 1:
+            raise UnsafeServiceEndpoint('multiple service control endpoints exist: ' +
+                                        ', '.join(str(path) for path in present.values()))
+        if present:
+            control = next(iter(present.values()))
+    except UnsafeServiceEndpoint:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise UnsafeServiceEndpoint('service endpoint path cannot be resolved') from exc
     # A client must not create directories while a service is starting. In
     # particular, mkdir(parents=True) can create intermediate state directories
     # with the client umask before the owner applies its private-mode policy.
@@ -144,14 +165,14 @@ class NoControlReply(ValueError):
     """The service closed without a response; a mutation may still have committed."""
 
 
-async def control_exchange(root, payload, timeout=10):
+async def control_exchange(root, payload, timeout=10, *, legacy_socket=None):
     """One bounded control exchange, returning the reply and kernel peer PID.
 
     The timeout covers connection, request writing and response reading. Cleanup
     gets its own one-second allowance, then aborts a stuck transport. No reply is
     not proof of rollback. The caller owns protocol and service identity checks.
     """
-    path = service_path(root)
+    path = service_path(root, legacy_socket=legacy_socket)
     data = encode(payload)
     writer = None
     try:

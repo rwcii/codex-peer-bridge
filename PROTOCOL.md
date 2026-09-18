@@ -373,3 +373,20 @@ No binding operation advances memory consumer cursors. The saved observation mea
 only that the bridge issued a pointer. The planned notifier integration will own
 per-binding subscriptions and finite recovery scans; each recovery scan must reread
 memory to catch advances after the previous remote read. It is not yet implemented.
+
+
+### Private control path aliases
+
+Private service control endpoints use the resolved state directory for both the
+socket-length decision and the fallback digest. All spellings of one state
+therefore select one new endpoint. This rule does not apply to peer messaging
+addresses or registry socket paths, which remain literal for key lookup.
+
+A client can still use an existing legacy direct `control.sock` through the
+original configured state path. A memory client can also use the old spelling
+from its owner record, but only when it resolves to that state's direct socket.
+The deterministic legacy hashed endpoint is also retained as a client route,
+including when a long alias had selected it for a short canonical root. The normal
+private-directory, socket-mode, kernel-PID and service-identity checks still apply. Two distinct old/new endpoints cause a refusal. New bridge and
+memory startup refuses a retained distinct legacy endpoint before database startup;
+it never removes that endpoint or starts a second listener beside it.

@@ -448,3 +448,22 @@ consistent backups before upgrade; rollback means restoring a compatible backup,
 not changing a schema number. An inbox upgrade does not restart memory for you.
 If `memory_upgrade_required` is returned, stop that memory service and start it
 with the new runtime. Missing or unhealthy memory leaves existing bridge state intact.
+
+
+### Upgrading a state directory reached through an alias
+
+New private control sockets use the resolved state path when checking the Unix
+socket path-length limit. Roots without aliases keep their endpoint. A short
+alias to a long directory could have selected a direct socket in an older release;
+a long alias to a short directory could have selected the hashed fallback instead.
+Clients retain both legacy routes; new startup refuses a distinct retained legacy
+endpoint before creating a second listener.
+
+Stop the old service before restarting it with the new code. The new bridge
+client can reach the old endpoint when given the original configured state path.
+Memory clients can also recover its exact old path from the validated owner
+record. An ownerless bridge cannot reconstruct an unknown alias from a long
+canonical path: use its original configured `--state-dir`, or stop its verified
+process through the service manager. Do not remove a socket while its owner is
+alive. If both old and new control endpoints exist, clients refuse the ambiguity;
+inspect their owners before proceeding. No inbox or memory state is reset.

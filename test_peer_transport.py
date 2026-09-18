@@ -3,6 +3,9 @@ import contextlib
 import io
 import json
 import os
+import socket
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -34,10 +37,10 @@ class ControlTransportTests(unittest.IsolatedAsyncioTestCase):
             path.unlink(missing_ok=True)
         self.temp.cleanup()
 
-    async def server(self, response=b'{"ok":true,"result":{}}\n', root=None):
+    async def server(self, response=b'{"ok":true,"result":{}}\n', root=None, path=None):
         root = root or self.root
         transport.private_dir(root)
-        path = platform_support.control_socket_path(root)
+        path = path or platform_support.control_socket_path(root)
         transport.private_dir(path.parent)
         async def handle(reader, writer):
             task = asyncio.current_task()
@@ -61,6 +64,81 @@ class ControlTransportTests(unittest.IsolatedAsyncioTestCase):
         self.paths.append(path)
         path.chmod(0o600)
         return path
+
+    async def test_legacy_alias_endpoint_remains_reachable_and_blocks_new_owner(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temp:
+            base = Path(temp)
+            parent = base / ('deep-' + 'x' * 110)
+            real = parent / 'state'
+            transport.private_dir(real)
+            alias = base / 'alias'
+            alias.symlink_to(parent, target_is_directory=True)
+            old_root = alias / 'state'
+            old_path = old_root / 'control.sock'
+            await self.server(root=real, path=old_path)
+            canonical = platform_support.control_socket_path(real)
+            self.assertNotEqual(old_path.resolve(), canonical.resolve())
+            self.assertEqual(transport.service_path(old_root), old_path)
+            reply, pid = await transport.control_exchange(old_root, dict(op='status'))
+            self.assertTrue(reply['ok'])
+            self.assertEqual(pid, os.getpid())
+            (real / 'owner.json').write_text(json.dumps(dict(socket=str(old_path))))
+            reply = await memory.request(real, dict(op='status'))
+            self.assertTrue(reply['ok'])
+            service = bridge.Bridge(real)
+            with self.assertRaises(bridge.BridgeOwnershipError):
+                await service.run()
+            self.assertIsNone(service.worker)
+            self.assertFalse((real / 'inbox.sqlite3').exists())
+            with self.assertRaises(memory.MemoryError_) as caught:
+                memory.bind_exclusive(real, 'a' * 16, 'b' * 32)
+            self.assertEqual(caught.exception.code, 'socket_in_use')
+            # Two plausible endpoints must be refused, never selected by luck.
+            await self.server(root=real)
+            with self.assertRaises(transport.UnsafeServiceEndpoint) as caught:
+                transport.service_path(old_root)
+            self.assertIn(str(old_path), str(caught.exception))
+            self.assertIn(str(canonical), str(caught.exception))
+            with self.assertRaises(memory.MemoryError_) as caught:
+                await memory.request(real, dict(op='status'))
+            self.assertEqual(caught.exception.code, 'unsafe_service_endpoint')
+
+    async def test_stale_legacy_fallback_refuses_startup_before_database_creation(self):
+        fallback = platform_support.fallback_control_socket(self.root)
+        transport.private_dir(fallback.parent)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            stale.bind(str(fallback))
+        finally:
+            stale.close()
+        self.paths.append(fallback)
+        service = bridge.Bridge(self.root)
+        with self.assertRaises(bridge.BridgeOwnershipError) as caught:
+            await service.run()
+        self.assertIn(str(fallback), str(caught.exception))
+        self.assertIsNone(service.worker)
+        self.assertFalse((self.root / 'inbox.sqlite3').exists())
+        self.assertTrue(fallback.exists())
+        with self.assertRaises(memory.MemoryError_) as caught:
+            memory.bind_exclusive(self.root, 'a' * 16, 'b' * 32)
+        self.assertEqual(caught.exception.code, 'socket_in_use')
+        self.assertIn(str(fallback), str(caught.exception))
+        self.assertEqual(memory.memory_error_exit_status(caught.exception.code), 78)
+        result = await asyncio.to_thread(subprocess.run,
+            [sys.executable, str(Path(bridge.__file__)), '--state-dir', str(self.root), 'serve'],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 78, result.stderr)
+        diagnostic = json.loads(result.stdout)
+        self.assertEqual(diagnostic['code'], 'endpoint_unavailable')
+        self.assertIn(str(fallback), diagnostic['error'])
+
+    async def test_legacy_owner_path_cannot_redirect_to_another_service(self):
+        await self.server()
+        other = self.root / 'other'
+        other_path = await self.server(root=other, response=b'{"ok":true,"result":"other"}\n')
+        (self.root / 'owner.json').write_text(json.dumps(dict(socket=str(other_path))))
+        reply = await memory.request(self.root, dict(op='status'))
+        self.assertEqual(reply['result'], {})
 
     async def test_control_fallback_is_usable_as_service_but_never_as_message(self):
         root = self.root/('long-root-'+'x'*120)
