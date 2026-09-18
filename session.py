@@ -232,7 +232,12 @@ def main():
     model=a.model or (dsh_delivery.default_model() if agent=='deepseek' else None)
     state,name,key=details(prefix,config,a.thread,repo,agent,model)
     private_dir(state)
-    with (state/'registration.lock').open('a') as lock:
+    # Lock order: lifecycle, registration, then names (in save_registration).
+    # Lifecycle protects start/stop/rename; registration protects saved identity.
+    # `run` must skip lifecycle: ensure holds it while waiting for the supervisor.
+    with (state/'lifecycle.lock').open('a') as lifecycle, (state/'registration.lock').open('a') as lock:
+        if a.action != 'run':
+            fcntl.flock(lifecycle,fcntl.LOCK_EX)
         fcntl.flock(lock,fcntl.LOCK_EX)
         registration=state/'session.json'
         if registration.exists():
@@ -310,6 +315,10 @@ def main():
                 target=unit_dir/filename
                 check_owned_unit(target)
                 target.write_text(content)
+            # `run` needs this lock before it can start either child. Keep the
+            # lifecycle lock until both children are ready, so another ensure,
+            # stop, or rename cannot change this session during startup.
+            fcntl.flock(lock,fcntl.LOCK_UN)
             subprocess.run(['systemctl','--user','daemon-reload'],check=True)
             # Per-conversation services start now, not at every login forever.
             subprocess.run(['systemctl','--user','start',*rendered],check=True)
@@ -319,7 +328,7 @@ def main():
                     return
                 time.sleep(.1)
             raise RuntimeError('service started but bridge is not ready; inspect its journal')
-    # Release the short registration lock before entering the long-lived supervisor.
+    # Release registration before taking supervisor.lock. `run` never holds lifecycle.
     if a.action=='run':
         supervisor(prefix,config,state,a.thread,repo,name,agent,model)
 

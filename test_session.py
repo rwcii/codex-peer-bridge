@@ -1,4 +1,5 @@
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -7,6 +8,7 @@ import tempfile
 import time
 import unittest
 import session
+from contextlib import redirect_stdout
 from unittest.mock import patch
 from scripts.install import units
 
@@ -113,3 +115,169 @@ class SessionTests(unittest.TestCase):
                 for process in processes:
                     process.communicate(timeout=25)
             self.assertEqual(list((root/'claude/sessions').glob('*.json')),[])
+
+
+class SystemdStartupTests(unittest.TestCase):
+    """Use a fake service manager and real, isolated session processes."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.app = self.root/'app'
+        self.env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.root/'claude'))
+        subprocess.run([sys.executable, 'scripts/install.py', '--configure-codex', '--no-start',
+                        '--codex', sys.executable, '--prefix', str(self.app),
+                        '--state-dir', str(self.root/'state'),
+                        '--unit-dir', str(self.root/'units'),
+                        '--codex-home', str(self.root/'codex')],
+                       check=True, capture_output=True, env=self.env)
+        # A competing command must never reach the host's service manager.
+        binaries = self.root/'bin'
+        binaries.mkdir()
+        stub = binaries/'systemctl'
+        stub.write_text(f'#!{sys.executable}\nraise SystemExit(1)\n')
+        stub.chmod(0o700)
+        self.env['PATH'] = str(binaries)+os.pathsep+os.environ.get('PATH', '')
+        self.config = session.read_config(self.app)
+        self.thread = 'startup-test-thread'
+        self.repo = str(self.root/'project')
+        self.state, _, _ = session.details(self.app, self.config, self.thread, self.repo)
+        self.processes = []
+        self.starts = 0
+        self.addCleanup(self.stop_processes)
+
+    def stop_processes(self):
+        for process in reversed(self.processes):
+            if process.poll() is None:
+                process.terminate()
+        for process in reversed(self.processes):
+            try:
+                process.communicate(timeout=25)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+
+    def spawn(self, command):
+        process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        self.processes.append(process)
+        return process
+
+    def start_session(self, before_start=None):
+        real_run = subprocess.run
+
+        def service_manager(command, *args, **kwargs):
+            if command[0] != 'systemctl':
+                return real_run(command, *args, **kwargs)
+            self.assertEqual(command[:2], ['systemctl', '--user'])
+            operation = command[2]
+            self.assertIn(operation, ('show-environment', 'daemon-reload', 'start'))
+            if operation == 'start':
+                self.starts += 1
+                if before_start:
+                    before_start()
+                # Read the actual rendered unit, as a service manager would.
+                import shlex
+                unit = (self.root/'units'/command[3]).read_text()
+                execution = next(line.removeprefix('ExecStart=') for line in unit.splitlines()
+                                 if line.startswith('ExecStart='))
+                self.spawn(shlex.split(execution))
+            return subprocess.CompletedProcess(command, 0)
+
+        output = io.StringIO()
+        arguments = [str(self.app/'session.py'), 'ensure', '--agent', 'codex',
+                     '--thread', self.thread, '--repo', self.repo]
+        with patch('session.__file__', str(self.app/'session.py')), \
+                patch.object(sys, 'argv', arguments), \
+                patch.dict(os.environ, self.env), \
+                patch('session.subprocess.run', side_effect=service_manager), \
+                redirect_stdout(output):
+            session.main()
+        result = json.loads(output.getvalue())
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(self.starts, 1)
+        return result
+
+    def competing_command(self, action):
+        attempted = self.root/'lock-attempted'
+        # Signal the real lock attempt, so the race test does not depend on
+        # guessing how long a second Python interpreter takes to start.
+        command = '''
+import fcntl
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+import session
+attempted = Path(sys.argv[2])
+original = fcntl.flock
+def observed(lock, operation):
+    if operation == fcntl.LOCK_EX and Path(lock.name).name in ('lifecycle.lock', 'registration.lock'):
+        attempted.touch()
+    return original(lock, operation)
+fcntl.flock = observed
+sys.argv = ['session.py', *sys.argv[3:]]
+session.main()
+'''
+        process = self.spawn([sys.executable, '-c', command, str(self.app), str(attempted),
+                              action, '--agent', 'codex', '--thread', self.thread,
+                              '--repo', str(self.root/'renamed-project')])
+        deadline = time.monotonic()+5
+        while not attempted.exists():
+            if process.poll() is not None:
+                self.fail(f'competing command exited before its lock attempt: {process.communicate()}')
+            if time.monotonic() >= deadline:
+                self.fail('competing command did not attempt a session lock')
+            time.sleep(.01)
+        # There is no supervisor yet. Stop/rename must not act in this gap,
+        # and another ensure must wait rather than report manual_required.
+        with self.assertRaises(subprocess.TimeoutExpired):
+            process.communicate(timeout=.2)
+        return process
+
+    def test_initial_systemd_ensure_starts_both_children(self):
+        self.start_session()
+        bridge = session.bridge_status(self.app, self.state)
+        self.assertIsNotNone(bridge)
+        self.assertTrue(session.notifier_ready(self.state, bridge))
+
+    def test_same_thread_ensure_waits_and_reuses_the_started_session(self):
+        competing = []
+        self.start_session(lambda: competing.append(self.competing_command('ensure')))
+        stdout, stderr = competing[0].communicate(timeout=15)
+        self.assertEqual(competing[0].returncode, 0, stderr)
+        result = json.loads(stdout)
+        self.assertEqual(result['status'], 'running')
+        bridge = session.bridge_status(self.app, self.state)
+        self.assertEqual(result['bridge']['pid'], bridge['pid'])
+        self.assertEqual(json.loads((self.state/'session.json').read_text())['repo'], self.repo)
+
+    def test_stop_waits_for_start_then_stops_the_session(self):
+        competing = []
+        self.start_session(lambda: competing.append(self.competing_command('stop')))
+        _, stderr = competing[0].communicate(timeout=15)
+        self.assertEqual(competing[0].returncode, 0, stderr)
+        self.assertIsNone(session.bridge_status(self.app, self.state))
+
+    def test_rename_waits_for_start_then_refuses_a_live_session(self):
+        competing = []
+        self.start_session(lambda: competing.append(self.competing_command('rename')))
+        _, stderr = competing[0].communicate(timeout=15)
+        self.assertNotEqual(competing[0].returncode, 0)
+        self.assertIn('stop this thread before explicitly renaming it', stderr)
+        self.assertEqual(json.loads((self.state/'session.json').read_text())['repo'], self.repo)
+        bridge = session.bridge_status(self.app, self.state)
+        self.assertTrue(session.notifier_ready(self.state, bridge))
+
+    def test_other_thread_registration_does_not_wait_for_this_start(self):
+        def register_other_thread():
+            process = self.spawn([sys.executable, str(self.app/'session.py'), 'ensure',
+                                  '--agent', 'codex', '--thread', 'other-startup-thread',
+                                  '--repo', self.repo])
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            result = json.loads(stdout)
+            self.assertEqual(result['status'], 'manual_required')
+            self.assertNotEqual(result['state_dir'], str(self.state))
+
+        self.start_session(register_other_thread)

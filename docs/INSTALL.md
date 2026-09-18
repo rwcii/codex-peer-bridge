@@ -155,6 +155,12 @@ supervisor owns both bridge and notifier. It reports healthy only after both are
 a child failure fails the supervisor so systemd can restart the pair. Per-conversation
 units start on registration, not at every subsequent login. No lingering is enabled.
 
+Only one `ensure`, `stop`, or `rename` command can operate on a session at a time.
+The supervisor can read its registration while `ensure` waits for both children.
+Commands for other sessions use separate locks.
+Manual `run` commands do not take the lifecycle lock. Wait for a manual start to
+report `running` before using `stop` or `rename`.
+
 Without a user manager, `ensure` returns `manual_required` and an exact `start_command`.
 The agent runs that command in a persistent managed shell session or terminal. The
 supervisor keeps both processes together. Do not use an ordinary background command if
@@ -212,6 +218,8 @@ Stop this installation's registered sessions before upgrading runtime code, then
 `--configure-codex` with the same paths. Existing state and instructions are preserved;
 rerun `ensure` in active conversations afterward. Configure a distinct state root when
 you intend an independent installation. Never silently reset a checkpoint.
+Do not run session commands from an older runtime during an upgrade. Older commands
+do not use the lifecycle lock that protects session startup.
 
 For the peer-message guidance update, an operator may stage the compatible runtime
 files and replace each file atomically, installing `peer_guidance.py` before its

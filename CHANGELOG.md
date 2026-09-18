@@ -28,6 +28,10 @@ into a dated release section when promoted to `main`.
 
 ### Fixed
 
+- Session registration releases its registration lock before starting the systemd
+  supervisor. This prevents a false readiness timeout. Concurrent lifecycle commands
+  for the same session remain serialized.
+
 - Repository setup requires the six OS/Python matrix checks, replacing obsolete
   Python-only names that left pull requests waiting for nonexistent jobs.
 
@@ -51,6 +55,8 @@ into a dated release section when promoted to `main`.
   now reports it.
 
 ### Changed
+
+- Git ignores local `_handoff/` directories to keep handoff content out of commits.
 
 - Notice delivery is dispatched per participant. The Codex path, including generated
   systemd units and the manual start command, is unchanged.
