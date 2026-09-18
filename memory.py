@@ -37,6 +37,8 @@ import subprocess
 import time
 import uuid
 
+from database_worker import DatabaseWorker, CapacityError, WorkerFailure
+from service_runtime import Admission, close_writer, drain_handlers, database_status, HANDSHAKE_TIMEOUT
 from peer_transport import LIMIT, credentials, encode, private_dir
 import platform_support
 from peer_transport import control_exchange, NoControlReply, UnsafeServiceEndpoint
@@ -692,7 +694,7 @@ class Store:
                                'was left untouched') from exc
         if rows.get('repo') != repo:
             raise MemoryError_('wrong_repository',
-                               'state directory belongs to another repository; it was left '
+                                       'state directory belongs to another repository; it was left '
                                'untouched')
         for key, current in (('schema', SCHEMA), ('protocol', PROTOCOL)):
             found = int(rows.get(key) or 0)
@@ -1320,54 +1322,26 @@ def freeze(store, consumer):
     return sid
 
 
-class Service:
-    def __init__(self, root, repo, store):
+def stop_result(r, repo, generation):
+    """Validate the exact instance at the point of action, without database access."""
+    if r.get('repo') != repo:
+        raise MemoryError_('wrong_repository',
+                           'this service serves another repository')
+    if r.get('generation') != generation:
+        raise MemoryError_('not_this_instance',
+                           'this endpoint is served by a different instance than the one '
+                           'you asked to stop; it is still running')
+    return dict(stopping=True, generation=generation)
+
+
+class MemoryCommands:
+    """Synchronous protocol operations owned by the database thread."""
+    def __init__(self, root, repo, store, generation=None):
         self.root, self.repo, self.store = Path(root), repo, store
-        self.stop = asyncio.Event()
-        self.generation = uuid.uuid4().hex
-        self.active = 0
-        self.tasks = set()
-        self.idle = asyncio.Event()
-        self.idle.set()
+        self.generation = generation or uuid.uuid4().hex
 
-    # --- connection handling --------------------------------------------------
-
-    async def handle(self, reader, writer):
-        if self.active >= 16:
-            writer.close()
-            return
-        self.active += 1
-        self.idle.clear()
-        task = asyncio.current_task()
-        self.tasks.add(task)
-        try:
-            pid = credentials(writer.get_extra_info('socket'))
-            async with asyncio.timeout(10):
-                request = json.loads(await reader.readline())
-                reply = dict(ok=True, result=self.command(request, pid))
-                if CRASH_AFTER_COMMIT and request.get('op') == 'note':
-                    os._exit(70)
-                if REPLY_DELAY and request.get('op') == 'note':
-                    await asyncio.sleep(REPLY_DELAY)
-        except MemoryError_ as exc:
-            reply = dict(ok=False, code=exc.code, error=str(exc))
-        except (ValueError, KeyError, TypeError, OSError, TimeoutError, sqlite3.Error) as exc:
-            reply = dict(ok=False, code='rejected', error=type(exc).__name__)
-        try:
-            writer.write(encode(reply))
-            await asyncio.wait_for(writer.drain(), 10)
-        except (OSError, ValueError, TimeoutError, asyncio.TimeoutError):
-            pass
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
-            self.tasks.discard(task)
-            self.active -= 1
-            if not self.active:
-                self.idle.set()
+    def close(self):
+        self.store.close()
 
     def consumer(self, r):
         """Stable consumer identity, supplied by the caller, never trusted as authority.
@@ -1413,19 +1387,7 @@ class Service:
         if op == 'status':
             return self.status(r)
         if op == 'stop':
-            # Validate the target here, at the point of action. Deciding which instance
-            # to stop from a record read beforehand is a race: a successor can replace
-            # the endpoint between that read and this connection, and an unqualified
-            # request would then stop the wrong service.
-            if r.get('repo') != self.repo:
-                raise MemoryError_('wrong_repository',
-                                   'this service serves another repository')
-            if r.get('generation') != self.generation:
-                raise MemoryError_('not_this_instance',
-                                   'this endpoint is served by a different instance than the one '
-                                   'you asked to stop; it is still running')
-            self.stop.set()
-            return dict(stopping=True, generation=self.generation)
+            return stop_result(r, self.repo, self.generation)
         raise MemoryError_('invalid_request', f'unknown operation: {op}')
 
     # --- protocol state -------------------------------------------------------
@@ -1672,31 +1634,116 @@ class Service:
                     consumers=consumers, more=more,
                     next_after=consumers[-1]['consumer'] if consumers and more else None)
 
-    async def run(self, sock):
-        server = await asyncio.start_unix_server(self.handle, sock=sock, limit=LIMIT)
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, self.stop.set)
-            except (NotImplementedError, ValueError):
-                pass
-        print(json.dumps(self.status()), flush=True)
+
+
+class Service:
+    """Socket controller; all SQLite work belongs to the dedicated worker."""
+    def __init__(self, root, repo, store_factory):
+        self.root, self.repo = Path(root), repo
+        self.generation = uuid.uuid4().hex
+        self.stop = asyncio.Event()
+        self.tasks = set()
+        self.closing = False
+        self.admission = Admission()
+        self.worker = DatabaseWorker(
+            lambda: MemoryCommands(root, repo, store_factory(), self.generation))
+
+    async def command(self, request, pid):
+        if not isinstance(request, dict) or not isinstance(request.get('op'), str):
+            raise MemoryError_('invalid_request', 'expected an operation object')
+        if request['op'] == 'stop':
+            result = stop_result(request, self.repo, self.generation)
+            self.stop.set()
+            return result
+        if request['op'] == 'status':
+            result, diagnostics = await database_status(self.worker, request, pid)
+            if result is None:
+                result = dict(repo=self.repo, protocol=PROTOCOL, schema=SCHEMA,
+                              generation=self.generation, healthy=False)
+            result.update(diagnostics)
+        else:
+            result = await self.worker.call('command', request, pid)
+        if request['op'] in ('hello', 'status'):
+            fault = (result['database_observed_fault'] if request['op'] == 'status'
+                     else self.worker.fault)
+            if request['op'] == 'hello':
+                result['database_observed_fault'] = fault
+            if fault:
+                result['healthy'] = False
+        return result
+
+    async def handle(self, reader, writer):
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        slot = None
         try:
+            try:
+                if self.closing:
+                    raise MemoryError_('stopping', 'service is stopping')
+                slot = self.admission.enter('handshake')
+                pid = credentials(writer.get_extra_info('socket'))
+                async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+                    request = json.loads(await reader.readline())
+                if not isinstance(request, dict):
+                    raise MemoryError_('invalid_request', 'expected an operation object')
+                async with asyncio.timeout(10):
+                    self.admission.leave(slot)
+                    slot = None
+                    slot = self.admission.enter('control' if request.get('op') in ('status', 'stop') else 'ordinary')
+                    reply = dict(ok=True, result=await self.command(request, pid))
+                    if CRASH_AFTER_COMMIT and request.get('op') == 'note':
+                        os._exit(70)
+                    if REPLY_DELAY and request.get('op') == 'note':
+                        await asyncio.sleep(REPLY_DELAY)
+            except MemoryError_ as exc:
+                reply = dict(ok=False, code=exc.code, error=str(exc))
+            except CapacityError:
+                reply = dict(ok=False, code='capacity', error='service request capacity reached')
+            except WorkerFailure as exc:
+                reply = dict(ok=False, code=exc.code, error='database operation failed')
+            except (ValueError, OSError, TimeoutError) as exc:
+                reply = dict(ok=False, code='rejected', error=type(exc).__name__)
+            except Exception:
+                reply = dict(ok=False, code='internal_error', error='service operation failed')
+            try:
+                writer.write(encode(reply))
+                await asyncio.wait_for(writer.drain(), 10)
+            except (OSError, ValueError, TimeoutError):
+                pass
+        finally:
+            try:
+                await close_writer(writer)
+            finally:
+                if slot is not None:
+                    self.admission.leave(slot)
+                self.tasks.discard(task)
+
+    async def run(self, sock):
+        server = None
+        try:
+            # Initialization completed in the worker before the socket was bound.
+            status = await self.command(dict(op='status'), os.getpid())
+            server = await asyncio.start_unix_server(self.handle, sock=sock, limit=LIMIT)
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, self.stop.set)
+                except (NotImplementedError, ValueError):
+                    pass
+            print(json.dumps(status), flush=True)
             await self.stop.wait()
         finally:
-            server.close()
-            await server.wait_closed()
-            # Drain in flight work before the database goes away, so a request that was
-            # accepted is never answered from a closed store. A timeout alone is not
-            # enough: a handler still running when the store closed would fail on a
-            # dead connection, so anything left is cancelled and joined first.
+            self.closing = True
+            if server is not None:
+                server.close()
             try:
-                await asyncio.wait_for(self.idle.wait(), 10)
-            except (asyncio.TimeoutError, TimeoutError):
-                for task in list(self.tasks):
-                    task.cancel()
-                await asyncio.gather(*list(self.tasks), return_exceptions=True)
-            self.store.close()
+                await drain_handlers(self.tasks)
+            finally:
+                try:
+                    await self.worker.close()
+                finally:
+                    if server is not None:
+                        await server.wait_closed()
 
 
 def write_owner(home, sock_path, generation, repo):
@@ -1855,12 +1902,11 @@ def start(home, repo, store_factory):
         existing = asyncio.run(verify_running(home, repo))
         if existing:
             return None, existing
-        store = store_factory()
-        service = Service(home, repo, store)
+        service = Service(home, repo, store_factory)
         try:
             sock, control = bind_exclusive(home, repo, service.generation)
         except BaseException:
-            store.close()
+            service.worker.close_sync()
             raise
         return (service, sock, control), None
 
@@ -1917,7 +1963,7 @@ def stop_service(home, repo, timeout=20):
         return dict(status='not_running', residue=control.exists())
     if target.get('repo') != repo:
         raise MemoryError_('wrong_repository',
-                           'the recorded owner serves another repository; refusing to stop it')
+                                   'the recorded owner serves another repository; refusing to stop it')
     generation = target.get('generation')
     try:
         reply = asyncio.run(request(home, dict(op='stop', repo=repo, generation=generation),

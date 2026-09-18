@@ -219,6 +219,15 @@ idempotency keys and idle consumers each have a lifetime, and expiry returns a d
 result rather than changing a caller's meaning silently. There is no bus integration and no
 compaction in this form; entries are removed only once expired.
 
+Bridge and memory database operations use dedicated worker threads with bounded queues.
+Status and stop have separate admission capacity when ordinary requests fill their slots.
+Incomplete control frames have a separate bounded pool and a two-second deadline; a full
+pool can refuse any operation until a slot becomes available. Status returns known process
+and queue information after one second if the database cannot answer, with database values
+marked unknown. An accepted write can still commit after its caller disconnects or times out. Shutdown
+waits for those writes before closing the database. `database_observed_fault` records observed
+storage or programming failures until restart; it is not an integrity check.
+
 See [the design contract](docs/PARITY-MEMORY-DESIGN.md) for the requirements this implements and
 for the capabilities that remain unverified.
 

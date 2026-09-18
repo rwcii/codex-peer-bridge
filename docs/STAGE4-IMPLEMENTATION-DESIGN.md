@@ -117,8 +117,10 @@ Before code: close participant namespace derivation, exact wire fields, queue/co
 ## Concrete gate decisions (review draft)
 
 These decisions apply to new stage 4 behavior. Existing peer envelopes and memory sync,
-acknowledgement, and snapshot formats remain unchanged. Transport-helper extraction and the participant ownership boundary are implemented;
-subscriptions, pointers, worker ownership, notification journal and health remain pending.
+acknowledgement, and snapshot formats remain unchanged. Transport-helper extraction,
+the participant ownership boundary, endpoint-role separation and bridge/memory worker
+ownership are implemented on this feature branch. Subscriptions, pointers, the notifier
+journal and its delivery-health reporting remain pending. This branch is not deployed.
 
 ### Participant identity and lock scope
 
@@ -190,9 +192,18 @@ backoff is 1, 2, 4, 8, 16, then 30 seconds; a durable rescan occurs every 2 seco
 with an open subscription. Each reconnect subscribes before rechecking durable state.
 All time values are policies, not bounds on disk latency or model response time.
 
+Ordinary control frames have a separate two-second read deadline and eight pending
+slots. An unclassified full pool can refuse any operation until expiry; established
+ordinary/subscription handlers do not retain those slots. Status waits one second for
+a database read, then returns known identity and queue diagnostics with database fields
+unknown. Historical worker faults persist until restart and are distinct from the
+notifier delivery-health recovery rules.
+
 Worker admission: 16 queued operations plus one running operation per owning worker.
-Status and stop have a separate allowance of two operations and priority over queued
-ordinary work; neither interrupts the running transaction. Excess work is refused with
+Status has a separate allowance of two queued operations and priority over queued
+ordinary work. Status and stop share two reserved handler slots; stop validates its
+instance and signals shutdown on the event loop without database admission. Neither
+interrupts the running transaction. Excess work is refused with
 `capacity`, not placed on an unbounded executor queue. No DB connection crosses workers.
 
 Bindings: 16 per bridge, with one pointer slot per binding. Ordinary rows retain the

@@ -13,6 +13,8 @@ import subprocess
 import time
 import uuid
 
+from database_worker import DatabaseWorker, CapacityError, WorkerFailure
+from service_runtime import Admission, close_writer, drain_handlers, database_status, HANDSHAKE_TIMEOUT
 from peer_guidance import PEER_GUIDANCE
 import platform_support
 
@@ -54,14 +56,66 @@ def peers():
     return found
 
 
+class InboxStore:
+    def __init__(self, root):
+        self.db = sqlite3.connect(root / 'inbox.sqlite3')
+        try:
+            self.db.execute('CREATE TABLE IF NOT EXISTS inbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, received REAL, pid INTEGER, frame TEXT)')
+        except BaseException:
+            self.db.close()
+            raise
+
+    def close(self):
+        self.db.close()
+
+    def store(self, pid, frame):
+        if not isinstance(frame, dict):
+            raise ValueError('expected object')
+        if len(encode(frame)) > 65536:
+            raise ValueError('inbox message exceeds 64 KiB')
+        kind = frame.get('type')
+        if kind == 'user':
+            msg = frame.get('message')
+            if not isinstance(msg, dict) or not isinstance(msg.get('content'), str) or not msg['content'].strip():
+                raise ValueError('invalid user message')
+        elif kind != 'control':
+            raise ValueError('unsupported frame')
+        # Store controls as inert data; never execute rename or any other action.
+        if self.db.execute('SELECT count(*) FROM inbox').fetchone()[0] >= 1000:
+            raise ValueError('inbox full; acknowledge older entries')
+        with self.db:
+            self.db.execute('INSERT INTO inbox(received,pid,frame) VALUES(?,?,?)', (time.time(), pid, json.dumps(frame)))
+
+    def command(self, r):
+        op = r['op']
+        if op == 'status':
+            return self.db.execute('SELECT count(*) FROM inbox').fetchone()[0]
+        if op == 'inbox':
+            rows = self.db.execute('SELECT seq,received,pid,frame FROM inbox WHERE seq>? ORDER BY seq LIMIT 10', (int(r.get('after', 0)),)).fetchall()
+            entries = []
+            for seq, received, pid, frame in rows:
+                item = dict(seq=seq, received=received, peer_pid=pid,
+                            guidance=PEER_GUIDANCE, frame=json.loads(frame))
+                if len(encode(entries)) + len(encode(item)) > LIMIT - 1000:
+                    break
+                entries.append(item)
+            return entries
+        if op == 'ack':
+            with self.db:
+                self.db.execute('DELETE FROM inbox WHERE seq<=?', (int(r['through']),))
+            return 'acknowledged locally'
+        raise ValueError('unknown database operation')
+
+
 class Bridge:
     def __init__(self, root):
         self.root = root
         self.address = f'uds:/tmp/cc-socks/{os.getpid()}.sock'
         self.stop = asyncio.Event()
-        self.db = sqlite3.connect(root / 'inbox.sqlite3')
-        self.db.execute('CREATE TABLE IF NOT EXISTS inbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, received REAL, pid INTEGER, frame TEXT)')
-        self.active = 0
+        self.worker = DatabaseWorker(lambda: InboxStore(root))
+        self.admission = Admission()
+        self.tasks = set()
+        self.closing = False
 
     async def send(self, address, message, priority='next'):
         if not isinstance(message, str) or not message.strip():
@@ -89,34 +143,28 @@ class Bridge:
             await writer.wait_closed()
         return dict(msg_id=frame['msg_id'], status='transport_complete', peer_pid=pid)
 
-    def store(self, pid, frame):
-        if not isinstance(frame, dict):
-            raise ValueError('expected object')
-        if len(encode(frame)) > 65536:
-            raise ValueError('inbox message exceeds 64 KiB')
-        kind = frame.get('type')
-        if kind == 'user':
-            msg = frame.get('message')
-            if not isinstance(msg, dict) or not isinstance(msg.get('content'), str) or not msg['content'].strip():
-                raise ValueError('invalid user message')
-        elif kind != 'control':
-            raise ValueError('unsupported frame')
-        # Store controls as inert data; never execute rename or any other action.
-        if self.db.execute('SELECT count(*) FROM inbox').fetchone()[0] >= 1000:
-            raise ValueError('inbox full; acknowledge older entries')
-        self.db.execute('INSERT INTO inbox(received,pid,frame) VALUES(?,?,?)', (time.time(), pid, json.dumps(frame)))
-        self.db.commit()
+    async def store(self, pid, frame):
+        return await self.worker.call('store', pid, frame)
 
     async def handle(self, reader, writer, control=False):
-        if self.active >= 16:
-            writer.close()
-            return
-        self.active += 1
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        slot = None
         try:
+            if self.closing:
+                raise CapacityError('service is stopping')
+            slot = self.admission.enter('handshake' if control else 'ordinary')
             pid = credentials(writer.get_extra_info('socket'))
+            if control:
+                async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+                    request = json.loads(await reader.readline())
             async with asyncio.timeout(6):
                 if control:
-                    request = json.loads(await reader.readline())
+                    if not isinstance(request, dict):
+                        raise ValueError('expected operation object')
+                    self.admission.leave(slot)
+                    slot = None
+                    slot = self.admission.enter('control' if request.get('op') in ('status', 'stop') else 'ordinary')
                     result = await self.command(request)
                     writer.write(encode(dict(ok=True, result=result)))
                     await writer.drain()
@@ -127,60 +175,66 @@ class Bridge:
                             break
                         if len(line) > LIMIT:
                             raise ValueError('frame too large')
-                        frame = json.loads(line)
-                        # Same-UID kernel peer credentials are our authentication policy.
-                        # No key is published, so an auth prelude is neither needed nor accepted.
-                        self.store(pid, frame)
-        except (ValueError, KeyError, TypeError, OSError, TimeoutError, AttributeError, sqlite3.Error) as exc:
+                        # Same-UID credentials are the peer authentication policy.
+                        await self.store(pid, json.loads(line))
+        except Exception as exc:
+            if isinstance(exc, CapacityError):
+                code = 'capacity'
+            elif isinstance(exc, WorkerFailure):
+                code = exc.code
+            elif isinstance(exc, (ValueError, OSError, TimeoutError)):
+                code = 'rejected'
+            else:
+                code = 'internal_error'
             if control:
-                writer.write(encode(dict(ok=False, error=type(exc).__name__)))
                 try:
-                    await writer.drain()
-                except OSError:
+                    writer.write(encode(dict(ok=False, code=code, error=type(exc).__name__)))
+                    await asyncio.wait_for(writer.drain(), 1)
+                except (OSError, TimeoutError):
                     pass
             else:
-                print(f'rejected peer input: {type(exc).__name__}', flush=True)
+                print(f'peer request failed: {code}', flush=True)
         finally:
-            writer.close()
             try:
-                await writer.wait_closed()
-            except OSError:
-                pass
-            self.active -= 1
+                await close_writer(writer)
+            finally:
+                if slot is not None:
+                    self.admission.leave(slot)
+                self.tasks.discard(task)
 
     async def command(self, r):
+        if not isinstance(r, dict) or not isinstance(r.get('op'), str):
+            raise ValueError('expected operation object')
         op = r['op']
         if op == 'status':
-            return dict(pid=os.getpid(), address=self.address, inbox_count=self.db.execute('SELECT count(*) FROM inbox').fetchone()[0], delivery='inbox available; run notify.py to notify the selected participant session')
+            count, diagnostics = await database_status(self.worker, r)
+            return dict(pid=os.getpid(), address=self.address, inbox_count=count,
+                        **diagnostics,
+                        delivery='inbox available; run notify.py to notify the selected participant session')
         if op == 'send':
-            return await self.send(r['to'], r['message'], r.get('priority', 'next'))
-        if op == 'inbox':
-            rows = self.db.execute('SELECT seq,received,pid,frame FROM inbox WHERE seq>? ORDER BY seq LIMIT 10', (int(r.get('after', 0)),)).fetchall()
-            entries = []
-            for seq, received, pid, frame in rows:
-                item = dict(seq=seq, received=received, peer_pid=pid,
-                            guidance=PEER_GUIDANCE, frame=json.loads(frame))
-                if len(encode(entries)) + len(encode(item)) > LIMIT - 1000:
-                    break
-                entries.append(item)
-            return entries
-        if op == 'ack':
-            self.db.execute('DELETE FROM inbox WHERE seq<=?', (int(r['through']),))
-            self.db.commit()
-            return 'acknowledged locally'
+            return await self.send(r.get('to'), r.get('message'), r.get('priority', 'next'))
+        if op in ('inbox', 'ack'):
+            if op == 'ack' and 'through' not in r:
+                raise ValueError('through is required')
+            key = 'after' if op == 'inbox' else 'through'
+            try:
+                request = dict(r, **{key: int(r.get(key, 0))})
+            except (ValueError, TypeError):
+                raise ValueError(f'{key} must be an integer') from None
+            return await self.worker.call('command', request)
         if op == 'stop':
             self.stop.set()
             return 'stopping'
         raise ValueError('unknown operation')
 
     async def run(self):
-        private_dir(Path('/tmp/cc-socks'))
-        peer = Path(self.address[4:])
-        control = platform_support.control_socket_path(self.root)
-        private_dir(control.parent)
-        # Bind exclusively. Never remove a pre-existing process socket.
-        sockets = []
+        sockets, servers = [], []
         try:
+            private_dir(Path('/tmp/cc-socks'))
+            peer = Path(self.address[4:])
+            control = platform_support.control_socket_path(self.root)
+            private_dir(control.parent)
+            # Bind exclusively. Never remove a pre-existing process socket.
             for path, is_control in [(peer, False), (control, True)]:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
@@ -203,21 +257,28 @@ class Bridge:
                 sock.listen(16)
                 sock.setblocking(False)
                 os.chmod(path, 0o600)
-            servers = [await asyncio.start_unix_server(lambda r,w: self.handle(r,w), sock=sockets[0][0], limit=LIMIT),
-                       await asyncio.start_unix_server(lambda r,w: self.handle(r,w,True), sock=sockets[1][0], limit=LIMIT)]
+            servers.append(await asyncio.start_unix_server(self.handle, sock=sockets[0][0], limit=LIMIT))
+            servers.append(await asyncio.start_unix_server(lambda r,w: self.handle(r,w,True), sock=sockets[1][0], limit=LIMIT))
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, self.stop.set)
             print(json.dumps(await self.command({'op':'status'})), flush=True)
             await self.stop.wait()
+        finally:
+            self.closing = True
             for server in servers:
                 server.close()
-                await server.wait_closed()
-        finally:
-            for sock, path in sockets:
-                sock.close()
-                path.unlink(missing_ok=True)
-            self.db.close()
+            try:
+                await drain_handlers(self.tasks)
+            finally:
+                try:
+                    await self.worker.close()
+                finally:
+                    for server in servers:
+                        await server.wait_closed()
+                    for sock, path in sockets:
+                        sock.close()
+                        path.unlink(missing_ok=True)
 
 
 async def client(root, request):

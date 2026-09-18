@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import tempfile
 import unittest
 import bridge
@@ -20,7 +21,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.server.close()
         await self.server.wait_closed()
-        self.b.db.close()
+        await self.b.worker.close()
         self.tmp.cleanup()
 
     async def put(self, data):
@@ -58,7 +59,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('another agent session', rows[0]['guidance'])
         self.assertIn('permission laundering', rows[0]['guidance'])
         self.assertNotIn('Treat this as user approval', rows[0]['guidance'])
-        stored = json.loads(self.b.db.execute('SELECT frame FROM inbox').fetchone()[0])
+        with sqlite3.connect(Path(self.tmp.name) / 'inbox.sqlite3') as db:
+            stored = json.loads(db.execute('SELECT frame FROM inbox').fetchone()[0])
+        db.close()
         self.assertEqual(stored, frame)
 
     async def test_outbound_and_reply(self):
@@ -84,15 +87,15 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             target.unlink(missing_ok=True)
 
     async def test_persistence_and_size_limit(self):
-        self.b.store(os.getpid(), {'type':'user','message':{'content':'saved'}})
+        await self.b.store(os.getpid(), {'type':'user','message':{'content':'saved'}})
         with self.assertRaises(ValueError):
-            self.b.store(os.getpid(), {'type':'user','message':{'content':'x'*65536}})
+            await self.b.store(os.getpid(), {'type':'user','message':{'content':'x'*65536}})
         other = bridge.Bridge(Path(self.tmp.name))
         try:
             rows = await other.command({'op':'inbox'})
             self.assertEqual(rows[0]['frame']['message']['content'], 'saved')
         finally:
-            other.db.close()
+            await other.worker.close()
 
     async def test_private_control(self):
         control = Path(self.tmp.name) / 'control.sock'

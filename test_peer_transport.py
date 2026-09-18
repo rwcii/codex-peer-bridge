@@ -77,7 +77,7 @@ class ControlTransportTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, 'not a messaging'):
                 await instance.send('uds:'+str(path), 'synthetic message')
         finally:
-            instance.db.close()
+            await instance.worker.close()
 
     async def test_discovery_does_not_publish_a_control_socket_as_a_peer(self):
         path = await self.server(root=self.root/('x'*120))

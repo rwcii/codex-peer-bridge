@@ -90,6 +90,43 @@ The client reads the key for the kernel-verified server PID and socket path with
 
 Observed controls include delivery statuses, rename, idle notices, and artifact coordination. The bridge stores control objects without performing their actions and does not notify Codex about them. It neither implements nor advertises their specialized semantics.
 
+## Database execution
+
+Bridge and memory database work runs on one owning thread per service. Initialization,
+queries, mutations and close use that thread with SQLite thread checks enabled. Each
+worker accepts at most 16 queued ordinary jobs, two queued status jobs, and one running
+job. Status has priority over queued ordinary work, but cannot interrupt a transaction.
+Stop is validated and handled on the event loop; shutdown settles accepted database work.
+
+Control connections have eight pending frame slots with a separate two-second read
+deadline. A full unclassified pool can refuse any operation, including status or stop;
+no operation identity is known before its frame arrives. These slots are released after
+parsing or expiry. Established ordinary requests do not occupy them. After parsing, each service admits
+16 ordinary handlers and two separate status/stop handlers. Bridge peer connections use
+the same ordinary allowance. Excess control requests return `capacity`; excess peer
+connections close. These bounds do not promise a deadline for disk operations.
+
+A timeout, disconnect or cancellation does not cancel an accepted database mutation and
+is not proof of rollback. Use the existing memory idempotency contract for uncertain note
+replies. Services stop accepting connections, drain handlers, then close the worker after
+all accepted jobs settle. Socket waits cannot keep a database transaction open.
+
+Database failures return `storage_error`; programming failures return `internal_error`.
+Status waits at most one second for a priority database read, then returns known process
+identity and a lock-protected worker snapshot without waiting for that read to finish.
+`database_status` is `ready`, `busy`, `capacity`, `closing` or an error class. When the read
+cannot complete, bridge `inbox_count` is null; memory omits database-derived fields such
+as `head` and sets `healthy` false. Unknown values are never replaced with zero.
+
+`database_worker` reports the running flag, both queue counts and the closing flag.
+`database_observed_fault` is null until a storage or programming failure is observed,
+then records the last error class until restart. This is historical evidence; a
+successful unrelated query does not clear it or prove recovery. Memory also sets
+`healthy` false after an observed worker fault. Invalid requests and capacity refusals
+do not set a historical fault. These fields are not a complete database integrity check
+or the notifier's separate delivery-health record. A status fallback requires a parsed
+request; it cannot bypass a full unclassified connection pool.
+
 ## Memory control protocol
 
 This section describes a protocol **this project defines**, unlike the rest of this document,

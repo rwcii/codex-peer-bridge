@@ -37,7 +37,7 @@ class Base(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.s = memory.Store(self.home/'memory.sqlite3', REPO)
         self.addCleanup(self.s.close)
-        self.svc = memory.Service(self.home, REPO, self.s)
+        self.svc = memory.MemoryCommands(self.home, REPO, self.s)
 
     def call(self, **r):
         return self.svc.command(r, 4242)
@@ -714,7 +714,7 @@ class SearchTests(Base):
             with self.subTest(fts=fts), tempfile.TemporaryDirectory() as d:
                 s = memory.Store(Path(d)/'m.sqlite3', REPO, fts=fts)
                 self.addCleanup(s.close)
-                svc = memory.Service(d, REPO, s)
+                svc = memory.MemoryCommands(d, REPO, s)
                 self.assertEqual(s.fts, fts)
                 kept = s.note('w','gotcha','registry keeps this one')['seq']
                 gone = s.note('w','gotcha','registry loses this one')['seq']
@@ -732,7 +732,7 @@ class SearchTests(Base):
         with tempfile.TemporaryDirectory() as d:
             s = memory.Store(Path(d)/'m.sqlite3', REPO, fts=False)
             self.addCleanup(s.close)
-            svc = memory.Service(d, REPO, s)
+            svc = memory.MemoryCommands(d, REPO, s)
             s.note('w','finding','literal percent % here')
             s.note('w','finding','no wildcard')
             self.assertEqual(len(svc.command(dict(op='recall',query='%'),1)['entries']), 1)
@@ -748,7 +748,7 @@ class SearchTests(Base):
             upgraded = memory.Store(path, REPO)
             self.addCleanup(upgraded.close)
             self.assertTrue(upgraded.fts)
-            svc = memory.Service(d, REPO, upgraded)
+            svc = memory.MemoryCommands(d, REPO, upgraded)
             self.assertEqual(len(svc.command(dict(op='recall',query='before'),1)['entries']), 1)
 
     def test_a_partially_indexed_store_is_rebuilt_on_reopen(self):
@@ -766,7 +766,7 @@ class SearchTests(Base):
             without.close()
             again = memory.Store(path, REPO)
             self.addCleanup(again.close)
-            svc = memory.Service(d, REPO, again)
+            svc = memory.MemoryCommands(d, REPO, again)
             total = again.db.execute('SELECT count(*) FROM entries').fetchone()[0]
             hits = svc.command(dict(op='recall', query='searchable'), 1)['entries']
             self.assertEqual(len(hits), total)
@@ -777,7 +777,7 @@ class SearchTests(Base):
         with tempfile.TemporaryDirectory() as d:
             s = memory.Store(Path(d)/'m.sqlite3', REPO)
             self.addCleanup(s.close)
-            svc = memory.Service(d, REPO, s)
+            svc = memory.MemoryCommands(d, REPO, s)
             s.note('w','status','ephemeral marker', expires=time.time()-1)
             s.reclaim()
             # A contentless index keeps its rows unless they are deleted explicitly,
@@ -1445,7 +1445,7 @@ class StorageBoundTests(Base):
             self.addCleanup(store.close)
             self.assertEqual(store.db.execute('PRAGMA max_page_count').fetchone()[0], ceiling,
                              'the engine must hold the ceiling under test, not the default')
-            service = memory.Service(self.home, REPO, store)
+            service = memory.MemoryCommands(self.home, REPO, store)
             body = self.varied_body(3000)
 
             # A reader registers and takes a snapshot while there is still room, because
@@ -1581,7 +1581,7 @@ class StorageBoundTests(Base):
              patch.object(memory, 'MAX_ENTRIES', 100_000), \
              patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40):
             store, written = self.full_store('blocked.sqlite3', ceiling, 40)
-            service = memory.Service(self.home, REPO, store)
+            service = memory.MemoryCommands(self.home, REPO, store)
             # Drive a progress transition past the engine ceiling: the case the reserve
             # exists to prevent, and the one that must block rather than be shrugged off.
             with self.assertRaises(memory.MemoryError_) as e:
@@ -1652,7 +1652,7 @@ class StorageBoundTests(Base):
             self.assertFalse(reopened.index_usable(),
                              'an index that could not be built must stay invalid')
             self.assertIsNone(reopened.blocked)
-            service = memory.Service(self.home, REPO, reopened)
+            service = memory.MemoryCommands(self.home, REPO, reopened)
             found = service.command(dict(op='recall', query=needle), 4242)
             self.assertFalse(found['indexed'], 'the reply must say the scan answered')
             self.assertEqual(len(found['entries']), 1,

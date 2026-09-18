@@ -16,7 +16,7 @@ import platform_support
 MARKER = '# Managed by codex-peer-bridge\n'
 SERVICES = ('codex-peer-notify.service', 'codex-peer-bridge.service')
 
-FILES = ('participant_lock.py', 'peer_transport.py', 'peer_guidance.py', 'CHANGELOG.md', 'memory.py', 'session.py', 'codex_instructions.py', 'platform_support.py', 'dsh_delivery.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md', 'docs/PARITY-MEMORY-DESIGN.md')
+FILES = ('database_worker.py', 'service_runtime.py', 'participant_lock.py', 'peer_transport.py', 'peer_guidance.py', 'CHANGELOG.md', 'memory.py', 'session.py', 'codex_instructions.py', 'platform_support.py', 'dsh_delivery.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md', 'docs/PARITY-MEMORY-DESIGN.md')
 
 
 def unit_arg(value):
