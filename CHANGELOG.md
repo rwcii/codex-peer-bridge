@@ -5,6 +5,8 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+## 2026-09-18 — Koinon
+
 ### Changed
 
 - Rename the project documentation to Koinon, with the descriptor "Shared coordination
