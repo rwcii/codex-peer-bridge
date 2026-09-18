@@ -115,12 +115,22 @@ ORDINARY_MAX_PAGES = MAX_PAGES - RESERVE_PAGES
 # is one page for an ordinary append; the bound allows for crossing a boundary as well.
 PTRMAP_COVERAGE = PAGE_SIZE // 5
 COMMIT_SLACK = 2
-# The most pages one ordinary append can add: at most one b-tree leaf and two overflow
-# pages for a body at MAX_BODY, its index rows, and a pointer-map page. Admission leaves
-# this much room so that a write it admits is not certain to be refused by enforcement.
-# Without it the two thresholds disagreed, and a store sitting in the gap admitted every
-# append and then rolled every one of them back.
+# Room admission leaves for the growth one append causes, so that a store resting just
+# under the threshold does not admit every append and then roll every one of them back.
+# It is sized from a leaf, two overflow pages for a body at MAX_BODY, and a pointer-map
+# page. It is NOT a bound on what an append can allocate: the stored row carries more than
+# the body, and FTS5 maintenance can allocate more than this. A rolled-back capacity
+# refusal remains a correct outcome; this only stops it being the usual one.
 APPEND_ALLOWANCE = 8
+# Expiry removes rows in batches so that reclamation never needs room for index
+# maintenance over the whole store at once. A whole-store tombstone reserve is not
+# something this design can size, because the index cost of arbitrary legal content is not
+# bounded by the record format.
+EXPIRY_BATCH = 200
+# Headroom a rebuild must see before it starts. It is a guard against beginning work that
+# is obviously unaffordable, NOT a proof that the work fits: the rollback is what makes an
+# unaffordable rebuild safe, and the index cost of arbitrary content has no derived bound.
+REBUILD_HEADROOM = RESERVE_PAGES // 2
 
 # Lifetimes. Every retained record has one, and expiry returns a defined recovery
 # result rather than silently changing a caller's meaning.
@@ -232,13 +242,18 @@ class Store:
         # it cannot understand, which is the opposite of refusing to touch it.
         existing = Path(path).exists() and Path(path).stat().st_size > 0
         self.db = sqlite3.connect(path)
+        self.blocked = None
         try:
             if existing:
                 self.inspect(repo)
             self.configure()
+            # executescript issues its own COMMIT, so it cannot run inside a transaction
+            # context. The log is reset immediately before it instead, which is what the
+            # bound asks of the transaction it then runs.
+            self.reset_log()
             self.db.executescript(SCHEMA_SQL)
             if not existing:
-                with self.db:
+                with self.transaction():
                     for key, value in (('repo', repo), ('protocol', PROTOCOL),
                                        ('schema', SCHEMA), ('head', 0), ('floor', 0)):
                         self.set_meta(key, value)
@@ -343,6 +358,65 @@ class Store:
         """Durable pages allocated. This is what admission compares, and nothing else."""
         return self.db.execute('PRAGMA page_count').fetchone()[0]
 
+    @contextlib.contextmanager
+    def transaction(self, control=True, blocking=True):
+        """The single write boundary. Every durable change in this file goes through it.
+
+        The bound is derived for ONE transaction beginning with an empty log, so each
+        transaction must begin that way. Resetting once after several have accumulated
+        would bound their sum, which is a different and larger quantity, so maintenance
+        and initialisation are routed here too rather than committing on their own.
+
+        The page check runs INSIDE the transaction. Running it after the context manager
+        committed produced an error that said the change was rolled back when it had
+        already been applied, which for a cursor or a snapshot is a false report about
+        durable progress.
+        """
+        self.require_writable()
+        self.reset_log()
+        try:
+            with self.db:
+                yield
+                self.enforce_pages(control)
+        except sqlite3.OperationalError as exc:
+            if not storage_exhausted(exc):
+                raise
+            # The engine refused a page, so the transaction was rolled back whole.
+            if control and blocking:
+                self.block(f'the engine refused a page at the {MAX_PAGES} page ceiling '
+                           'during a transition the reserve exists to protect')
+                raise MemoryError_('storage_blocked', self.blocked) from exc
+            raise MemoryError_(
+                'capacity',
+                f'the engine refused a page at the {MAX_PAGES} page ceiling; the '
+                'transaction was rolled back and stored data is intact') from exc
+
+    def block(self, reason):
+        """Record that writes cannot proceed until recovery is asked for explicitly.
+
+        Without a recorded state the runtime told a caller that recovery was required and
+        then accepted the next write as though nothing had happened. Reads, status and
+        stop stay available; only writes are held.
+        """
+        self.blocked = (f'{reason}. Stored data is intact. Reads, status and stop remain '
+                        'available; ask for recovery explicitly with the recover '
+                        'operation before writes resume')
+
+    def require_writable(self):
+        if self.blocked:
+            raise MemoryError_('storage_blocked', self.blocked)
+
+    def recover(self):
+        """The explicit path out of a blocked store. Reads never depended on it."""
+        self.reset_log_unchecked()
+        self.db.execute('PRAGMA incremental_vacuum').fetchall()
+        busy, log_pages, residual = self.log_state()
+        if busy or log_pages or residual:
+            self.block('recovery could not reset the write-ahead log')
+            raise MemoryError_('storage_blocked', self.blocked)
+        self.blocked = None
+        return dict(recovered=True, pages=self.pages())
+
     @staticmethod
     def page_cap(control):
         """The one effective page limit, so admission and enforcement cannot disagree.
@@ -362,12 +436,7 @@ class Store:
         empty. Under exclusive locking no other process can hold a snapshot, so a busy
         result is a genuine recovery condition rather than ordinary contention.
         """
-        busy, log_pages, moved = self.db.execute(
-            'PRAGMA wal_checkpoint(TRUNCATE)').fetchall()[0]
-        try:
-            residual = os.stat(str(self.path) + '-wal').st_size
-        except OSError:
-            residual = 0
+        busy, log_pages, residual = self.log_state()
         if busy or log_pages or residual:
             raise MemoryError_(
                 'storage_blocked',
@@ -375,7 +444,24 @@ class Store:
                 f'log_pages={log_pages}, {residual} bytes remain), so the bound on a '
                 'write cannot be held. No write was attempted and stored data is intact; '
                 'reads and recovery remain available')
-        return moved
+        return True
+
+    def reset_log_unchecked(self):
+        """Attempt a reset without refusing on the result. Only recovery uses this."""
+        try:
+            self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+        except sqlite3.Error:
+            pass
+
+    def log_state(self):
+        """The checkpoint's three results, and the log file that no result describes."""
+        busy, log_pages, _moved = self.db.execute(
+            'PRAGMA wal_checkpoint(TRUNCATE)').fetchall()[0]
+        try:
+            residual = os.stat(str(self.path) + '-wal').st_size
+        except OSError:
+            residual = 0
+        return busy, log_pages, residual
 
     def inspect(self, repo):
         """Read-only compatibility check on an existing store. Writes nothing."""
@@ -413,36 +499,53 @@ class Store:
 
     def _open_fts(self):
         try:
-            self.db.execute('CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(body, content="")')
+            with self.transaction():
+                self.db.execute(
+                    'CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(body, content="")')
             return True
         except sqlite3.Error:
             return False
 
     def _reconcile_index(self):
-        """Rebuild the index whenever it is not known to be complete.
+        """Make the index either complete or explicitly unusable, never quietly wrong.
 
-        Emptiness is the wrong test. A store can be written with the index, reopened by
-        a runtime without it, written again, and reopened with it once more; the index
-        is then nonempty and wrong, and a search silently loses results. Completeness is
-        tracked explicitly and a mismatch rebuilds in one transaction.
+        Emptiness is the wrong test. A store can be written with the index, reopened by a
+        runtime without it, written again, and reopened with it once more; the index is then
+        nonempty and wrong, and a search silently loses results. Completeness is tracked
+        explicitly, and anything short of it sends search to the complete scan.
+
+        A rebuild that cannot fit must not stop the store opening. The index is marked
+        invalid **before** the rebuild starts, so an interrupted or rolled-back rebuild
+        leaves it invalid rather than apparently complete, and the service then serves
+        scans. Refusing to open would be the worse failure: the fallback that exists for
+        exactly this case could never be reached, because there would be no service.
         """
         if not self.fts:
-            # Writes made now cannot be indexed, so mark the index unusable until a
+            # Writes made now cannot be indexed, so the index stays unusable until a
             # runtime that has FTS rebuilds it.
+            with self.transaction():
+                self.set_meta('indexed_through', -1)
+            return
+        if int(self.meta('indexed_through') or 0) == self.head():
+            return
+        with self.transaction():
             self.set_meta('indexed_through', -1)
-            self.db.commit()
+        if self.pages() > self.page_cap(control=True) - REBUILD_HEADROOM:
+            # Refused before it starts rather than part way through. Search stays on the
+            # scan until there is room, which reclamation can create.
             return
-        through = int(self.meta('indexed_through') or 0)
-        if through == self.head():
-            return
-        # A rebuild is bounded rather than admitted, like any progress transition:
-        # refusing it for space would leave search permanently wrong, and it adds no rows
-        # a caller controls, only an index over entries already admitted.
-        with self.progress():
-            self.db.execute("INSERT INTO search(search) VALUES('delete-all')")
-            for seq, body in self.db.execute('SELECT seq,body FROM entries ORDER BY seq'):
-                self.db.execute('INSERT INTO search(rowid,body) VALUES(?,?)', (seq, body))
-            self.set_meta('indexed_through', self.head())
+        try:
+            with self.transaction(blocking=False):
+                self.db.execute("INSERT INTO search(search) VALUES('delete-all')")
+                for seq, body in self.db.execute(
+                        'SELECT seq,body FROM entries ORDER BY seq').fetchall():
+                    self.db.execute('INSERT INTO search(rowid,body) VALUES(?,?)', (seq, body))
+                self.set_meta('indexed_through', self.head())
+        except MemoryError_ as exc:
+            if exc.code != 'capacity':
+                raise
+            # Rolled back, so the index is still marked invalid and search uses the scan.
+            # This is a degraded service, not a broken one, and it is reachable.
 
     def _unindex(self, rows):
         """A contentless FTS5 table needs an explicit delete; dropping the row is not enough."""
@@ -572,64 +675,36 @@ class Store:
         both are documented in the contract rather than skipped silently.
         """
         self.admit(need, slots, control)
-        self.reset_log()
-        try:
-            with self.db:
-                yield
-                self.enforce(control, need)
-        except sqlite3.OperationalError as exc:
-            if not storage_exhausted(exc):
-                raise
-            # The engine refused a page before the commit, so the transaction rolled back
-            # whole. Reporting the rollback is the point: a caller must be able to tell a
-            # refused write from a partly applied one.
-            raise MemoryError_(
-                'capacity',
-                f'the engine refused a page at the {MAX_PAGES} page ceiling; the '
-                'transaction was rolled back and stored data is intact') from exc
+        with self.transaction(control):
+            yield
+            if need:
+                self.enforce_logical(control)
 
     @contextlib.contextmanager
     def progress(self):
         """A transition that records progress and may never be refused for space.
 
         Acknowledgements, page issuance and activity refreshes cannot be rejected on
-        capacity: a reader that cannot acknowledge can never advance, and the store
-        would become unreadable-forward precisely when it most needs draining. They are
-        bounded instead of refused, by relieving write-ahead log growth when the file
-        approaches its limit, and they add no rows a caller controls.
+        capacity: a reader that cannot acknowledge can never advance, and the store would
+        become unreadable-forward precisely when it most needs draining. They draw on the
+        reserve, which ordinary appends may not consume, rather than on a margin.
         """
-        self.reset_log()
-        try:
-            with self.db:
-                yield
-        except sqlite3.OperationalError as exc:
-            if not storage_exhausted(exc):
-                raise
-            # A progress transition that the engine refuses is the one case the reserve
-            # was meant to prevent, so it is reported as a blocked store rather than as
-            # ordinary fullness: reads and recovery stay available, writes do not resume
-            # on their own.
-            raise MemoryError_(
-                'storage_blocked',
-                f'the engine refused a page at the {MAX_PAGES} page ceiling during a '
-                'progress transition, which the reserve exists to prevent. The '
-                'transaction was rolled back and stored data is intact; recovery is '
-                'required before writes resume') from exc
-        # The reserve, not a margin, is what leaves room for this transition. Its pages
-        # are withheld from ordinary admission, so there is nothing to relieve here.
-        self.enforce_pages(control=True)
+        with self.transaction(control=True):
+            yield
 
-    def enforce(self, control, need=0):
-        """Verify real allocation, and logical usage when the change was a growth."""
-        self.enforce_pages(control)
-        if need:
-            cap = MAX_LOGICAL_BYTES if control else MAX_LOGICAL_BYTES - RESERVED_BYTES
-            logical = self.usage()['logical']
-            if logical > cap:
-                raise MemoryError_('capacity',
-                                   f'this mutation would leave {logical} logical bytes stored, '
-                                   f'above the {cap} byte limit; it was rolled back and stored '
-                                   'data is intact')
+    def enforce_logical(self, control):
+        """The logical budget, checked inside the transaction like the page ceiling.
+
+        Logical usage is what callers control, so it is measured after the change rather
+        than projected from the request alone.
+        """
+        cap = MAX_LOGICAL_BYTES if control else MAX_LOGICAL_BYTES - RESERVED_BYTES
+        logical = self.usage()['logical']
+        if logical > cap:
+            raise MemoryError_('capacity',
+                               f'this mutation would leave {logical} logical bytes stored, '
+                               f'above the {cap} byte limit; it was rolled back and stored '
+                               'data is intact')
 
     def enforce_pages(self, control):
         """Check pages actually allocated, inside the transaction, so a breach rolls back.
@@ -685,36 +760,41 @@ class Store:
                            'bytes; nothing was written and stored data is intact')
 
     def expire(self):
-        """Remove only what is past its stated lifetime.
+        """Remove only what is past its stated lifetime, in bounded batches.
 
-        This runs at request boundaries, not merely after a capacity failure. A
-        horizon that is enforced only when the store fills is not a lifetime; it is a
-        side effect of pressure, and a caller cannot reason about it.
+        This runs at request boundaries, not merely after a capacity failure. A horizon
+        enforced only when the store fills is not a lifetime; it is a side effect of
+        pressure, and a caller cannot reason about it.
 
-        Removal is deliberately outside admission. Enforcing a budget here would refuse
-        the cleanup precisely when the store is over its limit, which is when it is most
-        needed; the only growth is a retirement tombstone, and registration reserves for
-        that when the consumer is admitted.
+        Batching is what keeps reclamation possible on a full store. A contentless FTS5
+        delete writes a tombstone before the vacuum returns any pages, so removing
+        everything at once would need room for index maintenance over the whole store, and
+        the index cost of arbitrary legal content is not something this design can bound.
+        If a batch's index maintenance will not fit, the index is invalidated and the rows
+        are removed without it; search continues on the complete scan and the index is
+        rebuilt when there is room.
         """
         now = time.time()
-        with self.db:
-            expired = self.db.execute(
-                'SELECT seq,body FROM entries WHERE expires IS NOT NULL AND expires < ?',
-                (now,)).fetchall()
-            if expired:
-                self._unindex(expired)
-                self.db.executemany('DELETE FROM entries WHERE seq=?', [(s,) for s, _ in expired])
-                # The recovery boundary comes from what was removed. A boundary taken
-                # from the lowest surviving row cannot describe an interior or a tail
-                # gap, and a reader above it is then told there is more while receiving
-                # nothing, forever.
-                highest = max(s for s, _ in expired)
-                if highest > self.floor():
-                    self.set_meta('floor', highest)
-                if not self.fts:
-                    # Rows were removed without maintaining the index, so it is no
-                    # longer trustworthy and must be rebuilt when FTS returns.
+        removed = 0
+        while True:
+            batch = self.db.execute(
+                'SELECT seq,body FROM entries WHERE expires IS NOT NULL AND expires < ? '
+                'ORDER BY seq LIMIT ?', (now, EXPIRY_BATCH)).fetchall()
+            if not batch:
+                break
+            try:
+                with self.transaction():
+                    self._unindex(batch)
+                    self._forget(batch)
+            except MemoryError_ as exc:
+                if exc.code != 'capacity':
+                    raise
+                with self.transaction():
                     self.set_meta('indexed_through', -1)
+                with self.transaction():
+                    self._forget(batch)
+            removed += len(batch)
+        with self.transaction():
             self.db.execute('DELETE FROM snapshots WHERE (acked IS NULL AND created < ?) '
                             'OR (acked IS NOT NULL AND acked_at < ?)',
                             (now - SNAPSHOT_TTL, now - ACK_RETENTION))
@@ -723,8 +803,8 @@ class Store:
             self.db.execute('DELETE FROM idem WHERE deadline < ?', (now,))
             self.db.execute('DELETE FROM retired WHERE at < ?', (now - RETIRED_TTL,))
             # A retired consumer leaves a tombstone. A later request from it gets an
-            # explicit consumer_retired result instead of silently becoming a new
-            # consumer that re-reads the whole store as if it had never synced.
+            # explicit consumer_retired result instead of silently becoming a new consumer
+            # that re-reads the whole store as if it had never synced.
             for consumer, seq in self.db.execute(
                     'SELECT consumer,seq FROM cursors WHERE updated < ?',
                     (now - CONSUMER_TTL,)).fetchall():
@@ -732,7 +812,23 @@ class Store:
                                 (consumer, seq, now))
                 self.db.execute('DELETE FROM cursors WHERE consumer=?', (consumer,))
         self.expired_at = now
-        return len(expired)
+        return removed
+
+    def _forget(self, batch):
+        """Drop a batch of entries and move the recovery boundary past them.
+
+        The boundary comes from what was removed. A boundary taken from the lowest
+        surviving row cannot describe an interior or a tail gap, and a reader above it is
+        then told there is more while receiving nothing, forever.
+        """
+        self.db.executemany('DELETE FROM entries WHERE seq=?', [(s,) for s, _ in batch])
+        highest = max(s for s, _ in batch)
+        if highest > self.floor():
+            self.set_meta('floor', highest)
+        if not self.fts:
+            # Rows were removed without maintaining the index, so it is no longer
+            # trustworthy and must be rebuilt when FTS returns.
+            self.set_meta('indexed_through', -1)
 
     def maybe_expire(self):
         """Enforce lifetimes at the request boundary, at a bounded rate."""
@@ -742,26 +838,26 @@ class Store:
     def reclaim(self):
         """Expiry, then count pruning that respects every retention window.
 
-        Count pruning may only remove records already outside their lifetime. Evicting
-        a record still promised for recovery, such as an acknowledgement inside its
-        retention, would turn a documented replay into a failure in order to make room.
+        Count pruning may only remove records already outside their lifetime. Evicting a
+        record still promised for recovery, such as an acknowledgement inside its retention,
+        would turn a documented replay into a failure in order to make room.
         """
         removed = self.expire()
         now = time.time()
-        with self.db:
+        with self.transaction():
             prunable = self.db.execute(
                 'SELECT key FROM idem WHERE deadline < ? ORDER BY deadline LIMIT -1 OFFSET ?',
                 (now, MAX_IDEM_ROWS)).fetchall()
             self.db.executemany('DELETE FROM idem WHERE key=?', prunable)
-        # Deleting rows frees pages inside the file; without these the file never
-        # shrinks and a store that reached its bound could never recover from it.
-        # Both pragmas must be driven to completion; preparing them without stepping
-        # through their results leaves the pages exactly where they were.
+        # Deleting rows frees pages inside the file; without this the file never shrinks and
+        # a store that reached its ceiling could never recover from it. The pragma must be
+        # driven to completion: preparing it without stepping through its results leaves the
+        # pages exactly where they were. It runs its own transaction, so the log is reset on
+        # both sides of it.
+        self.reset_log()
         self.db.execute('PRAGMA incremental_vacuum').fetchall()
         self.reset_log()
         return removed
-
-    # --- writes ---------------------------------------------------------------
 
     def note(self, consumer, kind, body, scope='repo', scope_target=None, path=None,
              supersedes=None, revokes=None, expires=None, key=None, deadline=None,
@@ -1050,13 +1146,22 @@ class Service:
             raise MemoryError_('invalid_request', 'a stable consumer key is required')
         return key.strip()
 
+    # Operations that must stay reachable when writes cannot proceed. Running cleanup
+    # before them made a failed cleanup block the very reads, status and stop that the
+    # blocked-store error promises remain available.
+    READ_ONLY = ('hello', 'status', 'recall', 'stop', 'recover')
+
     def command(self, r, pid):
         op = r.get('op')
-        self.store.maybe_expire()
+        if op not in self.READ_ONLY:
+            self.store.maybe_expire()
+        if op == 'recover':
+            return self.store.recover()
         if op == 'hello':
             return dict(service='codex-peer-memory', repo=self.repo, protocol=PROTOCOL,
                         schema=SCHEMA, generation=self.generation, pid=os.getpid(),
-                        healthy=self.store.healthy(), fts=self.store.fts)
+                        healthy=self.store.healthy(), fts=self.store.fts,
+                        indexed=self.store.index_usable(), blocked=self.store.blocked)
         if op == 'note':
             return self.store.note(self.consumer(r), r.get('type'), r.get('body'),
                                    scope=r.get('scope', 'repo'), scope_target=r.get('scope_target'),
@@ -1316,8 +1421,14 @@ class Service:
         return dict(repo=self.repo, protocol=PROTOCOL, schema=SCHEMA, generation=self.generation,
                     head=head, floor=self.store.floor(), healthy=self.store.healthy(),
                     fts=self.store.fts, usage=use,
+                    # A blocked store still answers status; that is the point of blocking
+                    # writes rather than failing the service, and a caller needs to see it.
+                    blocked=self.store.blocked, indexed=self.store.index_usable(),
+                    pages=self.store.pages(),
                     limits=dict(entries=MAX_ENTRIES, logical_bytes=MAX_LOGICAL_BYTES,
                                 physical_bytes=MAX_PHYSICAL_BYTES, body=MAX_BODY,
+                                max_pages=MAX_PAGES, ordinary_max_pages=ORDINARY_MAX_PAGES,
+                                reserve_pages=RESERVE_PAGES, wal_budget_bytes=WAL_BUDGET_BYTES,
                                 reserved_entries=RESERVED_ENTRIES, reserved_bytes=RESERVED_BYTES,
                                 page_bytes=FRAME_BUDGET, consumers=MAX_CONSUMERS),
                     lifetimes=dict(snapshot=SNAPSHOT_TTL, acknowledgement=ACK_RETENTION,

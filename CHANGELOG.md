@@ -20,7 +20,12 @@ into a dated release section when promoted to `main`.
   budget and a durable page ceiling, with slots and pages reserved so a withdrawal stays
   recordable, and every retained record has a lifetime whose expiry returns a defined recovery
   result. The store is opened by a single exclusive owner; a second owner is told the store is
-  busy rather than that the file is unreadable. Search answers from the index only while the
+  busy rather than that the file is unreadable. When storage cannot be written safely the
+  service records a blocked state and refuses writes until recovery is requested explicitly,
+  while status, search and stop stay available. Expiry removes entries in batches, and falls
+  back to invalidating the index rather than requiring room to maintain it, so a full store can
+  always be reclaimed. A search index that cannot be rebuilt leaves the store serving complete
+  scans instead of failing to open. Search answers from the index only while the
   index is known to cover every live entry, and otherwise from a complete scan, and the reply
   says which answered. Start is
   serialized, and a socket left by an unclean exit is recovered only after its recorded owner is

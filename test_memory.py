@@ -1,11 +1,13 @@
 import asyncio
 import json
 import os
+import random
 from pathlib import Path
 import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import unittest
@@ -1339,32 +1341,289 @@ class StorageBoundTests(Base):
         self.assertEqual([e['seq'] for e in fallback['entries']], [seq],
                          'the fallback must be complete, not empty')
 
+    def varied_body(self, body_len):
+        """Distinct-token text. Repeated filler understates the index by two orders."""
+        words = [f'w{i:05d}' for i in range(4000)]
+        rng = random.Random(11)
+
+        def make():
+            out, size = [], 0
+            while size < body_len:
+                w = rng.choice(words)
+                out.append(w)
+                size += len(w) + 1
+            return ' '.join(out)[:body_len]
+        return make
+
+    def full_store(self, name, ceiling, reserve, body_len=3000, limit=20_000):
+        """A store opened UNDER the tested ceiling, filled through admission.
+
+        Patching the constant after `setUp` opened a store left the engine holding its
+        original limit, so the test exercised only this code's comparison and never the
+        engine's. The store is created inside the patch instead, and the engine's limit is
+        asserted rather than assumed.
+        """
+        words = [f'w{i:05d}' for i in range(4000)]
+        rng = random.Random(11)
+
+        def body():
+            out, size = [], 0
+            while size < body_len:
+                w = rng.choice(words)
+                out.append(w)
+                size += len(w) + 1
+            return ' '.join(out)[:body_len]
+
+        store = memory.Store(self.home/name, REPO)
+        self.addCleanup(store.close)
+        self.assertEqual(store.db.execute('PRAGMA max_page_count').fetchone()[0], ceiling,
+                         'the engine must hold the ceiling under test, not the default')
+        written = []
+        for _ in range(limit):
+            try:
+                written.append(store.note('writer', 'decision', body())['seq'])
+            except memory.MemoryError_ as exc:
+                self.assertEqual(exc.code, 'capacity')
+                break
+        else:
+            self.fail('growth was never bounded')
+        return store, written
+
     def test_the_reserve_survives_a_full_store_for_every_promised_transition(self):
-        """At the ordinary threshold, progress and control must all still commit."""
-        body = 'x' * 4000
-        ceiling = self.s.pages() + 700
+        """At the threshold, every transition the contract promises must still commit.
+
+        The contract promises a specific set: page issuance, acknowledgement, activity
+        refresh, withdrawal, retirement and reclamation. It deliberately does NOT promise
+        that a new consumer can register or that a fresh snapshot can be frozen at
+        fullness -- those add rows a caller controls and are ordinary growth -- so this
+        asserts they are refused rather than quietly treating them as covered.
+
+        Bodies are distinct-token text, not a repeated character, because repeated filler
+        produces an index two orders of magnitude smaller than real content and would let
+        the index term escape the test entirely.
+        """
+        ceiling = 900
+        reserve = memory.RESERVE_PAGES // 8
         with patch.object(memory, 'MAX_PAGES', ceiling), \
-             patch.object(memory, 'ORDINARY_MAX_PAGES', ceiling - 150), \
+             patch.object(memory, 'ORDINARY_MAX_PAGES', ceiling - reserve), \
+             patch.object(memory, 'RESERVE_PAGES', reserve), \
+             patch.object(memory, 'MAX_ENTRIES', 100_000), \
+             patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40), \
+             patch.object(memory, 'FRAME_BUDGET', 16_384):
+            # A small frame budget so the snapshot really pages. With the production budget
+            # a store this size answers in one page, and page issuance -- which the reserve
+            # explicitly promises -- would never be exercised at all.
+            store = memory.Store(self.home/'reserve.sqlite3', REPO)
+            self.addCleanup(store.close)
+            self.assertEqual(store.db.execute('PRAGMA max_page_count').fetchone()[0], ceiling,
+                             'the engine must hold the ceiling under test, not the default')
+            service = memory.Service(self.home, REPO, store)
+            body = self.varied_body(3000)
+
+            # A reader registers and takes a snapshot while there is still room, because
+            # neither is promised at fullness.
+            for _ in range(40):
+                store.note('writer', 'decision', body())
+            page = service.command(dict(op='sync', consumer='reader'), 4242)
+            self.assertEqual(page['kind'], 'snapshot')
+
+            written = []
+            for _ in range(20_000):
+                try:
+                    written.append(store.note('writer', 'decision', body())['seq'])
+                except memory.MemoryError_ as exc:
+                    self.assertEqual(exc.code, 'capacity')
+                    break
+            else:
+                self.fail('growth was never bounded')
+            self.assertLessEqual(store.pages(), memory.ORDINARY_MAX_PAGES)
+            self.assertIsNone(store.blocked)
+
+            # Ordinary growth is refused: an append, a new consumer, and a fresh snapshot.
+            for label, call in (
+                    ('append', lambda: store.note('writer', 'decision', 'more')),
+                    ('registration', lambda: service.command(
+                        dict(op='sync', consumer='late-reader'), 4242)),
+                    ('snapshot', lambda: memory.freeze(store, 'reader'))):
+                with self.subTest(refused=label):
+                    with self.assertRaises(memory.MemoryError_) as e:
+                        call()
+                    self.assertEqual(e.exception.code, 'capacity')
+
+            # Page issuance on the snapshot taken earlier: promised, so it must commit.
+            issued = 0
+            while page.get('more'):
+                page = service.command(dict(op='sync', consumer='reader',
+                                            snapshot_id=page['snapshot_id'],
+                                            page_token=page['page_token']), 4242)
+                issued += 1
+            self.assertGreater(issued, 0, 'no page was issued, so issuance was not exercised')
+
+            # Acknowledgement: promised.
+            self.assertTrue(service.command(dict(op='ack', consumer='reader',
+                                                 snapshot_id=page['snapshot_id']), 4242))
+
+            # Withdrawal: a control mutation drawing on reserved slots and pages.
+            self.assertTrue(store.note('writer', 'directive', 'withdrawn', revokes=written[0]))
+
+            # Activity refresh: promised.
+            with store.progress():
+                store.set_meta('probe-at-the-bound', '1')
+            self.assertEqual(store.meta('probe-at-the-bound'), '1')
+
+            # Retirement: a consumer past its lifetime leaves a tombstone, at fullness.
+            store.db.execute('UPDATE cursors SET updated=? WHERE consumer=?',
+                             (time.time() - memory.CONSUMER_TTL - 1, 'reader'))
+            store.db.commit()
+            store.expire()
+            self.assertIsNotNone(store.db.execute(
+                'SELECT 1 FROM retired WHERE consumer=?', ('reader',)).fetchone())
+
+            # Reclamation must run rather than be refused.
+            store.db.execute('UPDATE entries SET expires=? WHERE seq IN (%s)'
+                             % ','.join(str(x) for x in written[:-3]), (time.time() - 1,))
+            store.db.commit()
+            at_bound = store.pages()
+            store.reclaim()
+            self.assertLess(store.pages(), at_bound)
+
+            # A rebuild, once reclamation has made room for it again.
+            store._reconcile_index()
+            self.assertTrue(store.index_usable())
+            self.assertLessEqual(store.pages(), ceiling)
+            self.assertIsNone(store.blocked)
+
+
+    def test_no_write_path_commits_without_resetting_the_log_first(self):
+        """The bound is for one transaction after an empty log, so none may accumulate.
+
+        Expiry and reclamation run many transactions. If any of them committed without a
+        reset in between, the log would hold the sum of several transactions rather than
+        the largest one, and the derived budget would describe nothing. The log is sampled
+        while a real expire/reclaim runs, rather than inspected after it, because an
+        accumulation that is checkpointed at the end leaves no trace afterwards.
+        """
+        wal = str(self.s.path) + '-wal'
+        for i in range(memory.EXPIRY_BATCH * 3):
+            self.note('entry ' + str(i) * 40, kind='finding')
+        self.s.db.execute('UPDATE entries SET expires=?', (time.time() - 1,))
+        self.s.db.commit()
+
+        peak = [0]
+        stop = [False]
+
+        def sample():
+            while not stop[0]:
+                try:
+                    peak[0] = max(peak[0], os.stat(wal).st_size)
+                except OSError:
+                    pass
+                time.sleep(0.0005)
+
+        watcher = threading.Thread(target=sample, daemon=True)
+        watcher.start()
+        removed = self.s.reclaim()
+        stop[0] = True
+        watcher.join()
+        self.assertGreater(removed, memory.EXPIRY_BATCH,
+                           'the run must span several batches for accumulation to be possible')
+        budget = 32 + (self.s.pages() + memory.PAD_FRAMES) * memory.FRAME_BYTES
+        self.assertLessEqual(peak[0], budget,
+                            'the log grew beyond one transaction, so transactions accumulated')
+
+    def test_a_refused_progress_transition_is_really_rolled_back(self):
+        """The refusal must not be reported after the change has already committed."""
+        self.note('seed')
+        with patch.object(memory, 'MAX_PAGES', self.s.pages() - 1):
+            with self.assertRaises(memory.MemoryError_) as e:
+                with self.s.progress():
+                    self.s.set_meta('committed-then-refused', '1')
+            self.assertEqual(e.exception.code, 'capacity')
+            self.assertIn('rolled back', str(e.exception))
+        self.assertIsNone(self.s.meta('committed-then-refused'),
+                          'the error said rolled back while the write had been applied')
+
+    def test_a_blocked_store_still_reads_and_recovers_on_request(self):
+        """Blocking writes must leave the reads, status and stop the error promises."""
+        ceiling = 700
+        with patch.object(memory, 'MAX_PAGES', ceiling), \
+             patch.object(memory, 'ORDINARY_MAX_PAGES', ceiling - 40), \
              patch.object(memory, 'MAX_ENTRIES', 100_000), \
              patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40):
-            written = []
-            for _ in range(4000):
+            store, written = self.full_store('blocked.sqlite3', ceiling, 40)
+            service = memory.Service(self.home, REPO, store)
+            # Drive a progress transition past the engine ceiling: the case the reserve
+            # exists to prevent, and the one that must block rather than be shrugged off.
+            with self.assertRaises(memory.MemoryError_) as e:
+                with store.progress():
+                    for i in range(20_000):
+                        store.db.execute(
+                            'INSERT INTO entries(seq,ts,type,scope,body,author,revision) '
+                            'VALUES(?,?,?,?,?,?,?)',
+                            (500_000 + i, 1.0, 'finding', 'repo', 'p' * 3000, 'a', 1))
+            self.assertEqual(e.exception.code, 'storage_blocked')
+            self.assertIsNotNone(store.blocked)
+
+            # Writes are held, and say why.
+            with self.assertRaises(memory.MemoryError_) as w:
+                store.note('writer', 'decision', 'after the block')
+            self.assertEqual(w.exception.code, 'storage_blocked')
+
+            # The operations the error promises remain available really are.
+            self.assertTrue(service.command(dict(op='hello'), 4242)['blocked'])
+            self.assertIsNotNone(service.command(dict(op='status'), 4242)['blocked'])
+            self.assertIn('entries', service.command(dict(op='recall', query='decision'), 4242))
+
+            # Recovery is explicit, and it works.
+            self.assertTrue(service.command(dict(op='recover'), 4242)['recovered'])
+            self.assertIsNone(store.blocked)
+            store.db.execute('UPDATE entries SET expires=? WHERE seq IN (%s)'
+                             % ','.join(str(x) for x in written[:-3]), (time.time() - 1,))
+            store.db.commit()
+            store.reclaim()
+            self.assertTrue(store.note('writer', 'decision', 'writes resume after recovery'))
+
+    def test_a_rebuild_that_cannot_fit_still_opens_the_store_in_scan_mode(self):
+        """A near-full store written without the index must open when it gains one.
+
+        Marking the index invalid on a store that is already running tests only which path
+        search picks. This drives the recovery that matters: the rebuild happens inside
+        `Store.__init__`, so a capacity failure there used to close the handle and stop the
+        service starting, and the fallback could never be reached because nothing was
+        serving.
+        """
+        ceiling = 700
+        path = self.home/'fallback.sqlite3'
+        with patch.object(memory, 'MAX_PAGES', ceiling), \
+             patch.object(memory, 'ORDINARY_MAX_PAGES', ceiling - 40), \
+             patch.object(memory, 'MAX_ENTRIES', 100_000), \
+             patch.object(memory, 'MAX_LOGICAL_BYTES', 1 << 40):
+            # Written by a runtime with no FTS at all, so nothing is indexed.
+            store = memory.Store(path, REPO, fts=False)
+            words = [f'w{i:05d}' for i in range(4000)]
+            rng = random.Random(3)
+            needle = 'zqxjkvneedle'
+            for i in range(20_000):
+                body = ' '.join(rng.choice(words) for _ in range(400))
+                if i == 0:
+                    body = needle + ' ' + body
                 try:
-                    written.append(self.note(body, kind='decision'))
+                    store.note('writer', 'decision', body)
                 except memory.MemoryError_:
                     break
-            self.assertTrue(written)
-            self.assertLessEqual(self.s.pages(), ceiling - 150)
-            # A withdrawal, drawing on reserved slots and reserved pages.
-            self.assertTrue(self.note('withdrawn', kind='directive', revokes=written[0]))
-            # Expiry and reclamation, which must run at the bound rather than be refused.
-            self.s.db.execute('UPDATE entries SET expires=? WHERE seq=?',
-                              (time.time() - 1, written[1]))
-            self.s.db.commit()
-            self.s.reclaim()
-            # An index rebuild, which replaces content rather than growing the store.
-            self.s.set_meta('indexed_through', 0)
-            self.s.db.commit()
-            self.s._reconcile_index()
-            self.assertTrue(self.s.index_usable())
-            self.assertLessEqual(self.s.pages(), ceiling)
+            self.assertFalse(store.index_usable())
+            store.close()
+
+            # Reopened by a runtime that has FTS, with no room to build the index.
+            with patch.object(memory, 'REBUILD_HEADROOM', 10_000):
+                reopened = memory.Store(path, REPO)
+                self.addCleanup(reopened.close)
+            # The store opened, which is the point.
+            self.assertFalse(reopened.index_usable(),
+                             'an index that could not be built must stay invalid')
+            self.assertIsNone(reopened.blocked)
+            service = memory.Service(self.home, REPO, reopened)
+            found = service.command(dict(op='recall', query=needle), 4242)
+            self.assertFalse(found['indexed'], 'the reply must say the scan answered')
+            self.assertEqual(len(found['entries']), 1,
+                             'the fallback scan must be complete, not empty')

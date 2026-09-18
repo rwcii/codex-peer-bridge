@@ -284,10 +284,38 @@ genuinely reset the log, and when the log was already empty. The return conventi
 missing log is therefore indistinguishable from success on the pragma's results alone.
 
 **The reset test is the conjunction:** the checkpoint returned `busy == 0` **and**
-`log_pages == 0`, **and** the `-wal` file is absent or exactly zero bytes. A failure is
-reported as `storage_blocked`, admits no further writes, and leaves reads and explicit
-recovery available. Under exclusive mode a foreign reader cannot exist, so a busy result
-is a genuine recovery condition rather than ordinary contention.
+`log_pages == 0`, **and** the `-wal` file is absent or exactly zero bytes. Under exclusive
+mode a foreign reader cannot exist, so a busy result is a genuine recovery condition rather
+than ordinary contention.
+
+### Every transaction, not every few
+
+The bound describes ONE transaction beginning with an empty log. Resetting once after several
+have accumulated would bound their sum, which is a larger and different quantity, so the reset
+belongs to the transaction rather than to the request. `Store.transaction` is the single write
+boundary and every durable change goes through it, **including expiry, reclamation, index
+maintenance, schema creation and the initial metadata writes**, each of which previously
+committed on its own.
+
+The page check runs **inside** that transaction. Running it after the context manager had
+committed produced an error stating the change was rolled back when it had already been
+applied -- for a cursor or a snapshot, a false report about durable progress.
+
+### A blocked store is a recorded state, and its promises are real
+
+A failed reset, or an engine refusal during a transition the reserve exists to protect,
+records a blocked state on the store. Writes are then refused with `storage_blocked` until
+recovery is asked for explicitly through the `recover` operation, rather than the next write
+being accepted as though nothing had happened.
+
+The error promises that reads, status and stop remain available, and they now are. Cleanup ran
+ahead of **every** operation, including `hello`, `status`, `recall` and `stop`, so a failed
+cleanup blocked exactly the operations the error said were still reachable. Cleanup now runs
+only ahead of operations that write.
+
+The state is held by the running service rather than written into the store, because a store
+that cannot be written cannot record that it cannot be written. A restart clears it and the
+condition is re-detected on the next write.
 
 ## 8. Conformance, not reproduction
 
@@ -312,6 +340,10 @@ asserted by a test in `test_memory.StorageBoundTests`:
 | A build without in-memory temporaries is refused | `test_a_build_without_in_memory_temporaries_is_refused` |
 | No sub-journal reaches disk (Linux) | `test_no_sub_journal_reaches_disk` |
 | A known-incomplete index is never served, and the scan is complete | `test_a_known_incomplete_index_is_never_served_and_the_scan_is_complete` |
+| No write path commits without resetting the log first | `test_no_write_path_commits_without_resetting_the_log_first` |
+| A refused progress transition is really rolled back | `test_a_refused_progress_transition_is_really_rolled_back` |
+| A blocked store still reads and recovers on request | `test_a_blocked_store_still_reads_and_recovers_on_request` |
+| A rebuild that cannot fit still opens the store in scan mode | `test_a_rebuild_that_cannot_fit_still_opens_the_store_in_scan_mode` |
 | The reserve survives a full store for every promised transition | `test_the_reserve_survives_a_full_store_for_every_promised_transition` |
 
 None of them asserts a page count, a file size or an entry total, so a build that allocates
@@ -366,9 +398,11 @@ on a breach, which rolls the transaction back.
 **Both thresholds must subtract the commit-time allocation, not just one.** While only
 enforcement did, a store resting between the two figures admitted every append and rolled
 every one back -- which presents to a caller as a store that accepts writes and loses them.
-`APPEND_ALLOWANCE` is 8 pages, derived as at most one b-tree leaf and two overflow pages for
-a body at `MAX_BODY`, its index rows, and a pointer-map page. With it, admission refuses
-first and enforcement becomes the backstop it is meant to be rather than the usual path. A control or progress
+`APPEND_ALLOWANCE` is 8 pages, sized from a leaf, two overflow pages for a body at
+`MAX_BODY`, and a pointer-map page. **It is not a bound on what an append can allocate.** The
+stored row carries more than the body, and FTS5 maintenance can allocate more than this. A
+rolled-back capacity refusal remains a correct outcome; the allowance only stops it being the
+usual one, so enforcement is the backstop it was meant to be rather than the ordinary path. A control or progress
 transition is checked against `MAX_PAGES` instead, which is what lets it draw on the
 reserve. The engine holds `max_page_count` at `MAX_PAGES` underneath both, so the ceiling
 does not depend on either check being correct.
@@ -387,19 +421,35 @@ It is justified by the transitions that must never be refused, not by an index r
 
 | Transition | Cost | Basis |
 |---|---|---|
-| Expiring a full store | about 0.28 pages per entry removed, so under 1400 pages at the entry cap | measured; a contentless FTS5 delete writes a tombstone before the vacuum returns the pages |
+| Expiring entries | one batch of `EXPIRY_BATCH` rows, not the whole store | a contentless FTS5 delete writes a tombstone before the vacuum returns pages, and the index cost of arbitrary legal content has no derived bound, so a whole-store tombstone reserve is not a quantity this design can size |
 | Withdrawal of a directive | a few pages: at most one leaf, two overflow pages and its index rows | derived from the record format, section 9's split arithmetic |
 | Acknowledgement | a few pages, updating cursor and snapshot rows | derived |
 | Retirement record | a few pages | derived |
 | Index rebuild | not assumed to be free | see below |
 
+**Expiry cannot depend on a reserve it cannot size.** It removes rows in batches of
+`EXPIRY_BATCH`, so the reserve need only cover one batch's index maintenance. If even that
+will not fit, the index is marked invalid and the rows are removed without maintaining it;
+search continues on the complete scan and the index is rebuilt when reclamation has made
+room. Reclamation therefore never needs room for a tombstone over the whole index.
+
 **A rebuild is not assumed to add nothing.** It added no pages when measured, but one
-observation does not cover every rebuild, so the design does not depend on it. A rebuild
-that cannot proceed within the reserve is refused **before** it starts rather than part way
-through, and search then answers from a complete fallback: `Service.recall` selects its
-path on `Store.index_usable`, which is true only when the index exists and covers the head,
-and otherwise scans `entries.body` directly. The reply states which path answered. The
-fallback is complete rather than empty, and a known-incomplete index is never served.
+observation does not cover every rebuild, so nothing depends on it. `REBUILD_HEADROOM` is a
+guard against beginning work that is obviously unaffordable, **not** a proof that the work
+fits: the rollback is what makes an unaffordable rebuild safe. The index is marked invalid
+**before** the rebuild begins, so an interrupted or rolled-back rebuild leaves it invalid
+rather than apparently complete.
+
+**A rebuild that cannot fit must not stop the store opening.** It runs inside
+`Store.__init__`, so a capacity failure there used to close the handle and prevent the service
+starting -- and the fallback meant for exactly this case could then never be reached, because
+nothing was serving. It is caught now: the store opens, the index stays invalid, and search
+answers from the scan.
+
+`Service.recall` selects its path on `Store.index_usable`, which is true only when the index
+exists **and** covers the head, and otherwise scans `entries.body` directly. The reply states
+which path answered. The fallback is complete rather than empty, and a known-incomplete index
+is never served.
 
 Selecting the path on trust matters more than it looks. Choosing it on whether the index
 returned rows conflates "no such entry" with "index unusable" and answers the two
@@ -475,5 +525,9 @@ admission counts reserved slots as well as bytes. That is a further reason the w
 - The index page cost is not derived. It is why `ORDINARY_MAX_PAGES` is enforced rather
   than inferred, and why a store reaching its page threshold before its logical ceiling is
   documented as a handled capacity outcome rather than ruled out.
-- A rebuild is not assumed to add no pages. It is refused before it starts when the reserve
-  cannot cover it, and search falls back to a complete scan.
+- A rebuild is not assumed to add no pages. It is guarded before it starts, rolled back if it
+  does not fit, and search falls back to a complete scan.
+- `APPEND_ALLOWANCE` and `REBUILD_HEADROOM` are guards that keep refusals rare, not bounds.
+  Neither makes a rolled-back capacity refusal impossible, and neither is claimed to.
+- The blocked state is held by the running service, not written into the store, because a
+  store that cannot be written cannot record that it cannot be written.

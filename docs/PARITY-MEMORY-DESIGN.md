@@ -323,8 +323,14 @@ transaction and rolls back on a breach, and it leaves `COMMIT_SLACK` pages of ro
 commit allocates pointer-map pages the in-transaction count does not yet report -- without
 that, an append committed one page above its threshold.
 
-**A rebuild is not assumed to be free.** It is refused before it starts when the reserve
-cannot cover it, never part way through, and search then answers from a complete scan.
+**A rebuild is not assumed to be free, and a rebuild that cannot fit must not stop the store
+opening.** The index is marked invalid before the rebuild starts, so an interrupted or
+rolled-back rebuild leaves it invalid rather than apparently complete. `REBUILD_HEADROOM`
+guards against starting obviously unaffordable work; it is not a proof that the work fits, and
+the rollback is what makes an unaffordable rebuild safe. Because the rebuild happens while the
+store is opening, a capacity failure there is caught rather than propagated: the store opens,
+the index stays invalid, and search answers from the scan. Refusing to open would be the worse
+failure, since the fallback could never be reached with nothing serving.
 `Service.recall` chooses its path on `Store.index_usable`, which requires the index to exist
 *and* to cover the head, and the reply states which path answered. Choosing the path on
 whether the index returned rows would conflate "no such entry" with "index unusable" and
@@ -337,6 +343,29 @@ when the last checkpoint ran, and how far a given SQLite build shrank the file d
 recovery. Admission now reads `page_count` alone. The log is not in the comparison
 because it is bounded separately and reset before every write.
 
+**One write boundary, and every durable change goes through it.** The bound describes a
+single transaction beginning with an empty log, so the reset belongs to the transaction rather
+than to the request. `Store.transaction` carries expiry, reclamation, index maintenance, schema
+creation and the initial metadata writes as well as appends; resetting once after several
+transactions had accumulated would bound their sum, which is a larger and different quantity.
+The page check runs inside that transaction, because running it after the commit produced an
+error saying a change was rolled back when it had already been applied -- for a cursor or a
+snapshot, a false report about durable progress.
+
+**A blocked store is a recorded state with real promises.** A failed reset, or an engine
+refusal during a transition the reserve protects, records the block; writes are refused with
+`storage_blocked` until recovery is requested explicitly through the `recover` operation.
+Reads, status and stop stay available, and cleanup runs only ahead of operations that write,
+so a failed cleanup cannot block the operations the error says remain reachable. The state
+lives in the running service rather than in the store, because a store that cannot be written
+cannot record that it cannot be written.
+
+**Expiry is batched, so reclamation never needs a reserve it cannot size.** Rows are removed
+`EXPIRY_BATCH` at a time. A contentless FTS5 delete writes a tombstone before the vacuum
+returns pages, and the index cost of arbitrary legal content has no derived bound, so if a
+batch's index maintenance will not fit, the index is marked invalid and the rows are removed
+without it. Search continues on the complete scan and the index is rebuilt when there is room.
+
 **A reset is verified before every write transaction, and the test is a conjunction.**
 `PRAGMA wal_checkpoint(TRUNCATE)` must return `busy == 0` **and** `log_pages == 0`, and
 the `-wal` file must be absent or exactly zero bytes. No single one of these is
@@ -346,11 +375,11 @@ is also what a store returns when no log has ever existed. A failed reset report
 available. Under exclusive mode no foreign reader can exist, so a busy result is a
 genuine recovery condition and not ordinary contention.
 
-**Maintenance and control capacity are reserved from ordinary admission.** An
-acknowledgement, a retirement record, a withdrawal and an index rebuild draw on a reserve
-that ordinary appends may not consume, so a full store can still record progress and
-retract a directive. A rebuild that would exceed the reserve is refused before it starts,
-never part way through, and a known incomplete index is never served.
+**Maintenance and control capacity are reserved from ordinary admission.** The reserve covers
+a defined set: page issuance, acknowledgement, activity refresh, withdrawal, retirement and
+reclamation. It deliberately does **not** cover registering a new consumer or freezing a fresh
+snapshot; those add rows a caller controls, so they are ordinary growth and are refused at a
+full store like any other append. A known incomplete index is never served.
 
 **Auxiliary files are bounded rather than excused.** Sorters are held in memory.
 Sub-journals reach disk only when SQLite's temp-in-memory predicate is false:
