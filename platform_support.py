@@ -41,6 +41,7 @@ SUPPORTED = DARWIN or LINUX
 SERVICE_MANAGER = 'systemd' if LINUX else None
 # Explicit configuration/ownership refusals require operator action, not restart loops.
 CONFIGURATION_EXIT_STATUS = 78
+TEMPORARY_EXIT_STATUS = 75
 
 if not SUPPORTED:
     raise RuntimeError(f'unsupported platform: {sys.platform}')

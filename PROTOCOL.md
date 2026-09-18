@@ -66,6 +66,11 @@ Memory reuse likewise distinguishes `service_busy`, `service_unresponsive`,
 listener. A connected service with another identity is `foreign_service`. These results
 refuse a replacement start; only a missing or refused connection takes the absent-listener
 path, which still requires the existing ownership checks before binding.
+The memory CLI prints structured errors for these refusals. Busy/unresponsive/unavailable
+services and capacity refusals exit 75 (retryable). Identity, ownership, permissions,
+configuration and invalid-handshake refusals exit 78 (operator correction required).
+Other request errors retain exit 1. A lost stop reply remains ambiguous: stop observes
+the selected generation before reporting its exit.
 
 These path checks do not authenticate a service role. Memory-service reuse additionally
 requires agreement between the connected kernel PID, the hello response and the owner

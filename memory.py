@@ -214,6 +214,14 @@ class MemoryError_(ValueError):
         self.code, self.detail = code, detail
 
 
+def private_state_dir(path):
+    try:
+        private_dir(path)
+    except (ValueError, PermissionError, FileExistsError, NotADirectoryError):
+        raise MemoryError_('unsafe_state_directory',
+                           'the state directory must be a private directory owned by this user') from None
+
+
 def repo_identity(start=None):
     """Canonical repository key: the Git common directory, absolute, hashed.
 
@@ -1879,7 +1887,7 @@ async def verify_running(root, repo):
 def bind_exclusive(home, repo, generation):
     """Bind the control socket, recovering only from a provably dead owner."""
     control = platform_support.control_socket_path(Path(home))
-    private_dir(control.parent)
+    private_state_dir(control.parent)
     for attempt in (0, 1):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -1908,7 +1916,7 @@ def bind_exclusive(home, repo, generation):
 
 def start(home, repo, store_factory):
     """Serialized start. Check and bind happen under one lock, never as a race."""
-    private_dir(Path(home))
+    private_state_dir(Path(home))
     with (Path(home) / 'start.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         existing = asyncio.run(verify_running(home, repo))
@@ -1980,10 +1988,18 @@ def stop_service(home, repo, timeout=20):
     try:
         reply = asyncio.run(request(home, dict(op='stop', repo=repo, generation=generation),
                                     timeout=5))
+        if not reply.get('ok') and reply.get('code') == 'capacity':
+            raise MemoryError_('service_busy', 'the service is at request capacity; retry stop after pending work settles')
         if not reply.get('ok') and reply.get('code') == 'not_this_instance':
             # A successor already owns the endpoint, so the instance we meant to stop is
             # gone and the one now running must be left alone.
             return dict(status='stopped', generation=generation, superseded=True)
+        if not reply.get('ok'):
+            raise MemoryError_('service_refused', 'the listening service refused the stop request')
+    except MemoryError_ as exc:
+        if exc.code != 'no_reply':
+            raise
+        # A lost stop reply is ambiguous; observe the exact instance below.
     except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
         # It may already be draining or gone. The wait below decides, not this call.
         pass
@@ -2012,7 +2028,7 @@ def stop_service(home, repo, timeout=20):
                     detail='the service has not exited within the timeout and is not proven dead')
 
 
-def main():
+def cli_main():
     os.umask(0o077)
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state-dir', default=str(Path(os.environ.get(
@@ -2051,9 +2067,9 @@ def main():
     args = vars(p.parse_args())
     root = Path(args.pop('state_dir')).absolute()
     repo = repo_identity(args.pop('repo_path'))
-    private_dir(root)
+    private_state_dir(root)
     home = state_dir(root, repo)
-    private_dir(home)
+    private_state_dir(home)
     op = args.pop('op')
     if op == 'serve':
         print(json.dumps(serve(home, repo, lambda: Store(home / 'memory.sqlite3', repo))))
@@ -2069,7 +2085,27 @@ def main():
     except (ConnectionRefusedError, FileNotFoundError) as exc:
         raise SystemExit(f'no memory service is running for this repository ({home})') from exc
     print(json.dumps(reply, indent=2))
-    raise SystemExit(0 if reply.get('ok') else 1)
+    raise SystemExit(0 if reply.get('ok') else memory_error_exit_status(reply.get('code')))
+
+
+def memory_error_exit_status(code):
+    if code in ('service_busy', 'service_unresponsive', 'service_unavailable',
+                'store_busy', 'capacity'):
+        return platform_support.TEMPORARY_EXIT_STATUS
+    if code in ('foreign_service', 'unsafe_service_endpoint', 'unsafe_state_directory', 'unknown_owner',
+                'ownership_mismatch', 'wrong_repository', 'incompatible_store',
+                'schema_too_new', 'schema_too_old', 'repo_unresolved',
+                'unhealthy_service', 'invalid_service_response', 'socket_in_use'):
+        return platform_support.CONFIGURATION_EXIT_STATUS
+    return 1
+
+
+def main():
+    try:
+        return cli_main()
+    except MemoryError_ as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, error=exc.detail)))
+        raise SystemExit(memory_error_exit_status(exc.code)) from None
 
 
 if __name__ == '__main__':

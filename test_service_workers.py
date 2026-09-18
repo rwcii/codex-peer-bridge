@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -306,3 +308,61 @@ class ServiceWorkerTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(memory.MemoryError_) as caught:
                     await memory.verify_running(self.root, REPO)
                 self.assertEqual(caught.exception.code, code)
+
+    async def test_memory_cli_reports_retryable_and_permanent_refusals_without_tracebacks(self):
+        repo_path = self.root/'repo'
+        repo_path.mkdir()
+        subprocess.run(['git', 'init', '-q', str(repo_path)], check=True, capture_output=True)
+        repo = memory.repo_identity(repo_path)
+        home = memory.state_dir(self.root/'state', repo)
+        memory.private_dir(self.root/'state')
+        memory.private_dir(home)
+        response = {}
+        async def answer(reader, writer):
+            try:
+                await reader.readline()
+                writer.write(bridge.encode(response))
+                await writer.drain()
+            finally:
+                await close_writer(writer)
+        control = memory.platform_support.control_socket_path(home)
+        memory.private_dir(control.parent)
+        server = await asyncio.start_unix_server(answer, control)
+        self.servers.append(server)
+        os.chmod(control, 0o600)
+        for reply, code, exit_status in ((dict(ok=False, code='capacity'), 'service_busy', 75),
+                                        (dict(ok=True, result=dict(service='foreign')), 'foreign_service', 78)):
+            response.clear()
+            response.update(reply)
+            with self.subTest(code=code):
+                child = await asyncio.create_subprocess_exec(
+                    sys.executable, str(Path(memory.__file__)), '--state-dir', str(self.root/'state'),
+                    '--repo-path', str(repo_path), 'serve',
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                stdout, stderr = await asyncio.wait_for(child.communicate(), 5)
+                self.assertEqual(child.returncode, exit_status, stderr.decode())
+                self.assertEqual(json.loads(stdout)['code'], code)
+                self.assertNotIn(b'Traceback', stderr)
+                self.assertFalse((home/'memory.sqlite3').exists())
+        (home/'owner.json').write_text(json.dumps(dict(repo='foreign-repository')))
+        child = await asyncio.create_subprocess_exec(
+            sys.executable, str(Path(memory.__file__)), '--state-dir', str(self.root/'state'),
+            '--repo-path', str(repo_path), 'stop',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(child.communicate(), 5)
+        self.assertEqual(child.returncode, 78, stderr.decode())
+        self.assertEqual(json.loads(stdout)['code'], 'wrong_repository')
+        self.assertNotIn(b'Traceback', stderr)
+
+        os.chmod(self.root/'state', 0o755)
+        try:
+            child = await asyncio.create_subprocess_exec(
+                sys.executable, str(Path(memory.__file__)), '--state-dir', str(self.root/'state'),
+                '--repo-path', str(repo_path), 'serve',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await asyncio.wait_for(child.communicate(), 5)
+            self.assertEqual(child.returncode, 78, stderr.decode())
+            self.assertEqual(json.loads(stdout)['code'], 'unsafe_state_directory')
+            self.assertNotIn(b'Traceback', stderr)
+        finally:
+            os.chmod(self.root/'state', 0o700)

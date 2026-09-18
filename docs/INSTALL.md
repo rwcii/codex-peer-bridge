@@ -213,7 +213,15 @@ numbers to avoid repeating work. A successful socket send is not proof of model 
 ## Shared repository memory
 
 The memory service is optional and independent of the bridge. It is not installed as a service
-unit, and nothing starts it automatically. Run one per repository, from inside that repository:
+unit, and nothing starts it automatically. Memory CLI errors use a structured
+`ok:false` response with a recovery code. Exit 75 means temporary unavailability or
+capacity; retry after pending work settles. Exit 78 means an identity, ownership,
+configuration, permissions or invalid-handshake refusal that needs operator correction.
+Other request failures exit 1. If you manage memory with a separate service manager,
+keep 75 retryable and exclude 78 from automatic restarts. No memory service unit is
+created by the installer.
+
+Run one per repository, from inside that repository:
 
 ```sh
 python3 memory.py serve
