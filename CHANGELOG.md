@@ -25,7 +25,11 @@ into a dated release section when promoted to `main`.
   while status, search and stop stay available. Expiry removes entries in batches, and falls
   back to invalidating the index rather than requiring room to maintain it, so a full store can
   always be reclaimed. A search index that cannot be rebuilt leaves the store serving complete
-  scans instead of failing to open. Search answers from the index only while the
+  scans instead of failing to open, and an index the store cannot maintain is marked invalid
+  rather than left silently short. Initialisation writes the schema and the identity that
+  describes it in one transaction, so an interrupted first start leaves nothing half-made, and a
+  store left in that state by an earlier version completes rather than being reported as another
+  repository's. Recovery is available as a `recover` subcommand. Search answers from the index only while the
   index is known to cover every live entry, and otherwise from a complete scan, and the reply
   says which answered. Start is
   serialized, and a socket left by an unclean exit is recovered only after its recorded owner is

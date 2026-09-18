@@ -43,27 +43,33 @@ import platform_support
 PROTOCOL = 1
 SCHEMA = 3
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+# One statement per element. `executescript` runs a script in autocommit mode, so these
+# would be one separately committed transaction each: a mid-script failure left the earlier
+# tables behind, and only the first transaction would begin from an empty log. They are
+# executed individually inside one explicit transaction instead, which SQLite supports for
+# DDL -- a rollback removes every table the transaction created.
+SCHEMA_STATEMENTS = (
+"""CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)""",
+"""
 CREATE TABLE IF NOT EXISTS entries(
     seq INTEGER PRIMARY KEY, ts REAL, type TEXT, scope TEXT, scope_target TEXT, path TEXT,
     body TEXT, author TEXT, author_pid INTEGER, consumer TEXT, revision INTEGER,
     supersedes INTEGER, revokes INTEGER, superseded_by INTEGER, revoked_by INTEGER,
-    conflicts_with INTEGER, expires REAL);
-CREATE TABLE IF NOT EXISTS idem(
-    key TEXT PRIMARY KEY, fingerprint TEXT, seq INTEGER, ts REAL, deadline REAL);
-CREATE TABLE IF NOT EXISTS cursors(
+    conflicts_with INTEGER, expires REAL)""",
+"""CREATE TABLE IF NOT EXISTS idem(
+    key TEXT PRIMARY KEY, fingerprint TEXT, seq INTEGER, ts REAL, deadline REAL)""",
+"""CREATE TABLE IF NOT EXISTS cursors(
     consumer TEXT PRIMARY KEY, seq INTEGER, issued INTEGER, snapshot TEXT,
-    bootstrapped INTEGER, resnapshot INTEGER, updated REAL);
-CREATE TABLE IF NOT EXISTS retired(consumer TEXT PRIMARY KEY, seq INTEGER, at REAL);
-CREATE TABLE IF NOT EXISTS snapshots(
+    bootstrapped INTEGER, resnapshot INTEGER, updated REAL)""",
+"""CREATE TABLE IF NOT EXISTS retired(consumer TEXT PRIMARY KEY, seq INTEGER, at REAL)""",
+"""CREATE TABLE IF NOT EXISTS snapshots(
     id TEXT PRIMARY KEY, consumer TEXT, head INTEGER, created REAL, items INTEGER,
-    issued INTEGER, acked INTEGER, acked_at REAL);
-CREATE TABLE IF NOT EXISTS snapshot_items(
+    issued INTEGER, acked INTEGER, acked_at REAL)""",
+"""CREATE TABLE IF NOT EXISTS snapshot_items(
     id TEXT, position INTEGER, seq INTEGER, payload TEXT, bytes INTEGER,
-    PRIMARY KEY(id, position));
-CREATE INDEX IF NOT EXISTS entries_live ON entries(superseded_by, revoked_by, expires);
-"""
+    PRIMARY KEY(id, position))""",
+"""CREATE INDEX IF NOT EXISTS entries_live ON entries(superseded_by, revoked_by, expires)""",
+)
 TYPES = ('decision', 'finding', 'gotcha', 'handoff', 'status', 'directive')
 SCOPES = ('repo', 'task', 'session')
 
@@ -246,19 +252,22 @@ class Store:
         # or creating tables first would modify a store this runtime has already decided
         # it cannot understand, which is the opposite of refusing to touch it.
         existing = Path(path).exists() and Path(path).stat().st_size > 0
-        self.db = sqlite3.connect(path)
+        # Autocommit, with every transaction opened explicitly below. The driver starts an
+        # implicit transaction only for INSERT, UPDATE, DELETE and REPLACE, so DDL ran in
+        # autocommit however it was wrapped, and the schema stayed several transactions.
+        self.db = sqlite3.connect(path, isolation_level=None)
         self.blocked = None
         try:
             if existing:
                 self.inspect(repo)
             self.configure()
-            # executescript issues its own COMMIT, so it cannot run inside a transaction
-            # context. The log is reset immediately before it instead, which is what the
-            # bound asks of the transaction it then runs.
-            self.reset_log()
-            self.db.executescript(SCHEMA_SQL)
-            if not existing:
+            # The schema and the metadata that identifies it are one transaction. Split
+            # across two, an interruption between them left a store with tables and no
+            # identity, which `inspect` could only read as belonging to another repository.
+            if self.uninitialised():
                 with self.transaction():
+                    for statement in SCHEMA_STATEMENTS:
+                        self.db.execute(statement)
                     for key, value in (('repo', repo), ('protocol', PROTOCOL),
                                        ('schema', SCHEMA), ('head', 0), ('floor', 0)):
                         self.set_meta(key, value)
@@ -379,22 +388,28 @@ class Store:
         """
         self.require_writable()
         self.reset_log()
+        self.db.execute('BEGIN IMMEDIATE')
         try:
-            with self.db:
-                yield
-                self.enforce_pages(control)
-        except sqlite3.OperationalError as exc:
-            if not storage_exhausted(exc):
-                raise
-            # The engine refused a page, so the transaction was rolled back whole.
-            if control and blocking:
-                self.block(f'the engine refused a page at the {MAX_PAGES} page ceiling '
-                           'during a transition the reserve exists to protect')
-                raise MemoryError_('storage_blocked', self.blocked) from exc
-            raise MemoryError_(
-                'capacity',
-                f'the engine refused a page at the {MAX_PAGES} page ceiling; the '
-                'transaction was rolled back and stored data is intact') from exc
+            yield
+            self.enforce_pages(control)
+            self.db.execute('COMMIT')
+        except BaseException as exc:
+            # The rollback comes first and unconditionally, so no path can leave a
+            # transaction open. A failed COMMIT is rolled back here too.
+            try:
+                self.db.execute('ROLLBACK')
+            except sqlite3.Error:
+                pass
+            if isinstance(exc, sqlite3.OperationalError) and storage_exhausted(exc):
+                if control and blocking:
+                    self.block(f'the engine refused a page at the {MAX_PAGES} page ceiling '
+                               'during a transition the reserve exists to protect')
+                    raise MemoryError_('storage_blocked', self.blocked) from exc
+                raise MemoryError_(
+                    'capacity',
+                    f'the engine refused a page at the {MAX_PAGES} page ceiling; the '
+                    'transaction was rolled back and stored data is intact') from exc
+            raise
 
     def block(self, reason):
         """Record that writes cannot proceed until recovery is asked for explicitly.
@@ -412,15 +427,36 @@ class Store:
             raise MemoryError_('storage_blocked', self.blocked)
 
     def recover(self):
-        """The explicit path out of a blocked store. Reads never depended on it."""
-        self.reset_log_unchecked()
-        self.db.execute('PRAGMA incremental_vacuum').fetchall()
-        busy, log_pages, residual = self.log_state()
+        """The explicit path out of a blocked store. Reads never depended on it.
+
+        Recovery is itself a write, so it obeys the same precondition it exists to restore:
+        the log is reset and the result verified BEFORE anything is written. Reclaiming
+        pages first would have written through an unreset log, which is the very state
+        being recovered from, and swallowing the checkpoint's errors would have hidden the
+        reason. The block is kept unless every postcondition holds.
+        """
+        try:
+            busy, log_pages, residual = self.log_state()
+        except sqlite3.Error as exc:
+            self.block(f'recovery could not checkpoint the log ({type(exc).__name__})')
+            raise MemoryError_('storage_blocked', self.blocked) from exc
         if busy or log_pages or residual:
-            self.block('recovery could not reset the write-ahead log')
+            self.block(f'recovery could not reset the write-ahead log (busy={busy}, '
+                       f'log_pages={log_pages}, {residual} bytes remain). Nothing was '
+                       'written')
+            raise MemoryError_('storage_blocked', self.blocked)
+        # Only now is a write permissible.
+        try:
+            self.db.execute('PRAGMA incremental_vacuum').fetchall()
+            busy, log_pages, residual = self.log_state()
+        except sqlite3.Error as exc:
+            self.block(f'recovery could not reclaim pages ({type(exc).__name__})')
+            raise MemoryError_('storage_blocked', self.blocked) from exc
+        if busy or log_pages or residual:
+            self.block('recovery reclaimed pages but could not reset the log afterwards')
             raise MemoryError_('storage_blocked', self.blocked)
         self.blocked = None
-        return dict(recovered=True, pages=self.pages())
+        return dict(recovered=True, pages=self.pages(), blocked=None)
 
     @staticmethod
     def page_cap(control):
@@ -443,20 +479,15 @@ class Store:
         """
         busy, log_pages, residual = self.log_state()
         if busy or log_pages or residual:
-            raise MemoryError_(
-                'storage_blocked',
-                f'the write-ahead log could not be reset (busy={busy}, '
-                f'log_pages={log_pages}, {residual} bytes remain), so the bound on a '
-                'write cannot be held. No write was attempted and stored data is intact; '
-                'reads and recovery remain available')
+            # The block is recorded here rather than by the caller. `transaction` resets
+            # before its own try block, so a failure raised from here bypassed the handler
+            # and the state the message promised was never retained: the next write was
+            # then accepted as though the reset had succeeded.
+            self.block(f'the write-ahead log could not be reset (busy={busy}, '
+                       f'log_pages={log_pages}, {residual} bytes remain), so the bound on '
+                       'a write cannot be held. No write was attempted')
+            raise MemoryError_('storage_blocked', self.blocked)
         return True
-
-    def reset_log_unchecked(self):
-        """Attempt a reset without refusing on the result. Only recovery uses this."""
-        try:
-            self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
-        except sqlite3.Error:
-            pass
 
     def log_state(self):
         """The checkpoint's three results, and the log file that no result describes."""
@@ -467,6 +498,32 @@ class Store:
         except OSError:
             residual = 0
         return busy, log_pages, residual
+
+    def uninitialised(self):
+        """Does this file still need its schema and identity written?
+
+        A file can exist with neither, and it can exist with tables but no identity if an
+        older runtime was interrupted between the two transactions that used to create
+        them. Both are the same recoverable state: nothing has been recorded, so
+        initialisation may complete. A file carrying entries but no identity is NOT this
+        state and is refused by `inspect`, because completing initialisation there would
+        adopt another store's data under this repository's name.
+        """
+        try:
+            self.db.execute('SELECT 1 FROM meta LIMIT 1').fetchone()
+        except sqlite3.Error:
+            return True                      # no meta table at all
+        if self.db.execute('SELECT count(*) FROM meta').fetchone()[0]:
+            return False
+        try:
+            if self.db.execute('SELECT 1 FROM entries LIMIT 1').fetchone():
+                raise MemoryError_(
+                    'incompatible_store',
+                    'this file holds entries but records no repository identity, so it '
+                    'cannot be adopted; it was left untouched')
+        except sqlite3.OperationalError:
+            pass                             # no entries table either
+        return True
 
     def inspect(self, repo):
         """Read-only compatibility check on an existing store. Writes nothing."""
@@ -484,6 +541,10 @@ class Store:
             raise MemoryError_('incompatible_store',
                                f'this file is not a memory store ({type(exc).__name__}); it was '
                                'left untouched') from exc
+        if not rows:
+            # Nothing recorded yet. `uninitialised` decides whether that is recoverable;
+            # reporting another repository here would misname an interrupted first start.
+            return
         if rows.get('repo') != repo:
             raise MemoryError_('wrong_repository',
                                'state directory belongs to another repository; it was left '
@@ -503,12 +564,23 @@ class Store:
     # --- schema helpers -------------------------------------------------------
 
     def _open_fts(self):
+        """Create the search table if this build has FTS5 and there is room for it.
+
+        The index is optional, so neither a build without FTS5 nor a store too full to hold
+        the table may stop the service starting. `transaction` translates an engine refusal
+        into MemoryError_, so catching sqlite3.Error alone would have let that escape and
+        fail the open.
+        """
         try:
-            with self.transaction():
+            with self.transaction(blocking=False):
                 self.db.execute(
                     'CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(body, content="")')
             return True
         except sqlite3.Error:
+            return False
+        except MemoryError_ as exc:
+            if exc.code != 'capacity':
+                raise
             return False
 
     def _reconcile_index(self):
@@ -533,7 +605,7 @@ class Store:
             return
         if int(self.meta('indexed_through') or 0) == self.head():
             return
-        with self.transaction():
+        with self.transaction(blocking=False):
             self.set_meta('indexed_through', -1)
         if self.pages() > self.page_cap(control=True) - REBUILD_HEADROOM:
             # Refused before it starts rather than part way through. Search stays on the
@@ -553,8 +625,14 @@ class Store:
             # This is a degraded service, not a broken one, and it is reachable.
 
     def _unindex(self, rows):
-        """A contentless FTS5 table needs an explicit delete; dropping the row is not enough."""
-        if not self.fts:
+        """A contentless FTS5 table needs an explicit delete; dropping the row is not enough.
+
+        Usability, not mere presence, is the test. While the store is serving scans the
+        index does not hold rows written since it was invalidated, and issuing a delete for
+        one of those is an instruction to remove a posting that was never added. The index
+        is already known wrong, so there is nothing to maintain and nothing to gain.
+        """
+        if not self.index_usable():
             return
         for seq, body in rows:
             self.db.execute("INSERT INTO search(search,rowid,body) VALUES('delete',?,?)", (seq, body))
@@ -788,12 +866,19 @@ class Store:
             if not batch:
                 break
             try:
-                with self.transaction():
+                # Non-blocking: index maintenance that meets the engine ceiling must reach
+                # the fallback below, not block the store. Blocking here skipped the
+                # invalidate-and-delete path at exactly the moment it was needed, because
+                # the handler caught capacity while the engine raised a blocked store.
+                with self.transaction(blocking=False):
                     self._unindex(batch)
                     self._forget(batch)
             except MemoryError_ as exc:
                 if exc.code != 'capacity':
                     raise
+                # The speculative attempt rolled back. Invalidate durably first, so a
+                # failure between here and the delete leaves the index known-wrong rather
+                # than silently short, then remove the rows without maintaining it.
                 with self.transaction():
                     self.set_meta('indexed_through', -1)
                 with self.transaction():
@@ -1725,7 +1810,7 @@ def main():
     p.add_argument('--repo-path', default=os.getcwd())
     p.add_argument('--consumer', help='stable consumer key; required for note, sync and ack')
     sub = p.add_subparsers(dest='op', required=True)
-    for op in ('serve', 'stop'):
+    for op in ('serve', 'stop', 'recover'):
         sub.add_parser(op)
     n = sub.add_parser('note')
     n.add_argument('body')

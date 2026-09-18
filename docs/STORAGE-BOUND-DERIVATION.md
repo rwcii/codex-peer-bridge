@@ -301,6 +301,38 @@ The page check runs **inside** that transaction. Running it after the context ma
 committed produced an error stating the change was rolled back when it had already been
 applied -- for a cursor or a snapshot, a false report about durable progress.
 
+### Every transaction in the runtime
+
+Every entry below is an actual `BEGIN IMMEDIATE` in `memory.py`. Nothing else in the file
+opens a transaction, and the connection is opened in autocommit mode so nothing can open one
+implicitly. The driver starts an implicit transaction only for `INSERT`, `UPDATE`, `DELETE`
+and `REPLACE`, so DDL ran in autocommit whatever it was wrapped in -- which is why the schema
+was several separately committed transactions until these boundaries were made explicit.
+
+| Transaction | Reset before | Commit | Rollback | Outcome on refusal |
+|---|---|---|---|---|
+| Initialisation: all 8 schema statements plus the 5 identity rows, one transaction | yes | on success | on any error, removing every table it created | the error, with no tables left behind |
+| `_open_fts`: create the search table | yes | on success | on error | `capacity` is swallowed and FTS is reported absent, so the store opens on scans |
+| `_reconcile_index`: mark the index invalid | yes | on success | on error | non-blocking; the store opens on scans |
+| `_reconcile_index`: rebuild the index | yes | on success | on any error, leaving the index invalid | non-blocking `capacity`, caught, so the store opens on scans |
+| `mutation`: an append, a control write, a registration | yes | on success | on refusal or error | `capacity`, rolled back, data intact |
+| `progress`: page issuance, acknowledgement, refresh | yes | on success | on refusal or error | `capacity`; an engine refusal blocks the store |
+| `expire`: one batch, with index maintenance | yes | on success | on refusal or error | non-blocking `capacity`, which the fallback below catches |
+| `expire`: mark the index invalid, after that fallback | yes | on success | on error | the error |
+| `expire`: the same batch without index maintenance | yes | on success | on error | the error |
+| `expire`: snapshot, idempotency, retirement and cursor cleanup | yes | on success | on error | the error |
+| `reclaim`: prune idempotency rows past retention | yes | on success | on error | the error |
+| `reclaim`: `PRAGMA incremental_vacuum` (its own transaction) | yes, and reset again afterwards | by the pragma | by the pragma | the error |
+| `recover`: `PRAGMA incremental_vacuum` (its own transaction) | yes, **verified** before it runs | by the pragma | by the pragma | the block is kept and nothing is written |
+
+`reset_log` is the only reset, and it records the block itself. It is called before the
+`BEGIN`, so a failure there raises before any transaction exists -- which is why the block
+must be recorded inside it rather than by the caller's handler, as that handler is never
+reached.
+
+Two pragmas run their own transactions rather than sitting inside one, because
+`incremental_vacuum` cannot usefully be wrapped. Both are bracketed by resets.
+
 ### A blocked store is a recorded state, and its promises are real
 
 A failed reset, or an engine refusal during a transition the reserve exists to protect,
@@ -312,6 +344,14 @@ The error promises that reads, status and stop remain available, and they now ar
 ahead of **every** operation, including `hello`, `status`, `recall` and `stop`, so a failed
 cleanup blocked exactly the operations the error said were still reachable. Cleanup now runs
 only ahead of operations that write.
+
+Recovery is itself a write, so it obeys the precondition it exists to restore: the log is
+reset and **the result verified** before anything is written. Reclaiming pages first, or
+swallowing the checkpoint's errors, would have written through the very unreset log being
+recovered from and hidden the reason. The block is kept unless every postcondition holds, and
+`recover` is reachable both as a service operation and as a command-line subcommand -- it was
+documented before the subcommand existed, so an operator following the contract had no way to
+take it.
 
 The state is held by the running service rather than written into the store, because a store
 that cannot be written cannot record that it cannot be written. A restart clears it and the
@@ -343,6 +383,16 @@ asserted by a test in `test_memory.StorageBoundTests`:
 | No write path commits without resetting the log first | `test_no_write_path_commits_without_resetting_the_log_first` |
 | A refused progress transition is really rolled back | `test_a_refused_progress_transition_is_really_rolled_back` |
 | A blocked store still reads and recovers on request | `test_a_blocked_store_still_reads_and_recovers_on_request` |
+| The schema statements are one transaction | `InitialisationBoundaryTests.test_the_schema_statements_are_one_transaction` |
+| A store with tables but no identity completes initialisation | `InitialisationBoundaryTests.test_a_store_with_tables_but_no_identity_completes_initialisation` |
+| A store holding entries without identity is refused | `InitialisationBoundaryTests.test_a_store_holding_entries_without_identity_is_refused` |
+| A failed reset is recorded and holds later writes | `ResetFailureTests.test_a_failed_reset_is_recorded_and_holds_later_writes` |
+| A blocked store answers status and search | `ResetFailureTests.test_a_blocked_store_answers_status_and_search` |
+| A failed recovery keeps the block and writes nothing | `ResetFailureTests.test_a_failed_recovery_keeps_the_block_and_writes_nothing` |
+| Recovery clears the block once the log can be reset | `ResetFailureTests.test_recovery_clears_the_block_once_the_log_can_be_reset` |
+| Recovery is reachable from the command line | `LifecycleTests.test_recovery_is_reachable_from_the_command_line` |
+| A scan-mode store expires across batches without touching the index | `ScanModeExpiryTests.test_a_scan_mode_store_expires_across_batches_without_touching_the_index` |
+| Index maintenance that cannot fit invalidates and still removes the rows | `ScanModeExpiryTests.test_index_maintenance_that_cannot_fit_invalidates_and_still_removes_the_rows` |
 | A rebuild that cannot fit still opens the store in scan mode | `test_a_rebuild_that_cannot_fit_still_opens_the_store_in_scan_mode` |
 | The reserve survives a full store for every promised transition | `test_the_reserve_survives_a_full_store_for_every_promised_transition` |
 

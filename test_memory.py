@@ -836,6 +836,25 @@ class LifecycleTests(unittest.TestCase):
     def client(self, **payload):
         return asyncio.run(memory.request(self.home, payload))
 
+    def test_recovery_is_reachable_from_the_command_line(self):
+        """The documented recovery path must exist as a subcommand, not only as an op.
+
+        `recover` was implemented in the service and described in the contract while
+        argparse offered no such subcommand, so an operator following the documentation had
+        no way to take it.
+        """
+        server = self.spawn('serve')
+        self.wait_for_socket(pid=server.pid)
+        client = self.spawn('recover')
+        stdout, stderr = client.communicate(timeout=20)
+        self.assertEqual(client.returncode, 0, stderr)
+        reply = json.loads(stdout)
+        self.assertTrue(reply.get('ok'), reply)
+        self.assertTrue(reply['result']['recovered'])
+        self.assertIsNone(reply['result']['blocked'])
+        # The service is still serving afterwards.
+        self.assertTrue(self.client(op='hello')['ok'])
+
     def test_concurrent_first_start_elects_one_service(self):
         # Three real starts race from cold. Exactly one may serve; the others must
         # reuse it rather than bind, fail, or corrupt the state directory.
@@ -1175,8 +1194,10 @@ class StorageBoundTests(Base):
 
     def test_frames_never_exceed_dirty_pages_plus_the_padding_bound(self):
         """F <= D + P, with P bounded by the sector-size ceiling."""
-        self.s.reset_log()
-        with self.s.db:
+        # The store's own boundary, not `with db:`. On an autocommit connection that
+        # context manager wraps nothing, so each statement would commit separately and the
+        # log would hold the sum of three hundred transactions rather than one.
+        with self.s.transaction():
             for i in range(300):
                 self.s.db.execute(
                     'INSERT INTO entries(seq,ts,type,scope,body,author,revision) '
@@ -1323,7 +1344,7 @@ class StorageBoundTests(Base):
 
         for i in range(60):
             self.note('body ' + str(i) * 200, kind='finding')
-        with self.s.db:
+        with self.s.transaction():
             self.s.db.execute('UPDATE entries SET revision=revision+1')
             self.s.db.execute('DELETE FROM entries WHERE seq % 3 = 0')
         self.assertEqual({t: n for t, n in unlinked().items() if n}, {},
@@ -1634,3 +1655,236 @@ class StorageBoundTests(Base):
             self.assertFalse(found['indexed'], 'the reply must say the scan answered')
             self.assertEqual(len(found['entries']), 1,
                              'the fallback scan must be complete, not empty')
+
+
+class InitialisationBoundaryTests(unittest.TestCase):
+    """Initialisation is not exempt from the bound, and must not leave a half-store."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.path = self.home/'memory.sqlite3'
+
+    def write_schema_only(self, path, extra=()):
+        """A store carrying the schema but no identity, with the pragmas the runtime needs.
+
+        Without those pragmas `configure` refuses first and the test would be measuring the
+        readback rather than the state it means to set up.
+        """
+        db = sqlite3.connect(path, isolation_level=None)
+        db.execute('PRAGMA auto_vacuum=INCREMENTAL')
+        db.execute('PRAGMA page_size=4096')
+        db.execute('PRAGMA journal_mode=WAL')
+        for statement in memory.SCHEMA_STATEMENTS:
+            db.execute(statement)
+        for statement in extra:
+            db.execute(statement)
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+        db.close()
+
+    def tables(self, path):
+        db = sqlite3.connect(path)
+        try:
+            return sorted(r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        finally:
+            db.close()
+
+    def test_the_schema_statements_are_one_transaction(self):
+        """`executescript` would commit each statement separately.
+
+        Demonstrated directly rather than asserted: a script that fails part way leaves the
+        tables its earlier statements created, which is what made initialisation several
+        unreset transactions instead of one.
+        """
+        loose = self.home/'loose.sqlite3'
+        db = sqlite3.connect(loose)
+        self.addCleanup(db.close)
+        with self.assertRaises(sqlite3.Error):
+            db.executescript('CREATE TABLE a(x);\nCREATE TABLE b(x);\nNOT SQL AT ALL;\n')
+        self.assertEqual(self.tables(loose), ['a', 'b'],
+                         'a failed script left no tables, so this premise needs revisiting')
+
+        # The store's own initialisation must instead be atomic.
+        real = self.home/'atomic.sqlite3'
+        original = memory.Store.set_meta
+
+        def fail_on_schema_key(self_, key, value):
+            if key == 'schema':
+                raise RuntimeError('interrupted part way through initialisation')
+            return original(self_, key, value)
+
+        with patch.object(memory.Store, 'set_meta', fail_on_schema_key):
+            with self.assertRaises(RuntimeError):
+                memory.Store(real, REPO)
+        self.assertEqual(self.tables(real), [],
+                         'an interrupted initialisation left tables behind')
+
+    def test_a_store_with_tables_but_no_identity_completes_initialisation(self):
+        """The state an older split initialisation could leave must be recoverable.
+
+        Tables with no identity used to read as belonging to another repository, because
+        `inspect` compared a missing value against this repository's own.
+        """
+        self.write_schema_only(self.path)
+        self.assertIn('meta', self.tables(self.path))
+
+        store = memory.Store(self.path, REPO)
+        self.addCleanup(store.close)
+        self.assertEqual(store.meta('repo'), REPO)
+        self.assertEqual(int(store.meta('schema')), memory.SCHEMA)
+        self.assertTrue(store.note('writer', 'finding', 'usable after completion'))
+
+    def test_a_store_holding_entries_without_identity_is_refused(self):
+        """Completing initialisation there would adopt another store's data."""
+        self.write_schema_only(self.path, extra=(
+            "INSERT INTO entries(seq,ts,type,scope,body,author,revision) "
+            "VALUES(1,1.0,'finding','repo','someone else data','a',1)",))
+        with self.assertRaises(memory.MemoryError_) as e:
+            memory.Store(self.path, REPO)
+        self.assertEqual(e.exception.code, 'incompatible_store')
+        self.assertEqual(self.tables(self.path) and True, True)
+        db = sqlite3.connect(self.path)
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute('SELECT count(*) FROM entries').fetchone()[0], 1,
+                         'the refusal must leave the data untouched')
+
+
+class ResetFailureTests(Base):
+    """A failed reset, not an engine-full transition, is what these exercise."""
+
+    def failing_log(self, store, row=(0, 400, 0)):
+        """Make the checkpoint report a log it did not reset."""
+        return patch.object(type(store), 'log_state', lambda _self: row)
+
+    def test_a_failed_reset_is_recorded_and_holds_later_writes(self):
+        self.note('before the failure')
+        with self.failing_log(self.s):
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.note('during the failure')
+            self.assertEqual(e.exception.code, 'storage_blocked')
+        # The state must outlive the condition. Previously reset_log raised without
+        # recording anything, because transaction() resets before its own try block, and
+        # the next write was accepted as though the reset had succeeded.
+        self.assertIsNotNone(self.s.blocked)
+        with self.assertRaises(memory.MemoryError_) as e:
+            self.note('after the condition cleared')
+        self.assertEqual(e.exception.code, 'storage_blocked')
+
+    def test_a_blocked_store_answers_status_and_search(self):
+        seq = self.note('findable while blocked')
+        with self.failing_log(self.s):
+            with self.assertRaises(memory.MemoryError_):
+                self.note('blocked')
+        self.assertIsNotNone(self.s.blocked)
+        self.assertIsNotNone(self.call(op='status')['blocked'])
+        self.assertTrue(self.call(op='hello')['blocked'])
+        found = self.call(op='recall', query='findable')
+        self.assertEqual([e['seq'] for e in found['entries']], [seq])
+
+    def test_a_failed_recovery_keeps_the_block_and_writes_nothing(self):
+        self.note('seed')
+        with self.failing_log(self.s):
+            with self.assertRaises(memory.MemoryError_):
+                self.note('blocked')
+            pages_before = self.s.pages()
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.s.recover()
+            self.assertEqual(e.exception.code, 'storage_blocked')
+            # Recovery is itself a write and obeys the precondition it restores. Reclaiming
+            # first would have written through the very unreset log being recovered from.
+            self.assertEqual(self.s.pages(), pages_before)
+        self.assertIsNotNone(self.s.blocked)
+
+    def test_recovery_clears_the_block_once_the_log_can_be_reset(self):
+        self.note('seed')
+        with self.failing_log(self.s):
+            with self.assertRaises(memory.MemoryError_):
+                self.note('blocked')
+        result = self.s.recover()
+        self.assertTrue(result['recovered'])
+        self.assertIsNone(self.s.blocked)
+        self.assertTrue(self.note('writes resume after recovery'))
+
+
+class ScanModeExpiryTests(Base):
+    """Expiry on a store that is deliberately serving scans, across several batches."""
+
+    def expiring(self, count, prefix='scan'):
+        seqs = []
+        for i in range(count):
+            seqs.append(self.note(f'{prefix} body {i} ' + str(i) * 30,
+                                  kind='finding', expires=time.time() - 1))
+        return seqs
+
+    def test_a_scan_mode_store_expires_across_batches_without_touching_the_index(self):
+        """Rows written while the index was invalid are not in it, so must not be deleted
+        from it. A contentless FTS5 delete for a posting that was never added is wrong, and
+        the index is already known wrong, so there is nothing to maintain either way."""
+        with patch.object(memory, 'EXPIRY_BATCH', 5):
+            self.note('written while the index was still valid')
+            # Put the store into scan mode, as a runtime without FTS would leave it.
+            with self.s.transaction():
+                self.s.set_meta('indexed_through', -1)
+            self.assertFalse(self.s.index_usable())
+            self.expiring(13)          # more than two batches of five
+
+            unindexed = []
+            real = memory.Store._unindex
+
+            def spy(self_, rows):
+                unindexed.append(len(rows))
+                return real(self_, rows)
+
+            with patch.object(memory.Store, '_unindex', spy):
+                removed = self.s.expire()
+            self.assertEqual(removed, 13, 'every expired row must be removed')
+            # `_unindex` may be called, but it must decline to issue deletes in scan mode.
+            self.assertEqual(self.s.db.execute(
+                'SELECT count(*) FROM entries WHERE expires IS NOT NULL').fetchone()[0], 0)
+            self.assertFalse(self.s.index_usable(), 'scan mode must survive expiry')
+            # Search still answers completely, from the scan.
+            found = self.call(op='recall', query='still valid')
+            self.assertFalse(found['indexed'])
+
+    def test_index_maintenance_that_cannot_fit_invalidates_and_still_removes_the_rows(self):
+        """The engine-full case must reach the fallback, not block the store.
+
+        `expire` ran its index maintenance with blocking semantics, so an engine refusal set
+        a blocked state and raised `storage_blocked`, while the fallback caught only
+        `capacity`. The invalidate-and-delete path was therefore skipped at exactly the
+        moment it existed for.
+        """
+        self.expiring(7)
+        self.assertTrue(self.s.index_usable())
+        real = memory.Store._unindex
+        exhausted = []
+
+        def full_on_first_batch(self_, rows):
+            real(self_, rows)
+            if not exhausted:
+                exhausted.append(True)
+                # A genuine engine refusal inside the index-maintenance transaction.
+                with patch.object(memory, 'MAX_PAGES', self_.pages()):
+                    self_.db.execute(f'PRAGMA max_page_count={self_.pages()}')
+                    for i in range(50_000):
+                        self_.db.execute(
+                            'INSERT INTO entries(seq,ts,type,scope,body,author,revision) '
+                            'VALUES(?,?,?,?,?,?,?)',
+                            (900_000 + i, 1.0, 'finding', 'repo', 'f' * 3000, 'a', 1))
+
+        with patch.object(memory, 'EXPIRY_BATCH', 3), \
+             patch.object(memory.Store, '_unindex', full_on_first_batch):
+            removed = self.s.expire()
+        self.s.db.execute(f'PRAGMA max_page_count={memory.MAX_PAGES}')
+        self.assertTrue(exhausted, 'the engine refusal never happened, so nothing was tested')
+        self.assertEqual(removed, 7, 'the fallback must still remove every expired row')
+        self.assertIsNone(self.s.blocked,
+                          'an unaffordable index maintenance must not block the store')
+        self.assertFalse(self.s.index_usable(),
+                         'the index must be left explicitly invalid, not silently short')
+        self.assertEqual(self.s.db.execute(
+            'SELECT count(*) FROM entries WHERE expires IS NOT NULL').fetchone()[0], 0)
+        # And the service still answers, from the scan.
+        self.assertIn('entries', self.call(op='recall', query='scan'))

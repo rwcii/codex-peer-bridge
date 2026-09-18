@@ -343,6 +343,15 @@ when the last checkpoint ran, and how far a given SQLite build shrank the file d
 recovery. Admission now reads `page_count` alone. The log is not in the comparison
 because it is bounded separately and reset before every write.
 
+**Initialisation is not an exception to the bound.** The schema statements and the identity
+rows they describe are one transaction. Split across two, an interruption left a store with
+tables and no identity, which could only be read as belonging to another repository; that state
+is now completed rather than refused, while a file holding entries without an identity is
+refused outright, because adopting it would take another store's data under this repository's
+name. The connection runs in autocommit and every transaction is opened explicitly, because the
+driver starts an implicit transaction only for `INSERT`, `UPDATE`, `DELETE` and `REPLACE` -- so
+DDL committed statement by statement whatever it was wrapped in.
+
 **One write boundary, and every durable change goes through it.** The bound describes a
 single transaction beginning with an empty log, so the reset belongs to the transaction rather
 than to the request. `Store.transaction` carries expiry, reclamation, index maintenance, schema
@@ -356,15 +365,20 @@ snapshot, a false report about durable progress.
 refusal during a transition the reserve protects, records the block; writes are refused with
 `storage_blocked` until recovery is requested explicitly through the `recover` operation.
 Reads, status and stop stay available, and cleanup runs only ahead of operations that write,
-so a failed cleanup cannot block the operations the error says remain reachable. The state
+so a failed cleanup cannot block the operations the error says remain reachable. Recovery obeys
+the precondition it restores: it resets the log and verifies the result before writing
+anything, keeps the block unless every postcondition holds, and is reachable as a `recover`
+subcommand as well as a service operation. The state
 lives in the running service rather than in the store, because a store that cannot be written
 cannot record that it cannot be written.
 
 **Expiry is batched, so reclamation never needs a reserve it cannot size.** Rows are removed
 `EXPIRY_BATCH` at a time. A contentless FTS5 delete writes a tombstone before the vacuum
 returns pages, and the index cost of arbitrary legal content has no derived bound, so if a
-batch's index maintenance will not fit, the index is marked invalid and the rows are removed
-without it. Search continues on the complete scan and the index is rebuilt when there is room.
+batch's index maintenance will not fit -- whether this code refuses it or the engine does -- the
+index is marked invalid and the rows are removed without it. While the store serves scans, no
+index deletes are issued at all: rows written since the index was invalidated are not in it, and
+a delete for a posting that was never added is not maintenance. Search continues on the complete scan and the index is rebuilt when there is room.
 
 **A reset is verified before every write transaction, and the test is a conjunction.**
 `PRAGMA wal_checkpoint(TRUNCATE)` must return `busy == 0` **and** `log_pages == 0`, and
