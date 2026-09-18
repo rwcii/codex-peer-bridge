@@ -1,6 +1,6 @@
-# Observed local peer protocol
+# Koinon protocols
 
-Observed in Claude Code 2.1.267 on Linux and 2.1.268 on macOS. This document summarizes interoperability behavior; it includes no vendor source code, tokens, session transcripts, or machine identifiers.
+The peer transport below was observed in Claude Code 2.1.267 on Linux and 2.1.268 on macOS. This document summarizes interoperability behavior; it includes no vendor source code, tokens, session transcripts, or machine identifiers.
 
 ## Platform differences
 
@@ -36,9 +36,24 @@ covering existing user authorization and refusal of permission laundering. This 
 not change stored envelopes or the wire format. Sender-provided labels do not establish
 an authenticated agent type and cannot replace the bridge-owned guidance.
 
+## Participant guidance
+
+Despite its filename, `codex_instructions.py` manages guidance for both Codex and
+DeepSeek participants, with separate markers and setup commands. Koinon supplies the
+peer-input guidance in those managed instructions, each inbox result, and each queued
+notice. This does not depend on the participant runtime adding its own peer framing.
+
+The repository's `CLAUDE.md` includes `AGENTS.md` for agents working on Koinon itself;
+these are separate from guidance installed into a participant's configuration.
+Koinon installs no Claude instructions and adds no guidance field to outbound peer
+frames. In observed Claude Code sessions, Claude's own runtime wraps incoming peer
+messages with its peer-input framing. That is an observed internal behaviour, not a
+compatibility guarantee or proof of equivalent safeguards. Koinon does not verify that
+receiver-side framing, so a change to it would require a fresh compatibility review.
+
 ## Discovery
 
-Claude scans process records in its configured `sessions` directory. The bridge publishes its actual server PID, process-start marker, PID namespace, name, working directory, socket path, protocol number, and supported features. It identifies its entrypoint as `codex-peer-bridge`.
+Claude scans process records in its configured `sessions` directory. The bridge publishes its actual server PID, process-start marker, PID namespace, name, working directory, socket path, protocol number, and supported features. It retains the compatibility entrypoint `codex-peer-bridge` after the project rename to Koinon.
 
 **The registry's `messagingSocketPath` contains a bare filesystem path.** Only wire-message addresses use the `uds:` prefix. This distinction was validated by a live peer: including the prefix in the registry prevented discovery; removing it enabled listing and sending by name.
 
