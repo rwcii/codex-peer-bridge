@@ -64,10 +64,21 @@ CONSUMER_TTL = 30 * 86400
 MAX_SNAPSHOTS_PER_CONSUMER = 4
 MAX_CONSUMERS = 256
 MAX_IDEM_ROWS = 20000
+RETIRED_TTL = 90 * 86400
+EXPIRY_INTERVAL = 30
 
 # Response framing. A page is bounded by encoded bytes, not by a row count, because
 # 200 rows of maximum body cannot fit one frame.
 FRAME_BUDGET = LIMIT - 8192
+# Rows fetched per read before byte bounding. A window that silently truncated would
+# report `more` as false while results remained.
+ROW_WINDOW = 500
+
+# Test fixture only, read once at import and consulted on no other path. When set, the
+# service exits abruptly after a write has committed and before its response is sent.
+# That window is precisely what a durability claim must survive, and a test that kills
+# the process after a successful response has not entered it.
+CRASH_AFTER_COMMIT = os.environ.get('MEMORY_TEST_CRASH_AFTER_COMMIT') == '1'
 
 SNAPSHOT_ORDER = {'directive': 0, 'decision': 1, 'gotcha': 2, 'handoff': 3, 'finding': 4, 'status': 5}
 SNAPSHOT_TAIL = {'finding': 25, 'handoff': 25, 'status': 10}
@@ -121,7 +132,8 @@ class Store:
     SELECT = 'SELECT ' + ','.join(FIELDS) + ' FROM entries'
 
     def __init__(self, path, repo, fts=None):
-        self.repo = repo
+        self.repo, self.path = repo, path
+        self.expired_at = 0.0
         self.db = sqlite3.connect(path)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.executescript('''
@@ -240,42 +252,72 @@ class Store:
     # --- capacity -------------------------------------------------------------
 
     def usage(self):
+        """Account for what is actually stored, not for bodies alone.
+
+        Variable fields are measured rather than approximated by a constant, and the
+        physical figure includes the write-ahead log, which `page_count` excludes and
+        which can be a large share of the file on disk.
+        """
         count, body = self.db.execute(
-            'SELECT count(*), coalesce(sum(length(cast(body AS BLOB))),0) FROM entries').fetchone()
+            'SELECT count(*), coalesce(sum(length(cast(body AS BLOB))'
+            '+length(cast(coalesce(path,"") AS BLOB))'
+            '+length(cast(coalesce(author,"") AS BLOB))'
+            '+length(cast(coalesce(scope_target,"") AS BLOB))'
+            '+length(cast(coalesce(consumer,"") AS BLOB))),0) FROM entries').fetchone()
         frozen = self.db.execute('SELECT coalesce(sum(bytes),0) FROM snapshot_items').fetchone()[0]
-        idem = self.db.execute('SELECT count(*) FROM idem').fetchone()[0]
-        logical = body + count * ENTRY_OVERHEAD + frozen + idem * 128
+        idem, idem_bytes = self.db.execute(
+            'SELECT count(*), coalesce(sum(length(cast(key AS BLOB))+64),0) FROM idem').fetchone()
+        readers = self.db.execute(
+            'SELECT coalesce(sum(length(cast(consumer AS BLOB))+64),0) FROM cursors').fetchone()[0]
+        retired = self.db.execute(
+            'SELECT count(*), coalesce(sum(length(cast(consumer AS BLOB))+64),0) FROM retired'
+        ).fetchone()
+        logical = body + count * ENTRY_OVERHEAD + frozen + idem_bytes + readers + retired[1]
         page_size = self.db.execute('PRAGMA page_size').fetchone()[0]
         pages = self.db.execute('PRAGMA page_count').fetchone()[0]
-        return dict(entries=count, logical=logical, physical=page_size * pages, idem=idem)
+        physical = page_size * pages
+        for suffix in ('-wal', '-shm'):
+            try:
+                physical += os.stat(str(self.path) + suffix).st_size
+            except OSError:
+                pass
+        return dict(entries=count, logical=logical, physical=physical, idem=idem,
+                    retired=retired[0])
 
-    def check_capacity(self, body, control):
-        """Refuse an over-budget write explicitly, leaving stored data untouched.
+    def admit(self, need, slots=0, control=False):
+        """The single admission point for every durable mutation.
 
-        A control write, meaning a revocation or supersession, draws on reserved
-        slots and reserved bytes. Without the byte reservation a full store could
-        accept the slot and still refuse the body, pinning a withdrawn directive.
+        Entries, frozen snapshot copies, consumer registrations and retirement
+        tombstones all pass through here. A mutation that wrote around it would grow
+        the store while the advertised budget said otherwise, which is what made the
+        earlier budget a claim rather than a limit.
+
+        A control mutation, meaning a revocation or a supersession, draws on reserved
+        slots *and* reserved bytes. Reserving slots alone would let a full store admit
+        the row and refuse the body, pinning a withdrawn directive permanently.
         """
-        need = measure(body) + ENTRY_OVERHEAD
         for attempt in (0, 1):
             use = self.usage()
             entry_cap = MAX_ENTRIES if control else MAX_ENTRIES - RESERVED_ENTRIES
             byte_cap = MAX_LOGICAL_BYTES if control else MAX_LOGICAL_BYTES - RESERVED_BYTES
-            if use['entries'] < entry_cap and use['logical'] + need <= byte_cap \
-                    and use['physical'] < MAX_PHYSICAL_BYTES:
-                return
+            physical_cap = (MAX_PHYSICAL_BYTES if control
+                            else MAX_PHYSICAL_BYTES - RESERVED_BYTES)
+            # Project the mutation rather than testing only what is already stored.
+            if (use['entries'] + slots <= entry_cap and use['logical'] + need <= byte_cap
+                    and use['physical'] + need <= physical_cap):
+                return use
             if attempt == 0:
                 self.reclaim()
-        raise MemoryError_('capacity', f"{use['entries']} entries, {use['logical']} logical bytes and "
-                           f"{use['physical']} physical bytes are stored; nothing was written and "
-                           'stored data is intact')
+        raise MemoryError_('capacity', f"{use['entries']} entries, {use['logical']} logical bytes "
+                           f"and {use['physical']} physical bytes are stored, and this mutation "
+                           f'needs {need} more; nothing was written and stored data is intact')
 
-    def reclaim(self):
-        """Bounded cleanup. Every removal here has a defined recovery result.
+    def expire(self):
+        """Remove only what is past its stated lifetime.
 
-        Reclaiming an event can leave a reader below the retained range, so the
-        floor moves with it and a reader below the floor is sent to a fresh
-        snapshot rather than handed a silent gap.
+        This runs at request boundaries, not merely after a capacity failure. A
+        horizon that is enforced only when the store fills is not a lifetime; it is a
+        side effect of pressure, and a caller cannot reason about it.
         """
         now = time.time()
         with self.db:
@@ -296,26 +338,44 @@ class Store:
                     # Rows were removed without maintaining the index, so it is no
                     # longer trustworthy and must be rebuilt when FTS returns.
                     self.set_meta('indexed_through', -1)
-            # Open snapshots expire; acknowledged ones are retained longer so a lost
-            # response can be recovered by replaying the same acknowledgement.
             self.db.execute('DELETE FROM snapshots WHERE (acked IS NULL AND created < ?) '
                             'OR (acked IS NOT NULL AND acked_at < ?)',
                             (now - SNAPSHOT_TTL, now - ACK_RETENTION))
             self.db.execute('DELETE FROM snapshot_items WHERE id NOT IN (SELECT id FROM snapshots)')
             self.db.execute('DELETE FROM idem WHERE ts < ?', (now - IDEM_TTL,))
-            excess = self.db.execute('SELECT key FROM idem ORDER BY ts DESC LIMIT -1 OFFSET ?',
-                                     (MAX_IDEM_ROWS,)).fetchall()
-            self.db.executemany('DELETE FROM idem WHERE key=?', excess)
+            self.db.execute('DELETE FROM retired WHERE at < ?', (now - RETIRED_TTL,))
             # A retired consumer leaves a tombstone. A later request from it gets an
             # explicit consumer_retired result instead of silently becoming a new
             # consumer that re-reads the whole store as if it had never synced.
-            stale = self.db.execute('SELECT consumer,seq FROM cursors WHERE updated < ?',
-                                    (now - CONSUMER_TTL,)).fetchall()
-            for consumer, seq in stale:
+            for consumer, seq in self.db.execute(
+                    'SELECT consumer,seq FROM cursors WHERE updated < ?',
+                    (now - CONSUMER_TTL,)).fetchall():
                 self.db.execute('INSERT OR REPLACE INTO retired(consumer,seq,at) VALUES(?,?,?)',
                                 (consumer, seq, now))
                 self.db.execute('DELETE FROM cursors WHERE consumer=?', (consumer,))
+        self.expired_at = now
         return len(expired)
+
+    def maybe_expire(self):
+        """Enforce lifetimes at the request boundary, at a bounded rate."""
+        if time.time() - self.expired_at >= EXPIRY_INTERVAL:
+            self.expire()
+
+    def reclaim(self):
+        """Expiry, then count pruning that respects every retention window.
+
+        Count pruning may only remove records already outside their lifetime. Evicting
+        a record still promised for recovery, such as an acknowledgement inside its
+        retention, would turn a documented replay into a failure in order to make room.
+        """
+        removed = self.expire()
+        now = time.time()
+        with self.db:
+            prunable = self.db.execute(
+                'SELECT key FROM idem WHERE ts < ? ORDER BY ts LIMIT -1 OFFSET ?',
+                (now - IDEM_TTL, MAX_IDEM_ROWS)).fetchall()
+            self.db.executemany('DELETE FROM idem WHERE key=?', prunable)
+        return removed
 
     # --- writes ---------------------------------------------------------------
 
@@ -331,6 +391,15 @@ class Store:
             raise MemoryError_('invalid_request', 'body must be nonempty text')
         if measure(body) > MAX_BODY:
             raise MemoryError_('entry_too_large', f'body exceeds {MAX_BODY} bytes')
+        # Refuse at admission what could never be delivered. A stored entry larger than
+        # a page would block the snapshot page containing it, permanently.
+        probe = len(encode(dict(zip(self.FIELDS, (0, 0.0, kind, scope, scope_target, path, body,
+                                                  author, pid, consumer, 1, supersedes, revokes,
+                                                  None, None, None, expires)))))
+        if probe > FRAME_BUDGET:
+            raise MemoryError_('entry_too_large',
+                               f'this entry encodes to {probe} bytes, above the {FRAME_BUDGET} '
+                               'byte page budget, so it could never be delivered')
         if supersedes and revokes:
             raise MemoryError_('invalid_request', 'an entry supersedes or revokes, never both')
         payload = dict(type=kind, body=body, scope=scope, scope_target=scope_target, path=path,
@@ -344,7 +413,9 @@ class Store:
                     raise MemoryError_('idempotency_conflict',
                                        'this key is already used with different content')
                 return dict(seq=row[1], duplicate=True)
-        self.check_capacity(body, control=bool(supersedes or revokes))
+        variable = sum(measure(x) for x in (body, path or '', author or '',
+                                           scope_target or '', consumer, key or ''))
+        self.admit(variable + ENTRY_OVERHEAD, slots=1, control=bool(supersedes or revokes))
         # One transaction. A failure anywhere inside rolls the whole write back, so a
         # caller told the write failed never finds it committed by a later request.
         try:
@@ -382,11 +453,22 @@ class Store:
                     self.db.execute('INSERT INTO search(rowid,body) VALUES(?,?)', (seq, body))
                     self.set_meta('indexed_through', seq)
                 if scoped:
+                    held = self.db.execute('SELECT count(*) FROM idem').fetchone()[0]
+                    if held >= MAX_IDEM_ROWS:
+                        # Refuse rather than evict. Dropping an in-window key to make
+                        # room would turn a safe retry into a silent duplicate.
+                        raise MemoryError_('idem_capacity',
+                                           f'{held} idempotency keys are retained and none is past '
+                                           f'its {IDEM_TTL} second horizon')
                     self.db.execute('INSERT INTO idem(key,fingerprint,seq,ts) VALUES(?,?,?,?)',
                                     (scoped, mark, seq, time.time()))
         except sqlite3.Error as exc:
             raise MemoryError_('write_failed', f'{type(exc).__name__}; nothing was written') from exc
-        return dict(seq=seq, duplicate=False, conflicts_with=conflict)
+        # State the retry horizon rather than leaving it implicit. A retry after this
+        # many seconds is a new write, not a deduplicated one, and a caller that bounds
+        # its own retries by this figure cannot append twice by accident.
+        return dict(seq=seq, duplicate=False, conflicts_with=conflict,
+                    idempotency_horizon=IDEM_TTL if key is not None else None)
 
     # --- reads ----------------------------------------------------------------
 
@@ -447,21 +529,29 @@ def freeze(store, consumer):
                 continue
         ordered.append(entry)
     sid = uuid.uuid4().hex
+    payloads = [(i, e, json.dumps(e, ensure_ascii=True)) for i, e in enumerate(ordered)]
+    # A snapshot copies every member, so it is a durable mutation and is charged for.
+    # Writing around admission is what let the store grow while the budget said
+    # otherwise.
+    store.admit(sum(measure(p) for _, _, p in payloads) + len(payloads) * 64)
     with store.db:
         store.db.execute(
             'INSERT INTO snapshots(id,consumer,head,created,items,issued,acked,acked_at) '
             'VALUES(?,?,?,?,?,0,NULL,NULL)', (sid, consumer, head, time.time(), len(ordered)))
         store.db.executemany(
             'INSERT INTO snapshot_items(id,position,seq,payload,bytes) VALUES(?,?,?,?,?)',
-            [(sid, i, e['seq'], json.dumps(e, ensure_ascii=True), len(encode(e)))
-             for i, e in enumerate(ordered)])
+            [(sid, i, e['seq'], p, len(encode(e))) for i, e, p in payloads])
         store.db.execute('UPDATE cursors SET snapshot=?,updated=? WHERE consumer=?',
                          (sid, time.time(), consumer))
-        # Bound retained snapshots per consumer so an abandoning reader cannot grow
-        # the store without limit.
+        # Bound retained snapshots per consumer, but only prune ones already outside
+        # their retention. Removing an acknowledged snapshot still inside ACK_RETENTION
+        # would turn a documented replay into a failure in order to save space.
+        now = time.time()
         old = store.db.execute(
-            'SELECT id FROM snapshots WHERE consumer=? ORDER BY created DESC LIMIT -1 OFFSET ?',
-            (consumer, MAX_SNAPSHOTS_PER_CONSUMER)).fetchall()
+            'SELECT id FROM snapshots WHERE consumer=? AND ((acked IS NULL AND created < ?) '
+            'OR (acked IS NOT NULL AND acked_at < ?)) ORDER BY created DESC LIMIT -1 OFFSET ?',
+            (consumer, now - SNAPSHOT_TTL, now - ACK_RETENTION, MAX_SNAPSHOTS_PER_CONSUMER)
+        ).fetchall()
         store.db.executemany('DELETE FROM snapshots WHERE id=?', old)
         store.db.executemany('DELETE FROM snapshot_items WHERE id=?', old)
     return sid
@@ -473,6 +563,7 @@ class Service:
         self.stop = asyncio.Event()
         self.generation = uuid.uuid4().hex
         self.active = 0
+        self.tasks = set()
         self.idle = asyncio.Event()
         self.idle.set()
 
@@ -484,19 +575,23 @@ class Service:
             return
         self.active += 1
         self.idle.clear()
+        task = asyncio.current_task()
+        self.tasks.add(task)
         try:
             pid = credentials(writer.get_extra_info('socket'))
             async with asyncio.timeout(10):
                 request = json.loads(await reader.readline())
                 reply = dict(ok=True, result=self.command(request, pid))
+                if CRASH_AFTER_COMMIT and request.get('op') == 'note':
+                    os._exit(70)
         except MemoryError_ as exc:
             reply = dict(ok=False, code=exc.code, error=str(exc))
         except (ValueError, KeyError, TypeError, OSError, TimeoutError, sqlite3.Error) as exc:
             reply = dict(ok=False, code='rejected', error=type(exc).__name__)
         try:
             writer.write(encode(reply))
-            await writer.drain()
-        except (OSError, ValueError):
+            await asyncio.wait_for(writer.drain(), 10)
+        except (OSError, ValueError, TimeoutError, asyncio.TimeoutError):
             pass
         finally:
             writer.close()
@@ -504,6 +599,7 @@ class Service:
                 await writer.wait_closed()
             except OSError:
                 pass
+            self.tasks.discard(task)
             self.active -= 1
             if not self.active:
                 self.idle.set()
@@ -522,6 +618,7 @@ class Service:
 
     def command(self, r, pid):
         op = r.get('op')
+        self.store.maybe_expire()
         if op == 'hello':
             return dict(service='codex-peer-memory', repo=self.repo, protocol=PROTOCOL,
                         schema=SCHEMA, generation=self.generation, pid=os.getpid(),
@@ -539,7 +636,7 @@ class Service:
         if op == 'recall':
             return self.recall(r)
         if op == 'status':
-            return self.status()
+            return self.status(r)
         if op == 'stop':
             self.stop.set()
             return 'stopping'
@@ -562,6 +659,7 @@ class Service:
         with self.store.db:
             if self.store.db.execute('SELECT count(*) FROM cursors').fetchone()[0] >= MAX_CONSUMERS:
                 raise MemoryError_('capacity', f'{MAX_CONSUMERS} consumers are registered')
+            self.store.admit(measure(consumer) + 128, slots=0)
             self.store.db.execute(
                 'INSERT INTO cursors(consumer,seq,issued,snapshot,bootstrapped,resnapshot,'
                 'updated) VALUES(?,0,0,NULL,0,0,?)', (consumer, time.time()))
@@ -703,34 +801,53 @@ class Service:
         return dict(cursor=through)
 
     def recall(self, r):
-        """Search live entries only, using the same liveness rule as sync."""
+        """Search live entries only, with real continuation and a truthful `more`."""
         term = r.get('query')
         if not isinstance(term, str) or not term.strip():
             raise MemoryError_('invalid_request', 'query must be nonempty text')
+        before = int(r.get('before') or 0)
         clause, args = self.store.live_clause()
+        window = [before or (1 << 62), ROW_WINDOW + 1]
         rows = []
         if self.store.fts:
             try:
                 rows = self.store.db.execute(
                     f'{self.store.SELECT} WHERE seq IN (SELECT rowid FROM search WHERE search MATCH ?)'
-                    f' AND {clause} ORDER BY seq DESC LIMIT 500', [term] + args).fetchall()
+                    f' AND {clause} AND seq < ? ORDER BY seq DESC LIMIT ?',
+                    [term] + args + window).fetchall()
             except sqlite3.Error:
                 rows = []
         if not rows:
             pattern = '%' + term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
             rows = self.store.db.execute(
-                f"{self.store.SELECT} WHERE body LIKE ? ESCAPE '\\' AND {clause} "
-                'ORDER BY seq DESC LIMIT 500', [pattern] + args).fetchall()
-        entries, more = bounded((len(encode(self.store.row(x))), self.store.row(x)) for x in rows)
-        return dict(entries=entries, more=more)
+                f"{self.store.SELECT} WHERE body LIKE ? ESCAPE '\\' AND {clause} AND seq < ? "
+                'ORDER BY seq DESC LIMIT ?', [pattern] + args + window).fetchall()
+        beyond = len(rows) > ROW_WINDOW
+        rows = rows[:ROW_WINDOW]
+        entries, truncated = bounded((len(encode(self.store.row(x))), self.store.row(x))
+                                     for x in rows)
+        # `more` accounts for both limits: the byte budget and the row window. Reporting
+        # only the first would hide results behind a false ending.
+        more = truncated or (beyond and len(entries) == len(rows))
+        return dict(entries=entries, more=more,
+                    next_before=entries[-1]['seq'] if entries and more else None)
 
-    def status(self):
+    def status(self, r=None):
+        r = r or {}
         use = self.store.usage()
         head = self.store.head()
-        consumers, _ = bounded(
-            (256, dict(consumer=c, cursor=s, lag=head - s, snapshot=snap, bootstrapped=bool(b)))
-            for c, s, snap, b in self.store.db.execute(
-                'SELECT consumer,seq,snapshot,bootstrapped FROM cursors ORDER BY consumer LIMIT 200'))
+        after = r.get('after') or ''
+        rows = self.store.db.execute(
+            'SELECT consumer,seq,snapshot,bootstrapped FROM cursors WHERE consumer > ? '
+            'ORDER BY consumer LIMIT ?', (after, ROW_WINDOW + 1)).fetchall()
+        beyond = len(rows) > ROW_WINDOW
+        rows = rows[:ROW_WINDOW]
+        listed = [dict(consumer=c, cursor=s, lag=head - s, snapshot=snap, bootstrapped=bool(b))
+                  for c, s, snap, b in rows]
+        # Measure each record rather than assuming a size; an assumed figure is how a
+        # response grows past its frame while the count still looks safe.
+        consumers, truncated = bounded((len(encode(x)), x) for x in listed)
+        more = truncated or (beyond and len(consumers) == len(listed))
         return dict(repo=self.repo, protocol=PROTOCOL, schema=SCHEMA, generation=self.generation,
                     head=head, floor=self.store.floor(), healthy=self.store.healthy(),
                     fts=self.store.fts, usage=use,
@@ -739,8 +856,10 @@ class Service:
                                 reserved_entries=RESERVED_ENTRIES, reserved_bytes=RESERVED_BYTES,
                                 page_bytes=FRAME_BUDGET, consumers=MAX_CONSUMERS),
                     lifetimes=dict(snapshot=SNAPSHOT_TTL, acknowledgement=ACK_RETENTION,
-                                   idempotency=IDEM_TTL, consumer=CONSUMER_TTL),
-                    consumers=consumers)
+                                   idempotency=IDEM_TTL, consumer=CONSUMER_TTL,
+                                   retired=RETIRED_TTL, expiry_interval=EXPIRY_INTERVAL),
+                    consumers=consumers, more=more,
+                    next_after=consumers[-1]['consumer'] if consumers and more else None)
 
     async def run(self, sock):
         server = await asyncio.start_unix_server(self.handle, sock=sock, limit=LIMIT)
@@ -756,12 +875,16 @@ class Service:
         finally:
             server.close()
             await server.wait_closed()
-            # Drain in flight work before the database goes away, so a request that
-            # was accepted is never answered from a closed store.
+            # Drain in flight work before the database goes away, so a request that was
+            # accepted is never answered from a closed store. A timeout alone is not
+            # enough: a handler still running when the store closed would fail on a
+            # dead connection, so anything left is cancelled and joined first.
             try:
                 await asyncio.wait_for(self.idle.wait(), 10)
-            except asyncio.TimeoutError:
-                pass
+            except (asyncio.TimeoutError, TimeoutError):
+                for task in list(self.tasks):
+                    task.cancel()
+                await asyncio.gather(*list(self.tasks), return_exceptions=True)
             self.store.close()
 
 
@@ -848,12 +971,31 @@ async def verify_running(root, repo):
         raise MemoryError_('foreign_service', 'another service holds this socket; refusing to reuse it')
     if not result.get('healthy'):
         raise MemoryError_('unhealthy_service', 'the running service reports an unhealthy store')
+    # A listener with no ownership record is not evidence of a healthy service; it is
+    # evidence that something is listening. Absence must refuse, not accept.
     owner = read_owner(root)
-    if owner and (owner.get('pid') != result.get('pid')
-                  or owner.get('generation') != result.get('generation')):
+    control = platform_support.control_socket_path(Path(root))
+    if not owner:
+        raise MemoryError_('unknown_owner',
+                           'a service is listening with no ownership record; stop it explicitly '
+                           'before reusing this state directory')
+    checks = (('repo', owner.get('repo'), repo),
+              ('protocol', owner.get('protocol'), PROTOCOL),
+              ('socket', owner.get('socket'), str(control)),
+              ('pid', owner.get('pid'), result.get('pid')),
+              ('generation', owner.get('generation'), result.get('generation')))
+    for field, recorded, expected in checks:
+        if recorded != expected:
+            raise MemoryError_('ownership_mismatch',
+                               f'the recorded owner disagrees with the running service on {field}; '
+                               'stop it explicitly before reusing this state directory')
+    try:
+        live = platform_support.proc_start(owner['pid'])
+    except (ProcessLookupError, OSError, subprocess.SubprocessError):
+        raise MemoryError_('ownership_mismatch', 'the recorded owner is no longer readable') from None
+    if not platform_support.same_process(owner.get('proc_start'), live):
         raise MemoryError_('ownership_mismatch',
-                           'the running service does not match the recorded owner; stop it '
-                           'explicitly before reusing this state directory')
+                           'the recorded owner pid belongs to a different process now')
     return result
 
 
@@ -868,7 +1010,10 @@ def bind_exclusive(home, repo, generation):
         except OSError as exc:
             sock.close()
             owner = read_owner(home)
-            if attempt == 0 and owner_is_dead(owner) and owner.get('socket') == str(control):
+            recoverable = (owner and owner.get('socket') == str(control)
+                           and owner.get('repo') == repo
+                           and owner.get('protocol') == PROTOCOL and owner_is_dead(owner))
+            if attempt == 0 and recoverable:
                 # The recorded owner is provably gone, so this socket is a leftover.
                 # Nothing here removes a socket on a failed probe alone.
                 control.unlink(missing_ok=True)
@@ -911,9 +1056,23 @@ def serve(home, repo, store_factory):
         asyncio.run(service.run(sock))
     finally:
         sock.close()
-        control.unlink(missing_ok=True)
-        (Path(home) / 'owner.json').unlink(missing_ok=True)
+        release(home, control, service.generation)
     return dict(status='stopped')
+
+
+def release(home, control, generation):
+    """Remove the endpoint and the record only while this generation still owns them.
+
+    Cleanup takes no lock, because a caller waiting for this process to exit may hold
+    one. Ownership is what makes it safe: a successor that has already published its
+    own record is never clobbered by a predecessor tidying up late.
+    """
+    owner = read_owner(home)
+    if owner and owner.get('generation') != generation:
+        return False
+    control.unlink(missing_ok=True)
+    (Path(home) / 'owner.json').unlink(missing_ok=True)
+    return True
 
 
 def main():

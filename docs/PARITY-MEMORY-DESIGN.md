@@ -243,6 +243,33 @@ caller waits on the serving process exiting. The serving process waits on neithe
 file lock, and its transactions are internal and bounded. The graph is therefore acyclic by
 construction, and a regression test asserts each edge rather than trusting the reasoning.
 
+### Durable transitions
+
+Every durable change passes one admission point, so the advertised budget is a limit
+rather than a claim. A mutation that wrote around it would grow the store while the
+accounting said otherwise, which is how the first implementation advertised bounds it
+did not enforce.
+
+| Transition | Owner | Transaction | Budget charge | Retained record | Expiry |
+| --- | --- | --- | --- | --- | --- |
+| Append an entry | writer's consumer key | one, rolled back whole | body plus path, author, scope target, consumer and key, plus row overhead; one slot | the entry, and an idempotency key when given | `expires` when set |
+| Supersede or revoke | writer's consumer key | one, with the link written onto the replaced row | as above, drawn from reserved slots and reserved bytes | the replaced row, its revision and the link | follows the entry |
+| Freeze a snapshot | the reading consumer | one | every copied payload plus per-row overhead | the snapshot and its frozen members | `SNAPSHOT_TTL` unacknowledged, `ACK_RETENTION` after acknowledgement |
+| Issue a page | the snapshot's consumer | one | none; updates a counter | the highest position issued | with its snapshot |
+| Acknowledge | the snapshot's consumer | one | none | the acknowledgement, for replay | `ACK_RETENTION` |
+| Register a consumer | the consumer key | one | key plus row overhead | the cursor | `CONSUMER_TTL` idle, then a tombstone |
+| Retire a consumer | the service | one | tombstone row | the tombstone, reporting `consumer_retired` | `RETIRED_TTL` |
+
+Reclamation is not a transition a caller makes. It removes only records already past the
+lifetime above, and it may never evict one still inside its window to make room: an
+acknowledgement inside its retention is a promise of replay, so the service refuses a new
+write rather than break it. Refusal is always explicit, names the reason, and leaves
+stored data and protocol progress unchanged.
+
+Physical accounting includes the write-ahead log, which `page_count` excludes and which
+can hold a large share of the bytes on disk. Logical accounting measures variable fields
+rather than approximating them with a constant.
+
 ### Subscriptions and notices
 
 Notices go only to explicit subscribers of one canonical repository. There is no global peer

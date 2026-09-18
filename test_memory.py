@@ -181,6 +181,53 @@ class WriteTests(Base):
             self.assertEqual(e.exception.code,'capacity')
         self.assertEqual(len(self.s.live()), 1)
 
+    def test_a_snapshot_copy_is_charged_against_the_budget(self):
+        """Freezing copies every member, so it is a durable mutation like any other."""
+        for i in range(4):
+            self.note(f'entry {i}')
+        before = self.s.usage()['logical']
+        memory.freeze(self.s, 'reader')
+        self.assertGreater(self.s.usage()['logical'], before)
+        with patch.object(memory,'MAX_LOGICAL_BYTES', before):
+            with self.assertRaises(memory.MemoryError_) as e:
+                memory.freeze(self.s, 'another-reader')
+            self.assertEqual(e.exception.code, 'capacity')
+
+    def test_an_in_window_idempotency_key_is_never_evicted_to_make_room(self):
+        with patch.object(memory,'MAX_IDEM_ROWS', 2):
+            self.note('one', key='k1')
+            self.note('two', key='k2')
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.note('three', key='k3')
+            self.assertEqual(e.exception.code, 'idem_capacity')
+            # Refusing protects the safe retry; evicting would turn it into a duplicate.
+            self.assertTrue(self.s.note('writer','finding','one', key='k1')['duplicate'])
+
+    def test_the_retry_horizon_is_reported_rather_than_implied(self):
+        result = self.s.note('writer', 'finding', 'bounded retry', key='k1')
+        self.assertEqual(result['idempotency_horizon'], memory.IDEM_TTL)
+        self.assertIsNone(self.s.note('writer','finding','no key')['idempotency_horizon'])
+
+    def test_lifetimes_are_enforced_at_the_request_boundary(self):
+        self.note('ephemeral', kind='status', expires=time.time()-1)
+        self.s.expired_at = 0
+        # No capacity pressure here: a horizon enforced only when the store fills is a
+        # side effect of pressure, not a lifetime a caller can reason about.
+        self.call(op='status')
+        self.assertEqual(self.s.live(), [])
+
+    def test_retired_tombstones_are_bounded(self):
+        self.note('one')
+        self.drain()
+        self.s.db.execute('UPDATE cursors SET updated=?', (time.time()-memory.CONSUMER_TTL-1,))
+        self.s.db.commit()
+        self.s.expire()
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM retired').fetchone()[0], 1)
+        self.s.db.execute('UPDATE retired SET at=?', (time.time()-memory.RETIRED_TTL-1,))
+        self.s.db.commit()
+        self.s.expire()
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM retired').fetchone()[0], 0)
+
     def test_idempotency_rows_have_a_finite_horizon(self):
         self.note('kept', key='fresh')
         self.s.db.execute('UPDATE idem SET ts=?', (time.time()-memory.IDEM_TTL-1,))
@@ -416,12 +463,51 @@ class FramingTests(Base):
             seen += len(page['entries'])
         self.assertEqual(seen, count)
 
-    def test_an_entry_too_large_for_a_page_is_reported_not_silently_dropped(self):
+    def test_an_undeliverable_entry_is_refused_at_admission(self):
+        """Storing what can never be delivered would block its snapshot page forever."""
         with patch.object(memory,'FRAME_BUDGET',64):
-            self.note('a body that will not fit in a tiny page budget')
+            with self.assertRaises(memory.MemoryError_) as e:
+                self.note('a body that cannot fit a tiny page budget')
+            self.assertEqual(e.exception.code, 'entry_too_large')
+        self.assertEqual(self.s.live(), [])
+
+    def test_an_already_stored_undeliverable_entry_is_reported_not_dropped(self):
+        self.note('stored while the budget was generous')
+        with patch.object(memory,'FRAME_BUDGET',64):
             with self.assertRaises(memory.MemoryError_) as e:
                 self.call(op='sync', consumer='reader')
             self.assertEqual(e.exception.code, 'entry_too_large')
+
+    def test_recall_continues_and_reports_truncation_truthfully(self):
+        with patch.object(memory,'ROW_WINDOW',3):
+            for i in range(7):
+                self.note(f'match {i}', kind='decision')
+            first = self.call(op='recall', consumer='r', query='match')
+            self.assertTrue(first['more'])
+            self.assertIsNotNone(first['next_before'])
+            seen = [e['seq'] for e in first['entries']]
+            token = first['next_before']
+            while token:
+                page = self.call(op='recall', consumer='r', query='match', before=token)
+                seen.extend(e['seq'] for e in page['entries'])
+                token = page['next_before']
+            # Continuation must reach every match; a window that stopped early while
+            # reporting more as false would hide results behind a false ending.
+            self.assertEqual(len(seen), 7)
+            self.assertEqual(len(set(seen)), 7)
+
+    def test_status_paginates_its_consumer_list(self):
+        with patch.object(memory,'ROW_WINDOW',2):
+            for name in ('c1','c2','c3','c4','c5'):
+                self.call(op='sync', consumer=name)
+            names, token = [], ''
+            while True:
+                page = self.call(op='status', after=token)
+                names.extend(c['consumer'] for c in page['consumers'])
+                token = page.get('next_after')
+                if not token:
+                    break
+            self.assertEqual(names, ['c1','c2','c3','c4','c5'])
 
 
 class SearchTests(Base):
@@ -529,11 +615,17 @@ class LifecycleTests(unittest.TestCase):
             if p.poll() is None:
                 p.kill()
                 p.wait(timeout=10)
+            # Close the pipes explicitly; leaving them to the collector produces
+            # unclosed-file warnings that hide real ones.
+            for stream in (p.stdout, p.stderr):
+                if stream and not stream.closed:
+                    stream.close()
 
-    def spawn(self, *args):
+    def spawn(self, *args, env=None):
         p = subprocess.Popen([sys.executable, 'memory.py', '--state-dir', str(self.state),
                               '--repo-path', str(self.repo_path), *args],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             env=env)
         self.running.append(p)
         return p
 
@@ -617,26 +709,29 @@ class LifecycleTests(unittest.TestCase):
         s.listen(1)
         return s
 
-    def test_crash_between_commit_and_response_keeps_the_write_and_the_retry_is_idempotent(self):
-        self.spawn('serve')
-        self.wait_for_socket()
-        first = self.client(op='note', consumer='cli-1', type='decision',
-                            body='committed before the crash', key='k1')
-        self.assertTrue(first['ok'])
-        seq = first['result']['seq']
-        # Kill the process abruptly, as a real crash would, rather than closing the
-        # database cleanly. The committed write must survive and the retry must not
-        # produce a second entry.
-        victim = self.running[-1]
-        victim.send_signal(signal.SIGKILL)
-        victim.wait(timeout=10)
-        platform_support.control_socket_path(self.home).unlink(missing_ok=True)
-        self.spawn('serve')
-        self.wait_for_socket()
+    def test_a_crash_between_commit_and_response_is_survived_and_recovered(self):
+        """The window is commit to send, and recovery runs through the real path."""
+        crasher = self.spawn('serve', env=dict(os.environ, MEMORY_TEST_CRASH_AFTER_COMMIT='1'))
+        self.wait_for_socket(pid=crasher.pid)
+        with self.assertRaises(memory.MemoryError_) as e:
+            self.client(op='note', consumer='cli-1', type='decision',
+                        body='committed, never answered', key='k1')
+        self.assertEqual(e.exception.code, 'no_reply')
+        crasher.wait(timeout=10)
+        self.assertEqual(crasher.returncode, 70)
+        control = platform_support.control_socket_path(self.home)
+        # No manual cleanup: the replacement must recover through ownership evidence,
+        # which is the path a real operator depends on.
+        self.assertTrue(control.exists())
+        survivor = self.spawn('serve')
+        self.wait_for_socket(pid=survivor.pid)
+        status = self.client(op='status')['result']
+        self.assertEqual(status['usage']['entries'], 1, 'the committed write must survive')
         retry = self.client(op='note', consumer='cli-1', type='decision',
-                            body='committed before the crash', key='k1')
+                            body='committed, never answered', key='k1')
+        # The caller never saw a response, so its retry must deduplicate rather than
+        # append a second copy of work that already happened.
         self.assertTrue(retry['result']['duplicate'])
-        self.assertEqual(retry['result']['seq'], seq)
         self.assertEqual(self.client(op='status')['result']['usage']['entries'], 1)
 
     def test_maximum_size_entries_round_trip_through_the_real_socket(self):
@@ -655,6 +750,54 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(seen, 8)
         self.assertTrue(self.client(op='ack', consumer='reader',
                                     snapshot_id=page['snapshot_id'])['result']['complete'])
+
+    def test_a_listener_without_an_ownership_record_is_refused(self):
+        self.spawn('serve')
+        self.wait_for_socket()
+        (self.home/'owner.json').unlink()
+        # Something answering on the socket is evidence that something listens, not
+        # that it is this repository's healthy service.
+        with self.assertRaises(memory.MemoryError_) as e:
+            asyncio.run(memory.verify_running(self.home, self.repo))
+        self.assertEqual(e.exception.code, 'unknown_owner')
+
+    def test_a_record_disagreeing_with_the_running_service_is_refused(self):
+        self.spawn('serve')
+        self.wait_for_socket()
+        record = memory.read_owner(self.home)
+        for field, value in (('generation', 'not-the-running-one'),
+                             ('socket', '/tmp/somewhere-else.sock'),
+                             ('repo', 'f'*16)):
+            tampered = dict(record, **{field: value})
+            (self.home/'owner.json').write_text(json.dumps(tampered))
+            with self.assertRaises(memory.MemoryError_) as e:
+                asyncio.run(memory.verify_running(self.home, self.repo))
+            self.assertEqual(e.exception.code, 'ownership_mismatch', field)
+
+    def test_the_serving_process_never_holds_the_start_lock(self):
+        """Invariant 1 from the design contract, asserted rather than reasoned about.
+
+        A starting caller holds this lock while it probes, so a service that needed it
+        to answer could never answer. This is the shape of the readiness deadlock the
+        project already shipped once.
+        """
+        self.spawn('serve')
+        self.wait_for_socket()
+        import fcntl
+        with (self.home/'start.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # The lock is ours, and the service must still answer while we hold it.
+            self.assertTrue(self.client(op='hello')['ok'])
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def test_cleanup_removes_only_what_the_generation_still_owns(self):
+        self.spawn('serve')
+        control = self.wait_for_socket()
+        # A predecessor tidying up late must not remove a successor's endpoint.
+        self.assertFalse(memory.release(self.home, control, 'some-older-generation'))
+        self.assertTrue(control.exists())
+        self.assertTrue((self.home/'owner.json').exists())
+        self.assertTrue(self.client(op='hello')['ok'])
 
     def test_reuse_is_refused_for_another_repository(self):
         self.spawn('serve')
