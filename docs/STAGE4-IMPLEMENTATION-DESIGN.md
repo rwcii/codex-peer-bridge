@@ -1,6 +1,6 @@
 # Stage 4 implementation design for review
 
-Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented and reviewed. Subscriptions and the shared reconnect/rescan helper are implemented and reviewed. Explicit bindings/pointers, store identity migrations, and private control alias compatibility are implemented, independently reviewed, and verified on Linux and macOS. The journal storage and serial delivery core are implemented with tests; independent review and CLI/provider integration remain pending. No stage 4 runtime changes are deployed.
+Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented and reviewed. Subscriptions and the shared reconnect/rescan helper are implemented and reviewed. Explicit bindings/pointers, store identity migrations, and private control alias compatibility are implemented, independently reviewed, and verified on Linux and macOS. The journal storage and serial delivery core are independently reviewed and verified on Linux and macOS. CLI/provider, health and subscription integration is implemented in the working candidate; independent integration review remains pending. No stage 4 runtime changes are deployed.
 Baseline: develop 84f35e727b0f17a9469de182db9a843e7a28d092, integrated by signed merge 7503dc1.
 Codex is the sole driver. Claude is the reviewer. The merged baseline was independently verified. Implementation branch: feature/shared-transport-delivery.
 
@@ -121,8 +121,8 @@ acknowledgement, and snapshot formats remain unchanged. Transport-helper extract
 the participant ownership boundary, endpoint-role separation and bridge/memory worker
 ownership are implemented on this feature branch. Subscription services and their shared
 client helper are reviewed. Explicit pointer controls are implemented in the current
-candidate; automatic notifier integration,
-the journal and its delivery-health reporting remain pending. This branch is not deployed.
+candidate. The journal core is reviewed; automatic notifier integration and delivery
+health are implemented in the review candidate. This branch is not deployed.
 
 ### Participant identity and lock scope
 
@@ -428,7 +428,7 @@ The implemented activation capability is `notification_journal_activation`.
 Its normal control is `activate-notification-journal`; explicit evidence replacement
 uses `rebuild-notification-journal-activation` with `expected_previous_nonce` and
 `accept_history_loss: true`, preserving the target. These are bridge-side operations;
-the planned notifier rebuild must still enforce stopped ownership and local evidence
+the notifier rebuild enforces stopped ownership and local evidence
 before invoking replacement. The current candidate does not implement that notifier
 workflow. Subscription and explicit binding capabilities are implemented separately.
 
@@ -474,8 +474,8 @@ capability is service support, not a readiness claim about optional bound servic
 Service verification state is a process-local bounded cache (16 entries), expires
 after 30 seconds, and begins unknown after restart. Persistent anomaly bits record
 store replacement (1) and same-store head regression (2) until `ack-binding-health`.
-They do not clear merely because a later refresh succeeds. The current component
-exposes explicit refresh only; notifier-driven subscription/scan integration is next.
+They do not clear merely because a later refresh succeeds. The integration candidate
+uses notifier-driven subscriptions and recovery checks to refresh these bindings.
 
 Journal integration must account for explicit pointers that predate its deployment:
 the legacy notifier advances its checkpoint across pointer rows without notifying
@@ -483,7 +483,7 @@ them. First journal migration must seed retained pointers once, independently of
 the imported ordinary-message checkpoint. Record completion and bounded seed work
 transactionally after ready publication and before provider delivery. Repeated
 startup must not reseed delivered pointers; ordinary messages must not be replayed.
-This integration requirement is pending and must have crash/retry coverage.
+The journal core implements this seeding transaction with restart and retry tests.
 
 
 Each binding creation has a durable random 32-hex `binding_instance`, separate from
@@ -586,7 +586,25 @@ counts ignored control frames once, and never opens its source writable. Source
 acknowledgement during provider I/O ends retry responsibility on the next cycle;
 it does not claim to cancel an already submitted notice. Status uses the worker's
 reserved admission while provider I/O runs outside that worker. These components
-are not yet connected to the notifier CLI, live provider adapters or subscriptions.
+are connected to the notifier CLI, asynchronous provider adapters and subscriptions
+in the integration candidate.
 Unseen sequence gaps are permitted: pointer coalescing and unbinding remove rows
 without acknowledgement. Missing previously admitted ordinary work above the
 known acknowledgement watermark remains an explicit source fault.
+
+
+## Notifier integration candidate
+
+The implementation now connects the serial journal worker to asynchronous provider
+subprocesses, bridge and memory subscriptions, private controls and a separate health
+publication worker. [Operator procedures](NOTIFIER.md) specify the live controls,
+legacy compatibility and stopped-owner rebuild. The state and participant ownership
+locks remain held through accepted worker drain, provider process settlement and
+owned endpoint cleanup. Cleanup collects failures after attempting all resources.
+SQLite BUSY and LOCKED result codes report storage wait; other operational failures
+report storage error, rather than treating every OperationalError as transient.
+
+Memory notices use an exact service directory and a stable consumer derived from
+provider namespace, participant digest and repository key. A target guard verifies
+repository and service generation before a memory request can perform maintenance
+or mutate data. Notification never advances a memory consumer cursor.

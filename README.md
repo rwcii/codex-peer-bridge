@@ -243,7 +243,18 @@ python3 bridge.py --state-dir /path/to/private/state inbox
 
 State directories must be owned by the current user and mode 0700. The notifier checkpoint is tied to its thread ID; do not reuse one instance for unrelated conversations. Runtime databases, sockets, checkpoints, peer keys, and logs do not belong in Git.
 
-The watcher checks every two seconds and batches new user messages into a notice. It skips controls to avoid receipt loops. Queue failures retry after 30 seconds, and checkpoints advance only after queue success. An ambiguous timeout or crash can produce a duplicate notice. Codex controls notification scheduling: delivery may wait until an active turn finishes. Older notices can therefore surface after their messages have already been handled.
+The notifier subscribes before checking durable inbox state and repeats the check
+at a two-second recovery interval. It skips peer controls. Each notice contains at
+most ten ordinary message pointers, or one memory pointer. A separate bounded
+journal records attempts before provider calls; each unit has three automatic
+attempts with 30- and 60-second delays. An ambiguous provider result or crash can
+produce a duplicate notice. A successful unit is not resent because a later unit
+failed. Delivery health is separate from process readiness. See
+[notifier operation and recovery](docs/NOTIFIER.md).
+
+Codex controls notification scheduling: delivery can wait until an active turn
+finishes. Older notices can arrive after their messages have been handled.
+Transport completion does not prove that a model processed a notice.
 
 ## Notifier ownership
 
@@ -335,9 +346,10 @@ The bridge now maintains a transactional acknowledgement watermark and durable
 journal activation evidence in inbox schema 3 (introduced in schema 2). Migration preserves retained messages
 and sequence allocation. See [the schema contract](PROTOCOL.md#inbox-schema-2-and-journal-activation).
 Explicit repository bindings and content-free memory pointers are available through
-[the binding controls](PROTOCOL.md#memory-bindings-and-pointers). Notifier integration
-and the notifier journal remain pending.
-Local bridge and memory services now support explicit content-free change subscriptions.
-Subscribers read durable state after each hint; hints never acknowledge records or
-call a provider. The existing notifier still uses periodic polling. See
-[subscription protocol](PROTOCOL.md#change-subscriptions).
+[the binding controls](PROTOCOL.md#memory-bindings-and-pointers). The notifier
+refreshes these bindings through subscriptions and finite recovery checks, then
+queues content-free sync commands. No notification acknowledges memory.
+Local bridge and memory subscriptions carry hints only. The notifier reads durable
+state before reserving journal work and calling a provider. See the
+[subscription protocol](PROTOCOL.md#change-subscriptions) and
+[upgrade and recovery procedure](docs/NOTIFIER.md).

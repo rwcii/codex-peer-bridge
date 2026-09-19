@@ -16,7 +16,7 @@ import platform_support
 MARKER = '# Managed by codex-peer-bridge\n'
 SERVICES = ('codex-peer-notify.service', 'codex-peer-bridge.service')
 
-FILES = ('subscriptions.py','memory_bindings.py', 'inbox_schema.py', 'database_worker.py', 'service_runtime.py', 'participant_lock.py', 'peer_transport.py', 'peer_guidance.py', 'CHANGELOG.md', 'memory.py', 'session.py', 'codex_instructions.py', 'platform_support.py', 'dsh_delivery.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md', 'docs/PARITY-MEMORY-DESIGN.md')
+FILES = ('session_observation.py', 'durable_state.py', 'notification_delivery.py', 'notification_health.py', 'notification_journal.py', 'notification_legacy.py', 'notification_memory.py', 'notification_migration.py', 'notification_notices.py', 'notification_provider.py', 'notification_runtime.py', 'notification_source.py', 'notification_state.py', 'subscriptions.py','memory_bindings.py', 'inbox_schema.py', 'database_worker.py', 'service_runtime.py', 'participant_lock.py', 'peer_transport.py', 'peer_guidance.py', 'CHANGELOG.md', 'memory.py', 'session.py', 'codex_instructions.py', 'platform_support.py', 'dsh_delivery.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md', 'docs/NOTIFIER.md', 'docs/PARITY-MEMORY-DESIGN.md')
 
 
 def unit_arg(value):

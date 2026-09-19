@@ -52,6 +52,7 @@ class InstallTests(unittest.TestCase):
                 '--unit-dir',str(root/'units'),'--no-start'],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertTrue((root/'app/docs/INSTALL.md').exists())
+            self.assertTrue((root/'app/docs/NOTIFIER.md').exists())
             self.assertTrue((root/'app/LICENSE').exists())
             for script in ('bridge.py', 'notify.py', 'session.py', 'memory.py'):
                 check = subprocess.run([sys.executable, str(root/'app'/script), '--help'],

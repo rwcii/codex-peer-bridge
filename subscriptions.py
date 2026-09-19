@@ -126,12 +126,12 @@ class HintConnection:
 
 
 @asynccontextmanager
-async def open_hints(root, request, *, expected_pid=None):
+async def open_hints(root, request, *, expected_pid=None, legacy_socket=None):
     """Connect to an explicit service; caller verifies any stronger service identity."""
     writer = None
     try:
         async with asyncio.timeout(5):
-            path = service_path(root)
+            path = service_path(root, legacy_socket=legacy_socket)
             reader, writer = await asyncio.open_unix_connection(str(path), limit=LIMIT)
             pid = credentials(writer.get_extra_info('socket'))
             if expected_pid is not None and pid != expected_pid:

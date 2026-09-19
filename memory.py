@@ -1373,6 +1373,17 @@ def freeze(store, consumer):
     return sid
 
 
+def validate_target(request, repo, generation):
+    # Optional for legacy callers. Exact-root clients require the advertised guard
+    # and send both fields; validate before any database maintenance or mutation.
+    if 'repo' not in request and 'generation' not in request:
+        return
+    if request.get('repo') != repo:
+        raise MemoryError_('wrong_repository', 'this service serves another repository')
+    if request.get('generation') != generation:
+        raise MemoryError_('not_this_instance', 'the requested service instance has changed')
+
+
 def stop_result(r, repo, generation):
     """Validate the exact instance at the point of action, without database access."""
     if r.get('repo') != repo:
@@ -1412,6 +1423,7 @@ class MemoryCommands:
     READ_ONLY = ('hello', 'status', 'recall', 'stop', 'recover')
 
     def command(self, r, pid):
+        validate_target(r, self.repo, self.generation)
         op = r.get('op')
         if op not in self.READ_ONLY:
             self.store.maybe_expire()
@@ -1706,6 +1718,7 @@ class Service:
     async def command(self, request, pid):
         if not isinstance(request, dict) or not isinstance(request.get('op'), str):
             raise MemoryError_('invalid_request', 'expected an operation object')
+        validate_target(request, self.repo, self.generation)
         if request['op'] == 'stop':
             result = stop_result(request, self.repo, self.generation)
             self.stop.set()
@@ -1719,7 +1732,7 @@ class Service:
         else:
             result = await self.worker.call('command', request, pid)
         if request['op'] in ('hello', 'status'):
-            result['capabilities'] = ['memory_subscription']
+            result['capabilities'] = ['memory_subscription', 'memory_target_guard']
             fault = (result['database_observed_fault'] if request['op'] == 'status'
                      else self.worker.fault)
             if request['op'] == 'hello':
@@ -1872,7 +1885,7 @@ async def request(root, payload, timeout=10):
         raise MemoryError_('no_reply', 'the service closed the connection without replying') from None
 
 
-async def verify_running(root, repo):
+async def verify_running(root, repo, *, require_healthy=True):
     """Confirm the listener is this repository's healthy service before reusing it.
 
     A bind conflict plus any answer proves only that something listens. Reuse
@@ -1903,7 +1916,7 @@ async def verify_running(root, repo):
     if (result.get('repo') != repo or type(result.get('protocol')) is not int or
             result['protocol'] != PROTOCOL):
         raise MemoryError_('foreign_service', 'another service holds this socket; refusing to reuse it')
-    if not result.get('healthy'):
+    if require_healthy and not result.get('healthy'):
         raise MemoryError_('unhealthy_service', 'the running service reports an unhealthy store')
     # A listener with no ownership record is not evidence of a healthy service; it is
     # evidence that something is listening. Absence must refuse, not accept.
@@ -1948,6 +1961,24 @@ async def verify_running(root, repo):
         raise MemoryError_('ownership_mismatch',
                            'the recorded owner pid belongs to a different process now')
     return result
+
+
+async def request_bound(root, repo, payload):
+    """Read or mutate one explicit service root, with identity checked at action.
+
+    An unhealthy store can still expose status or readable data. Let its operation
+    policy decide what remains available instead of refusing all client requests.
+    """
+    service = await verify_running(root, repo, require_healthy=False)
+    if service is None:
+        raise MemoryError_('service_unavailable', 'the selected memory service is unavailable')
+    if 'memory_target_guard' not in service.get('capabilities', []):
+        raise MemoryError_('service_refused', 'upgrade this memory service before using --service-dir')
+    request_payload = dict(payload, repo=repo, generation=service['generation'])
+    reply, pid = await control_exchange(root, request_payload)
+    if pid != service['pid']:
+        raise MemoryError_('ownership_mismatch', 'the selected service changed during the request')
+    return reply
 
 
 def bind_exclusive(home, repo, generation):
@@ -2107,8 +2138,10 @@ def stop_service(home, repo, timeout=20):
 def cli_main():
     os.umask(0o077)
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--state-dir', default=str(Path(os.environ.get(
+    paths = p.add_mutually_exclusive_group()
+    paths.add_argument('--state-dir', default=str(Path(os.environ.get(
         'XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge'))
+    paths.add_argument('--service-dir', help='exact bound memory service directory; no path suffix is added')
     p.add_argument('--repo-path', default=os.getcwd())
     p.add_argument('--consumer', help='stable consumer key; required for note, sync and ack')
     sub = p.add_subparsers(dest='op', required=True)
@@ -2142,9 +2175,13 @@ def cli_main():
     st.add_argument('--after', help='continue from next_after of a previous page')
     args = vars(p.parse_args())
     root = Path(args.pop('state_dir')).absolute()
+    exact = args.pop('service_dir')
     repo = repo_identity(args.pop('repo_path'))
-    private_state_dir(root)
-    home = state_dir(root, repo)
+    if exact is None:
+        private_state_dir(root)
+        home = state_dir(root, repo)
+    else:
+        home = Path(exact).absolute()
     private_state_dir(home)
     op = args.pop('op')
     if op == 'serve':
@@ -2157,7 +2194,7 @@ def cli_main():
         raise SystemExit(f'{op} requires --consumer, a stable key that outlives one command')
     payload = dict(op=op, **{k: v for k, v in args.items() if v is not None})
     try:
-        reply = asyncio.run(request(home, payload))
+        reply = asyncio.run(request_bound(home, repo, payload) if exact is not None else request(home, payload))
     except (ConnectionRefusedError, FileNotFoundError) as exc:
         raise SystemExit(f'no memory service is running for this repository ({home})') from exc
     print(json.dumps(reply, indent=2))

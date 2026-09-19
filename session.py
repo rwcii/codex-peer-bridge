@@ -23,6 +23,8 @@ from bridge import private_dir, peers
 import dsh_delivery
 from notify import save
 import platform_support
+import notification_health
+import session_observation
 from scripts.install import units, check_owned_unit, start_command_for
 
 
@@ -63,24 +65,10 @@ def bridge_status(prefix, state):
 def notifier_readiness(state, bridge):
     if not bridge:
         return None
-    try:
-        ready=json.loads((state/'notify-ready.json').read_text())
-        if ready['bridge_pid'] != bridge['pid']:
-            return None
-        pid=ready['notifier_pid']
-        if not platform_support.same_process(ready['proc_start'], platform_support.proc_start(pid)):
-            return None
-    except (OSError,ValueError,KeyError,IndexError,subprocess.SubprocessError):
+    ready = notification_health.verify_owner(state)
+    if ready is None or ready['bridge_pid'] != bridge.get('pid'):
         return None
-    try:
-        with (state/'notifier.lock').open('a') as lock:
-            try:
-                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            except BlockingIOError:
-                return ready
-    except OSError:
-        pass
-    return None
+    return ready
 
 
 def notifier_ready(state, bridge):
@@ -277,8 +265,9 @@ def main():
             saved=save_registration(state,Path(config['state_root']),a.thread,repo,agent=agent,model=model)
             name=saved['name']
         active=bridge_status(prefix,state)
+        observed=session_observation.lifecycle(state,active)
         if a.action=='rename':
-            if active:
+            if observed != 'stopped':
                 raise ValueError('stop this thread before explicitly renaming it')
             # Rename is the one action where an explicit request wins over the
             # saved identity, so an advertised model can actually be corrected. An
@@ -291,10 +280,11 @@ def main():
             return
         ready=notifier_readiness(state,active)
         healthy=ready is not None
-        if a.action=='status' or (a.action=='ensure' and active):
-            data=result(prefix,state,name,a.thread,repo,'running' if healthy else ('repair_required' if active else 'stopped'),agent,model)
+        if a.action=='status' or (a.action=='ensure' and observed != 'stopped'):
+            data=result(prefix,state,name,a.thread,repo,'running' if healthy else ('repair_required' if active else observed),agent,model)
             data['bridge']=active
             data['participant_lock']=ready.get('participant_lock') if ready else None
+            data['delivery_health']=notification_health.read(state,ready)
             if active and not healthy:
                 data['repair_command']=shlex.join([sys.executable,str(prefix/'session.py'),'stop','--thread',a.thread])
             print(json.dumps(data))
@@ -311,14 +301,22 @@ def main():
                 if available:
                     subprocess.run(['systemctl','--user','stop',unit.name],check=True)
                 active=bridge_status(prefix,state)
-            if active:
-                subprocess.run([sys.executable,str(prefix/'bridge.py'),'--state-dir',str(state),'stop'],check=True)
-                for _ in range(100):
-                    if not bridge_status(prefix,state) and not notifier_ready(state,active):
-                        break
-                    time.sleep(.1)
-                else:
-                    raise RuntimeError('session did not stop completely')
+            # Try independently addressable controls even if status could not answer.
+            # Never interpret a timeout or a retained endpoint as proof of shutdown.
+            for executable, endpoint in (('notify.py', state/'notifier'), ('bridge.py', state)):
+                if session_observation.endpoint_present(endpoint):
+                    try:
+                        subprocess.run([sys.executable,str(prefix/executable),'--state-dir',str(state),'stop'],
+                                       check=True, capture_output=True, timeout=12)
+                    except (OSError,subprocess.SubprocessError):
+                        # A lost stop reply is ambiguous; the observation below
+                        # decides whether shutdown completed.
+                        pass
+            deadline=time.monotonic()+10
+            while session_observation.lifecycle(state,bridge_status(prefix,state)) != 'stopped':
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('session stop is unconfirmed; lifecycle remains unknown')
+                time.sleep(.1)
             # systemd's Restart=on-failure does not restart a clean stop.
             return
         if a.action=='ensure':

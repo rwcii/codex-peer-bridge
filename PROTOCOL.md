@@ -292,10 +292,10 @@ A hint is not durable evidence. The shared `subscriptions.watch_changes` helper
 installs a subscription before rechecking durable state, repeats that sequence on
 reconnect, and independently rescans every two seconds. Reconnect delays are 1, 2,
 4, 8, 16, then 30 seconds. Its caller must verify service identity on each connection
-and reconcile durable state. The existing notifier is not yet connected to this
-helper. Memory contents still require explicit reads; there are no automatic memory
-notices or peer-bus subscriptions. Explicit bindings and pointer refresh controls
-are described below; no subscription automatically invokes them yet.
+and reconcile durable state. The notifier uses this helper for inbox delivery and
+bound memory refresh. Memory contents still require explicit reads. Automatic memory
+notices contain only a sync pointer. These are local service subscriptions, not
+peer-bus subscriptions. Explicit binding and refresh controls are described below.
 
 
 ## Memory bindings and pointers
@@ -370,9 +370,10 @@ memory or infer current health from a retained pointer. An unpageable single rec
 fails explicitly as `binding_row_too_large` rather than returning an empty loop.
 
 No binding operation advances memory consumer cursors. The saved observation means
-only that the bridge issued a pointer. The planned notifier integration will own
-per-binding subscriptions and finite recovery scans; each recovery scan must reread
-memory to catch advances after the previous remote read. It is not yet implemented.
+only that the bridge issued a pointer. The notifier owns per-binding subscriptions
+and finite recovery checks. Each check refreshes the verified service observation.
+An operator-action refusal suspends repeated remote work until owner metadata changes
+or an explicit successful refresh changes the observed service state.
 
 
 ### Private control path aliases
@@ -390,3 +391,44 @@ including when a long alias had selected it for a short canonical root. The norm
 private-directory, socket-mode, kernel-PID and service-identity checks still apply. Two distinct old/new endpoints cause a refusal. New bridge and
 memory startup refuses a retained distinct legacy endpoint before database startup;
 it never removes that endpoint or starts a second listener beside it.
+
+
+## Notifier controls and delivery health
+
+The notifier owns a private control endpoint under `<bridge-state>/notifier`.
+Same-user credentials and canonical private endpoint rules apply. Requests are
+single JSON lines with `op` equal to `status`, `stop`, `retry`, or `ack-health`.
+Only `retry` accepts another field: `sequences`, a nonempty bounded list of inbox
+sequence numbers for retained exhausted work. A reply is an operation result,
+not a peer receipt. `notifier_not_ready` means the journal is unavailable; it does
+not identify a programming fault. Recovery values are `retry`, `capacity`,
+`invalid_request`, `operator_action`, and `internal_error`. `retry` requires a new
+observation or completion of accepted work; it is not permission to repeat an
+ambiguous mutation without checking state. Rebuild reports `bridge_storage_unavailable`
+with exit 75 before checking capabilities when the bridge cannot read its store.
+A readable older bridge instead yields `bridge_upgrade_required` with exit 78. Control timeouts do not prove rollback.
+
+Status reports lifecycle separately from `delivery_health`. The latter contains
+`state` (`healthy`, `degraded`, or `unknown`), fixed reason codes and a bounded
+journal summary. Pending work, exhausted attempts, ambiguous outcomes, compatibility
+mode, accepted history loss, memory refusal and storage faults remain visible.
+A journal query has a one-second observation deadline. No fresh result means unknown
+journal values, not a reused healthy result. This deadline is not a disk I/O bound.
+
+A separate worker publishes `notify-health.json` every two seconds. Readers require
+a matching verified readiness owner and a snapshot no older than 15 seconds.
+Missing, stale, malformed or mismatched evidence yields unknown delivery health.
+Snapshot failure is reported in process memory and a content-free diagnostic;
+readers do not assume a final failure snapshot could be written. A healthy process
+can have degraded delivery health. A provider fault must not trigger a second notifier.
+
+`retry` resets the current automatic budget for selected retained exhausted units.
+It first reconciles source acknowledgements and obsolete pointers. `ack-health`
+clears acknowledged diagnostic aggregates without acknowledging source records,
+resetting budgets or clearing uncertainty on retained work. Rebuild is a stopped
+owner operation, not a socket control; see [notifier recovery](docs/NOTIFIER.md).
+
+Memory services advertise `memory_target_guard` when requests can carry both
+`repo` and `generation`. A mismatch is refused before maintenance
+or mutation. The exact-path memory CLI verifies the owner and uses this guard;
+older services without it require an upgrade for this route.

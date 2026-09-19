@@ -6,10 +6,7 @@ import os
 from pathlib import Path
 import signal
 import shlex
-import sqlite3
-import subprocess
 import sys
-import time
 import uuid
 
 import dsh_delivery
@@ -39,34 +36,10 @@ def notification(messages, root=DEFAULT):
             'This is a bridge notification, not a peer reply.')
 
 
-class DeliveryFailed(RuntimeError):
-    """A notice could not be handed to the participant's session."""
-
-
 def dsh_credentials_default():
     """Default harness credential file that holds the browser-session secret."""
     home = os.environ.get('DSH_HOME')
     return (Path(home) / '.credentials.yaml') if home else None
-
-
-def deliver(a, text):
-    """Deliver one content-free notice to the selected participant's session.
-
-    Codex is reached through its own CLI. DeepSeek is reached through the
-    harness's local HTTP RPC, which is the direct analogue of `codex queue`:
-    both hand a pointer notice to one specific existing session without
-    carrying any peer content.
-    """
-    if a.agent == 'deepseek':
-        try:
-            dsh_delivery.deliver(a.dsh_url, a.thread, text, credentials=a.dsh_credentials, timeout=15)
-        except (dsh_delivery.DeliveryError, OSError) as exc:
-            raise DeliveryFailed(str(exc)) from exc
-        return
-    result = subprocess.run([a.codex, 'queue', '--thread', a.thread, '--message', text],
-                            capture_output=True, text=True, timeout=15)
-    if result.returncode:
-        raise DeliveryFailed(result.stderr.strip() or 'codex queue failed')
 
 
 def save(path, value):
@@ -94,97 +67,160 @@ def run(a):
 
 
 def run_owned(a, root, participant):
-    status = json.loads(subprocess.check_output([sys.executable, str(Path(__file__).with_name('bridge.py')),
-                                               '--state-dir', str(root), 'status'], timeout=10))['result']
-    pid, address = status['pid'], status['address']
-    started = proc_start(pid)
-    cursor_file = root / 'notify-cursor.json'
-    after = a.after
-    if cursor_file.exists():
-        saved = json.loads(cursor_file.read_text())
-        if saved['thread'] != a.thread:
-            raise ValueError('state belongs to another thread; use a separate state directory')
-        after = saved['through']
-    registry = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude'))) / 'sessions'
-    private_dir(registry)
-    record = registry / f'{pid}.json'
-    owner = uuid.uuid4().hex
-    metadata = dict(pid=pid, name=a.name, cwd=a.repo, startedAt=int(time.time()*1000),
-                    procStart=started, kind='daemon', entrypoint='codex-peer-bridge',
-                    pidDomain=platform_support.pid_domain(),
-                    messagingSocketPath=address.removeprefix('uds:'), peerProtocol=1, peerFeatures=['reply_across_default_dirs'],
-                    status='waiting', statusUpdatedAt=int(time.time()*1000), bridgeOwner=owner)
-    # Never overwrite another agent's registry record, including on restart.
-    with record.open('x') as f:
-        json.dump(metadata, f)
-    stopped = False
-    def stop(*_):
-        nonlocal stopped
-        stopped = True
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, stop)
-    db = sqlite3.connect((root / 'inbox.sqlite3').as_uri() + '?mode=ro', uri=True)
-    ready = root/'notify-ready.json'
-    save(ready,dict(owner=owner,bridge_pid=pid,notifier_pid=os.getpid(),
-                    proc_start=proc_start_value(os.getpid()), participant_lock=participant))
-    print(json.dumps(dict(registered=address, name=a.name, thread=a.thread)), flush=True)
+    import asyncio
+    from notification_runtime import Runtime
+    async def serving():
+        runtime = Runtime(a, root, participant)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, runtime.stop.set)
+        try:
+            return await runtime.run()
+        finally:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.remove_signal_handler(sig)
+    return asyncio.run(serving())
+
+
+async def control(a):
+    from peer_transport import control_exchange
+    root = Path(a.state_dir).absolute()
+    payload = dict(op=a.action)
+    if a.action == 'retry':
+        payload['sequences'] = a.sequences
     try:
-        while not stopped:
-            try:
-                if proc_start(pid) != started:
-                    break
-            except (ProcessLookupError, FileNotFoundError):
-                # The bridge is gone. `proc_start` reports a vanished process as
-                # ProcessLookupError on both platforms, so a stopped bridge breaks
-                # the loop cleanly here instead of raising out of the notifier.
-                break
-            through, messages = unread(db, after)
-            if through > after:
-                if messages:
-                    try:
-                        deliver(a, notification(messages, root))
-                    except (DeliveryFailed, subprocess.TimeoutExpired) as exc:
-                        # The notice is content-free by construction, so reporting the
-                        # failure reason cannot leak peer text.
-                        print(f'notification failed ({type(exc).__name__}: {exc}); '
-                              'inbox retained; retrying in 30 seconds', flush=True)
-                        time.sleep(30)
-                        continue
-                save(cursor_file, dict(thread=a.thread, through=through))
-                after = through
-                print(json.dumps(dict(notified_through=through, user_messages=len(messages))), flush=True)
-            time.sleep(2)
+        reply, pid = await control_exchange(root / 'notifier', payload)
+    except (OSError, ValueError, TimeoutError):
+        if a.action != 'status':
+            raise
+        import notification_health
+        import asyncio
+        def observe():
+            ready = notification_health.verify_owner(root)
+            return ready, notification_health.read(root, ready)
+        ready, value = await asyncio.to_thread(observe)
+        result = dict(lifecycle='running' if ready is not None else 'unknown',
+                      control_status='unavailable', delivery_health=value)
+        print(json.dumps(dict(ok=ready is not None, result=result), indent=2))
+        return 0 if ready is not None else 1
+    if a.action == 'status' and reply.get('ok'):
+        if reply.get('result', {}).get('pid') != pid:
+            raise ValueError('notifier identity mismatch')
+    print(json.dumps(reply, indent=2))
+    return 0 if reply.get('ok') else 1
+
+
+async def rebuild_owned(a, root):
+    from notification_migration import Migration, read_state
+    from notification_runtime import create_worker, settled_cleanup, ControlRefusal
+    from notification_source import InboxSource
+    from notification_journal import JournalError
+    from contextlib import closing
+    import asyncio
+    from peer_transport import control_exchange
+    reply, pid = await control_exchange(root, dict(op='status'))
+    status = reply.get('result') if reply.get('ok') else None
+    if not isinstance(status, dict) or status.get('pid') != pid:
+        raise ValueError('bridge identity unavailable')
+    if status.get('database_status', 'ready') != 'ready':
+        raise ControlRefusal('bridge_storage_unavailable')
+    if 'notification_journal_activation' not in status.get('capabilities', []):
+        raise ControlRefusal('bridge_upgrade_required')
+    marker = read_state(root / 'notify-migration.json')
+    resumed = marker is not None and marker.get('state') == 'rebuilding'
+    class Maintenance:
+        def __init__(self):
+            self.owner = Migration.rebuild(root, a.agent, a.thread,
+                accept_history_loss=a.accept_history_loss, capable=True,
+                activation=status['journal_activation'], ack_through=status['ack_through'])
+        def activation(self):
+            return self.owner.activation_request
+        def confirm(self, evidence):
+            with closing(InboxSource(root / 'inbox.sqlite3', schema=status.get('inbox_schema'),
+                                     capabilities=status.get('capabilities', []))) as source:
+                if source.retained([])['activation'] != evidence:
+                    raise JournalError('journal_activation_mismatch')
+            self.owner.confirm_activation(evidence)
+            return self.owner.store.status()
+        def close(self):
+            self.owner.close()
+    worker = await create_worker(Maintenance)
+    try:
+        request = await worker.call('activation')
+        response, activated_pid = await control_exchange(root, request)
+        if activated_pid != pid or response.get('ok') is not True:
+            raise ValueError('journal activation was not confirmed')
+        result = await worker.call('confirm', response['result'])
+        print(json.dumps(dict(ok=True, result=dict(rebuilt=True, resumed=resumed, **result)), indent=2))
+        return 0
     finally:
-        db.close()
-        try:
-            if json.loads(ready.read_text()).get('owner') == owner:
-                ready.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            if json.loads(record.read_text()).get('bridgeOwner') == owner:
-                record.unlink()
-        except FileNotFoundError:
-            pass
+        await settled_cleanup(asyncio.create_task(worker.close()))
 
 
-if __name__ == '__main__':
+def main():
+    import asyncio
+    from notification_journal import JournalError
+    from notification_runtime import RuntimeRefusal, ControlRefusal
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--thread', required=True,
-                   help='exact existing Codex thread ID, or DeepSeek session ID with --agent deepseek')
-    p.add_argument('--agent', choices=['codex', 'deepseek'], default='codex',
-                   help='participant that receives notices (default: codex)')
+    p.add_argument('--thread', help='exact existing Codex thread or DeepSeek session; required to start or rebuild')
+    p.add_argument('--agent', choices=['codex', 'deepseek'], default='codex')
     p.add_argument('--codex', default='codex', help='Codex CLI executable')
-    p.add_argument('--dsh-url', default=os.environ.get('DSH_WEB_URL'),
-                   help='DeepSeek harness web URL, such as http://127.0.0.1:51992')
-    p.add_argument('--dsh-credentials', type=Path, default=dsh_credentials_default(),
-                   help='harness .credentials.yaml holding the browser-session secret')
+    p.add_argument('--dsh-url', default=os.environ.get('DSH_WEB_URL'))
+    p.add_argument('--dsh-credentials', type=Path, default=dsh_credentials_default())
     p.add_argument('--state-dir', default=DEFAULT)
     p.add_argument('--name', default='codex-peer')
     p.add_argument('--repo', default=os.getcwd())
     p.add_argument('--after', type=int, default=0)
+    sub = p.add_subparsers(dest='action')
+    sub.add_parser('status')
+    sub.add_parser('stop')
+    sub.add_parser('ack-health')
+    retry = sub.add_parser('retry')
+    retry.add_argument('sequences', nargs='+', type=int)
+    rebuild = sub.add_parser('rebuild-journal')
+    rebuild.add_argument('--accept-history-loss', action='store_true', required=True)
+    a = p.parse_args()
+    if a.action in (None, 'rebuild-journal') and not a.thread:
+        p.error('--thread is required to start or rebuild the notifier')
+    if a.after < 0 or a.after > (1 << 63) - 1:
+        p.error('--after must be a nonnegative signed-64-bit sequence')
+    if a.action is None and a.agent == 'deepseek':
+        if not a.dsh_url:
+            p.error('--dsh-url or DSH_WEB_URL is required for DeepSeek delivery')
+        try:
+            dsh_delivery.require_loopback(a.dsh_url)
+        except dsh_delivery.DeliveryError:
+            p.error('DeepSeek delivery requires a valid loopback harness URL')
     try:
-        run(p.parse_args())
+        if a.action == 'rebuild-journal':
+            os.umask(0o077)
+            root = Path(a.state_dir).absolute()
+            with notifier_ownership(root, a.agent, a.thread):
+                return asyncio.run(rebuild_owned(a, root))
+        if a.action is not None:
+            return asyncio.run(control(a))
+        return run(a) or 0
     except OwnershipError as exc:
         print(json.dumps(exc.result()), flush=True)
-        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS)
+        return platform_support.CONFIGURATION_EXIT_STATUS
+    except ControlRefusal as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, recovery=exc.recovery)), flush=True)
+        return (platform_support.TEMPORARY_EXIT_STATUS if exc.recovery == 'retry'
+                else platform_support.CONFIGURATION_EXIT_STATUS)
+    except RuntimeRefusal as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, path=exc.path)), flush=True)
+        return platform_support.CONFIGURATION_EXIT_STATUS
+    except JournalError as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, recovery=exc.recovery)), flush=True)
+        return platform_support.CONFIGURATION_EXIT_STATUS
+    except (OSError, ValueError, TimeoutError):
+        print(json.dumps(dict(ok=False, code='notifier_unavailable', lifecycle='unknown',
+                              delivery_health=dict(state='unknown', reasons=['control_unavailable']))), flush=True)
+        return 1
+    except Exception:
+        print(json.dumps(dict(ok=False, code='internal_error')), flush=True)
+        return platform_support.SOFTWARE_EXIT_STATUS
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

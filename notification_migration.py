@@ -121,6 +121,8 @@ class Migration:
                 self.marker = dict(marker, state='ready')
                 durable_state.publish(self.marker_path, self.marker)
             else:
+                if not present(sqlite_files(self.root)[0]):
+                    raise journal.JournalError('journal_recovery_required')
                 self.store = journal.Journal(sqlite_files(self.root)[0], expected)
             self.activation_request = self.activation_gate()
             if saved is None:
@@ -133,7 +135,7 @@ class Migration:
             if self.store is not None:
                 self.store.close()
                 self.store = None
-            if isinstance(exc, sqlite3.ProgrammingError):
+            if isinstance(exc, (sqlite3.ProgrammingError, sqlite3.OperationalError)):
                 raise
             if isinstance(exc, (sqlite3.DatabaseError, FileNotFoundError)):
                 raise journal.JournalError('journal_recovery_required') from exc
@@ -176,6 +178,8 @@ class Migration:
             raise journal.JournalError('journal_rebuild_refused')
         journal.integer(ack_through)
         root = Path(root)
+        # Validate retained target evidence before publishing any rebuild marker.
+        legacy_cursor(root, participant, ack_through)
         target = identity(provider, participant)['digest']
         marker_path = root / 'notify-migration.json'
         marker = read_state(marker_path)

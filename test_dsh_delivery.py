@@ -267,6 +267,32 @@ class DeliverTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_http_error_response_is_closed_before_failure_or_address_retry(self):
+        import io
+        for code in (401, 403, 302, 503):
+            with self.subTest(code=code):
+                body = io.BytesIO(b'synthetic response')
+                failure = urllib.error.HTTPError('http://127.0.0.1:1', code, 'synthetic', {}, body)
+                calls = []
+                def opener(request, timeout=None):
+                    calls.append(request.full_url)
+                    if len(calls) == 1:
+                        raise failure
+                    self.assertTrue(body.closed)
+                    return FakeResponse({'ok': True, 'value': {'accepted': True}})
+                with patch('socket.getaddrinfo', return_value=TWO_LOOPBACK):
+                    if code >= 500:
+                        value = dsh_delivery.deliver('http://localhost:51992', 'synthetic', 'notice',
+                                                    credentials=self.credentials, opener=opener)
+                        self.assertTrue(value['accepted'])
+                        self.assertEqual(len(calls), 2)
+                    else:
+                        with self.assertRaises(dsh_delivery.DeliveryError):
+                            dsh_delivery.deliver('http://localhost:51992', 'synthetic', 'notice',
+                                                 credentials=self.credentials, opener=opener)
+                        self.assertEqual(len(calls), 1)
+                self.assertTrue(body.closed)
+
     def test_accepted_envelope_is_returned(self):
         seen = {}
 

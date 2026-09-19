@@ -403,11 +403,11 @@ notification checkpoint; do not reset either to activate the schema.
 Do not run an older bridge against an upgraded inbox. Schema-2 runtimes refuse
 schema 3; earlier runtimes do not maintain the acknowledgement watermark. Restore a consistent pre-upgrade backup for a
 rollback instead of mixing runtime and metadata versions. The schema change preserves
-ordinary-reader compatibility but does not itself implement a notifier journal or
-upgrade an old notifier to the new delivery protocol. Local change subscriptions are available after both service runtimes are restarted,
-but the existing notifier does not yet use them. Explicit bindings require memory
-schema 4; restart each optional memory service with the new runtime before binding. The explicit bridge activation controls store evidence only; they are
-not a substitute for the planned stopped-notifier rebuild procedure.
+ordinary-reader compatibility but does not upgrade an old notifier. The new notifier
+uses subscriptions and imports the legacy checkpoint into its separate journal.
+Explicit bindings require memory schema 4; restart each optional memory service with
+the new runtime before binding. Activation controls store evidence only. They are
+not a substitute for [stopped-notifier recovery](NOTIFIER.md).
 
 Migration and acknowledgements use SQLite transactions. Process-termination tests
 verify rollback and retry; they do not establish power-loss durability on every
@@ -437,8 +437,10 @@ python3 bridge.py --state-dir /private/bridge-state unbind-memory BINDING_KEY
 ```
 
 Binding verifies the live service but does not create a pointer until refresh.
-The legacy notifier does not deliver memory-pointer notices. Read memory with its
-existing sync commands; binding controls do not acknowledge or import memory.
+The new notifier performs this refresh automatically and queues a content-free
+sync command with the exact service root and a stable consumer identity. The legacy
+notifier does not deliver memory pointers. Binding and notification do not acknowledge
+or import memory; the consumer must run sync and acknowledge issued pages explicitly.
 
 Memory schema 3 upgrades to schema 4 in a transaction that adds a durable store UUID
 and changes the schema version together. Records, snapshots and consumer cursors

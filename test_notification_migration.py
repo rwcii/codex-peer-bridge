@@ -37,6 +37,20 @@ class MigrationTests(unittest.TestCase):
         owner.store.seed_pointers(dict(records=[]))
         return owner, evidence
 
+    def test_operational_error_preserves_preparing_state_for_retry(self):
+        fault = sqlite3.OperationalError('synthetic lock contention')
+        fault.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        with mock.patch.object(migration.journal, 'Journal', side_effect=fault):
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                self.open()
+        self.assertIs(raised.exception, fault)
+        before = durable_state.read(self.marker_path)
+        self.assertEqual(before['state'], 'preparing')
+        with closing(self.open()) as owner:
+            self.assertEqual(owner.marker['nonce'], before['nonce'])
+            self.assertEqual(owner.marker['through'], before['through'])
+            self.assertEqual(owner.marker['state'], 'ready')
+
     def test_legacy_checkpoint_is_imported_and_guarded_without_advancement(self):
         durable_state.publish(self.cursor_path, dict(thread=PARTICIPANT, through=17))
         with closing(self.open(after=0)) as owner:
@@ -210,7 +224,7 @@ class MigrationTests(unittest.TestCase):
         for path in migration.sqlite_files(self.root):
             path.unlink(missing_ok=True)
         with mock.patch.object(migration.journal, 'Journal', side_effect=sqlite3.OperationalError('synthetic')):
-            with self.assertRaises(journal.JournalError):
+            with self.assertRaises(sqlite3.OperationalError):
                 migration.Migration.rebuild(self.root, 'codex', PARTICIPANT,
                     accept_history_loss=True, capable=True, activation=evidence, ack_through=7)
         marker = durable_state.read(self.marker_path)
@@ -219,3 +233,16 @@ class MigrationTests(unittest.TestCase):
                 accept_history_loss=True, capable=True, activation=evidence, ack_through=9)) as owner:
             self.assertEqual(owner.marker['nonce'], marker['nonce'])
             self.assertEqual(owner.store.meta()['scan_through'], 7)
+
+    def test_rebuild_refuses_foreign_legacy_cursor_before_changing_marker(self):
+        owner, evidence = self.complete()
+        owner.close()
+        for path in migration.sqlite_files(self.root):
+            path.unlink(missing_ok=True)
+        before = self.marker_path.read_bytes()
+        durable_state.publish(self.cursor_path, dict(thread='other-synthetic-session', through=17))
+        with self.assertRaises(journal.JournalError):
+            migration.Migration.rebuild(self.root, 'codex', PARTICIPANT,
+                accept_history_loss=True, capable=True, activation=evidence, ack_through=7)
+        self.assertEqual(self.marker_path.read_bytes(), before)
+        self.assertFalse(migration.sqlite_files(self.root)[0].exists())

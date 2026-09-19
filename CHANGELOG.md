@@ -11,23 +11,29 @@ into a dated release section when promoted to `main`.
 
 - Bounded notification journal core, crash-safe migration state, attempt accounting,
   and read-only source reconciliation. Worker integration tests cover acknowledgement
-  races and process termination. The notifier CLI and provider adapters still use
-  the existing delivery path; the journal is not enabled by this component.
+  races and process termination.
+
+- Journal-backed asynchronous Codex and DeepSeek delivery, bounded automatic retry,
+  content-free memory sync notices, and independent delivery health. Notifier controls
+  expose status, explicit retry, health acknowledgement and accepted-loss rebuild.
+  Session lifecycle checks preserve running processes during delivery faults and
+  report an unconfirmed stop as unknown. Exact memory service paths are supported
+  by `memory.py --service-dir`, with repository and generation checks.
 
 - Explicit verified memory bindings and atomic content-free pointer refresh, with
   independent inbox quotas, durable observation state and replacement diagnostics.
   Inbox schema 2 upgrades to 3; memory schema 3 upgrades to 4 with a stable store UUID.
   Binding deadlines cover verification and cleanup; process identity probes stay
-  bounded and off the service loop. Notifier integration remains pending.
+  bounded and off the service loop.
 
 - Explicit bridge and memory change subscriptions with bounded connections, coalesced
-  content-free hints after commit, and a shared reconnect/rescan helper. The existing
-  notifier still polls; automatic memory notices remain pending.
+  content-free hints after commit, and a shared reconnect/rescan helper. The notifier
+  subscribes before each durable recheck and retains finite fallback checks.
 
 - Inbox schema 2 with atomic migration, a bounded acknowledgement watermark and
   durable journal activation evidence. Status advertises only those implemented
   capabilities. Bridge software faults preserve exit 70 through the supervisor and
-  stop automatic restarts. Notifier-journal delivery remains pending.
+  stop automatic restarts.
 
 - Bridge startup reserves both socket paths before opening the inbox and retains
   ownership until database shutdown completes. Endpoint refusal exits 78 without

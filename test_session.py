@@ -107,6 +107,29 @@ class SessionTests(unittest.TestCase):
                     self.assertEqual(reported['participant_lock'], identity('codex', thread))
                     self.assertEqual(json.loads((state/'notify-ready.json').read_text())[
                         'participant_lock'], reported['participant_lock'])
+                # Provider failure must not turn ensure into a second owner launch.
+                # These installed fixtures use Python as the unavailable queue CLI.
+                import sqlite3
+                failed_state,_,_=session.details(app,config,'thread-one','/test-project')
+                ready_before=json.loads((failed_state/'notify-ready.json').read_text())
+                from contextlib import closing
+                with closing(sqlite3.connect(failed_state/'inbox.sqlite3')) as db:
+                    db.execute('INSERT INTO inbox(pid,frame) VALUES(?,?)',
+                        (123, json.dumps(dict(type='user', message=dict(content='synthetic test')))))
+                    db.commit()
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    observed=subprocess.run([sys.executable,str(app/'session.py'),'ensure','--thread','thread-one'],
+                        env=env,capture_output=True,text=True,check=True)
+                    result=json.loads(observed.stdout)
+                    if 'uncertain_delivery' in result['delivery_health']['reasons']:
+                        break
+                    time.sleep(.05)
+                else:
+                    self.fail('provider failure did not reach delivery health')
+                self.assertEqual(result['status'],'running')
+                self.assertEqual(result['bridge']['pid'],statuses[0]['pid'])
+                self.assertEqual(json.loads((failed_state/'notify-ready.json').read_text()),ready_before)
                 self.assertNotEqual(statuses[0]['pid'],statuses[1]['pid'])
                 self.assertNotEqual(statuses[0]['address'],statuses[1]['address'])
                 # A unit file alone must not prevent shutting down a manual instance.
@@ -263,7 +286,7 @@ fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 import subprocess
 bridge = json.loads(subprocess.check_output([sys.executable,
     str(Path(__file__).with_name('bridge.py')), '--state-dir', str(root), 'status']))['result']
-(root/'notify-ready.json').write_text(json.dumps(dict(owner='synthetic',
+(root/'notify-ready.json').write_text(json.dumps(dict(owner='a'*32,
     bridge_pid=bridge['pid'], notifier_pid=os.getpid(),
     proc_start=platform_support.proc_start(os.getpid()))))
 while not (root/'exit-now').exists():

@@ -442,6 +442,9 @@ def deliver(base, session_id, text, credentials=None, timeout=15, opener=None):
                     raise DeliveryError(f'harness returned HTTP {response.status}')
                 document = json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
+            # HTTPError owns a response stream even when no body is consumed.
+            # Release it before raising or trying the next verified address.
+            exc.close()
             if exc.code in (401, 403):
                 # The harness answered and rejected this credential; another address
                 # reaches the same server and would fail identically.
