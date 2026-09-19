@@ -5,6 +5,11 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+- Add bounded local delivery records, acknowledgement-independent deduplication,
+  explicit handled outcomes, and durable notification evidence export. Preserve
+  uncertain outcomes without replaying native messages. Separate observed service
+  health from fresh model activity and declare provider priority limits.
+
 - Add explicit local Codex/Claude usage collection, source-lineage roles, before-work
   markers, retrospective reports, report combining, and eight-column rendering.
   Missing and inconsistent counters remain explicit. DeepSeek usage reporting is

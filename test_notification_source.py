@@ -18,7 +18,7 @@ class InboxSourceTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.store = bridge.InboxStore(self.root)
         self.addCleanup(self.store.close)
-        self.reader = source.InboxSource(self.root / 'inbox.sqlite3', schema=3,
+        self.reader = source.InboxSource(self.root / 'inbox.sqlite3', schema=4,
             capabilities=(*inbox_schema.CAPABILITIES, 'memory_binding'))
         self.addCleanup(self.reader.close)
 
@@ -141,7 +141,7 @@ class InboxSourceTests(unittest.TestCase):
     def test_invalid_advertised_capability_is_refused(self):
         for schema, capabilities in ((True, ['inbox_ack_watermark']),
                                      (2, ['memory_binding']),
-                                     (4, ['inbox_ack_watermark'])):
+                                     (5, ['inbox_ack_watermark'])):
             with self.subTest(schema=schema), self.assertRaises(source.SourceError):
                 source.InboxSource(self.root / 'inbox.sqlite3', schema=schema,
                                    capabilities=capabilities)

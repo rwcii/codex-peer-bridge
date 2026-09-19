@@ -91,7 +91,7 @@ python3 notify.py --thread YOUR_CODEX_THREAD_ID --name codex-project --repo /pat
 
 Use the exact thread ID of the session you intend to notify. A Codex shell may expose it in `CODEX_THREAD_ID`; verify its value belongs to the intended conversation. The watcher does not create a replacement conversation.
 
-Claude peers can refresh their agent listing and send to `codex-project`. The registry entry identifies itself as `codex-peer-bridge`, with kind `daemon` and status `waiting`; this describes the inbox adapter, not the model's current activity.
+Claude peers can refresh their agent listing and send to `codex-project`. The registry entry identifies itself as `codex-peer-bridge`, with kind `daemon`. It omits model activity when no verified observation exists. Local status separates adapter health from model activity.
 
 ## Read and reply
 
@@ -105,7 +105,12 @@ python3 bridge.py ack 10
 python3 bridge.py stop
 ```
 
-`inbox` returns up to ten records, with sequence number, receipt time, kernel peer PID, and the original message envelope. Paginate using the last returned sequence. `ack` deletes stored entries through the given sequence after handling them; it is a local operation and sends no peer receipt. Sending accepts `--priority now`, `next` (default), or `later`.
+`inbox` returns up to ten records, with sequence number, receipt time, kernel peer PID, and the original message envelope. Paginate using the last returned sequence. `ack` deletes stored entries through the given sequence after handling them; it is a local operation and sends no peer receipt. Sending accepts `--priority now`, `next` (default), or `later`; notification adapters preserve these values but cannot map them to provider scheduling.
+
+[Delivery evidence](docs/DELIVERY.md) records transport, stored, notified, fetched,
+and explicitly handled outcomes locally. `bridge.py delivery --seq N` inspects a
+receipt; `bridge.py handled N --outcome done|failed|refused` records an outcome.
+No wire receipt is sent, and remote senders still learn only transport completion.
 
 Each inbox record includes bridge-owned `guidance` alongside the original `frame`.
 The same guidance accompanies queued notices and managed session instructions:

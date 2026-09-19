@@ -126,7 +126,9 @@ validate their required executable. Preserve saved paths, targets, and state.
 
 ## DQ-03 — Stage 5 presence, priority, and delivery evidence
 
-**Source:** approved programme contract. **Status:** pending implementation.
+**Source:** approved programme contract. **Status:** implementation prepared for review;
+status-omission discovery verification remains blocked by the reviewer permission
+layer. No release or runtime deployment is claimed. See [DELIVERY.md](DELIVERY.md).
 
 Separate fresh, evidenced model activity from service health. Unknown activity must
 remain unknown. Declare provider priority limits from measurement. Distinguish
