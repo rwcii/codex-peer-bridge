@@ -30,7 +30,7 @@ class SessionTests(unittest.TestCase):
         ua=units(Path('/app'),a[0],'thread-a',a[1],'/repo',sys.executable,sys.executable,a[2])
         ub=units(Path('/app'),b[0],'thread-b',b[1],'/repo',sys.executable,sys.executable,b[2])
         self.assertFalse(set(ua)&set(ub))
-        self.assertEqual(list(ua),[f'codex-peer-session-{a[2]}.service'])
+        self.assertEqual(list(ua),[f'koinon-session-{a[2]}.service'])
         self.assertIn('session.py',next(iter(ua.values())))
         for invalid in ('','../../bad','thread\nvalue'):
             with self.assertRaises(ValueError): session.identity(invalid)
@@ -136,8 +136,8 @@ class SessionTests(unittest.TestCase):
                 state,_,key=session.details(app,config,'thread-one','/test-project')
                 unit_dir=root/'units'
                 unit_dir.mkdir(exist_ok=True)
-                from scripts.install import MARKER
-                (unit_dir/f'codex-peer-session-{key}.service').write_text(MARKER+'[Service]\n')
+                from scripts.install import MARKER, unit_arg
+                (unit_dir/f'codex-peer-session-{key}.service').write_text(MARKER+'[Service]\nExecStart='+unit_arg(sys.executable)+' '+unit_arg(str(app/'session.py'))+'\n')
                 # Force no systemctl resolution for this subprocess without changing children.
                 stop_env=dict(env,PATH='/nonexistent')
                 stopped=subprocess.run([sys.executable,str(app/'session.py'),'stop','--thread','thread-one'],

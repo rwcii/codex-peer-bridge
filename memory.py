@@ -22,6 +22,7 @@ a defect in review:
   are recorded here, never inferred from a number the caller supplies.
 """
 import argparse
+import runtime_names
 import asyncio
 import subscriptions
 import contextlib
@@ -1430,7 +1431,7 @@ class MemoryCommands:
         if op == 'recover':
             return self.store.recover()
         if op == 'hello':
-            return dict(service='codex-peer-memory', repo=self.repo, protocol=PROTOCOL,
+            return dict(service=runtime_names.MEMORY_SERVICE, repo=self.repo, protocol=PROTOCOL,
                         schema=SCHEMA, store_id=self.store.meta('store_id'), generation=self.generation, pid=os.getpid(),
                         healthy=self.store.healthy(), fts=self.store.fts,
                         indexed=self.store.index_usable(), blocked=self.store.blocked)
@@ -1911,7 +1912,7 @@ async def verify_running(root, repo, *, require_healthy=True):
     result = reply.get('result') if reply.get('ok') is True else None
     if not isinstance(result, dict):
         raise MemoryError_('invalid_service_response', 'the service did not return a valid handshake; no replacement was started')
-    if result.get('service') != 'codex-peer-memory':
+    if result.get('service') != runtime_names.MEMORY_SERVICE:
         raise MemoryError_('foreign_service', 'another service holds this socket; refusing to reuse it')
     if (result.get('repo') != repo or type(result.get('protocol')) is not int or
             result['protocol'] != PROTOCOL):
@@ -2139,8 +2140,7 @@ def cli_main():
     os.umask(0o077)
     p = argparse.ArgumentParser(description=__doc__)
     paths = p.add_mutually_exclusive_group()
-    paths.add_argument('--state-dir', default=str(Path(os.environ.get(
-        'XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge'))
+    paths.add_argument('--state-dir')
     paths.add_argument('--service-dir', help='exact bound memory service directory; no path suffix is added')
     p.add_argument('--repo-path', default=os.getcwd())
     p.add_argument('--consumer', help='stable consumer key; required for note, sync and ack')
@@ -2174,10 +2174,11 @@ def cli_main():
     st = sub.add_parser('status')
     st.add_argument('--after', help='continue from next_after of a previous page')
     args = vars(p.parse_args())
-    root = Path(args.pop('state_dir')).absolute()
+    selected_root = args.pop('state_dir')
     exact = args.pop('service_dir')
     repo = repo_identity(args.pop('repo_path'))
     if exact is None:
+        root = Path(selected_root or runtime_names.default_state_root()).absolute()
         private_state_dir(root)
         home = state_dir(root, repo)
     else:
@@ -2203,7 +2204,7 @@ def cli_main():
 
 # Every locally raised recovery code and synthesized error has an explicit CLI policy. Unknown wire
 # codes retain exit 1; they cannot make a client claim a known retry/configuration class.
-SYNTHESIZED_ERROR_CODES = frozenset(('internal_error', 'storage_error', 'rejected'))
+SYNTHESIZED_ERROR_CODES = frozenset(('internal_error', 'storage_error', 'rejected')) | runtime_names.PATH_SELECTION_CODES
 ERROR_EXIT_CLASSES = {
     'software': frozenset(('internal_error',)),
     'temporary': frozenset((
@@ -2216,7 +2217,7 @@ ERROR_EXIT_CLASSES = {
         'schema_too_new', 'schema_too_old', 'repo_unresolved', 'unhealthy_service',
         'invalid_service_response', 'socket_in_use', 'unsupported_runtime',
         'store_too_large', 'service_refused', 'storage_blocked',
-    )),
+    )) | runtime_names.PATH_SELECTION_CODES,
     'request': frozenset((
         'consumer_retired', 'entry_too_large', 'foreign_snapshot', 'idempotency_conflict',
         'invalid_request', 'no_reply', 'no_such_entry', 'not_bootstrapped', 'not_issued',
@@ -2250,6 +2251,11 @@ def local_error_reply(code, detail):
 def main():
     try:
         return cli_main()
+    except runtime_names.NameConflict as exc:
+        reply = local_error_reply(exc.code, str(exc))
+        reply['paths'] = exc.paths
+        print(json.dumps(reply))
+        raise SystemExit(memory_error_exit_status(reply['code'])) from None
     except MemoryError_ as exc:
         # Factory failures happen before the worker's request classifier is active.
         # Do not report a wrapped programming defect as an incompatible user file.

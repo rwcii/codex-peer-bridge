@@ -84,6 +84,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                     await self.task
                 await asyncio.sleep(.01)
 
+    async def test_registry_entrypoint_keeps_the_external_literal(self):
+        record = self.root / 'registry' / f'{self.runtime.bridge["pid"]}.json'
+        self.assertEqual(json.loads(record.read_text())['entrypoint'], 'codex-peer-bridge')
+
     async def test_committed_inbox_hint_delivers_content_free_notice(self):
         await self.bus.worker.call('store', 7, dict(type='user', message=dict(content='PRIVATE SYNTHETIC BODY')))
         await self.wait_for(lambda: len(self.provider.messages) == 1)

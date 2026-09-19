@@ -34,6 +34,22 @@ class ExactMemoryTargetTests(unittest.IsolatedAsyncioTestCase):
                     await self.running
                 await asyncio.sleep(.001)
 
+    async def test_memory_handshake_keeps_the_old_client_literal(self):
+        reply = await memory.request(self.home, dict(op='hello'))
+        self.assertEqual(reply['result']['service'], 'codex-peer-memory')
+        verified = await memory.verify_running(self.home, self.repo_key)
+        self.assertIsNotNone(verified)
+        original = self.service.command
+        async def renamed_service(request, pid):
+            result = await original(request, pid)
+            if request.get('op') == 'hello':
+                result['service'] = 'koinon-memory'
+            return result
+        with mock.patch.object(self.service, 'command', side_effect=renamed_service):
+            with self.assertRaises(memory.MemoryError_) as raised:
+                await memory.verify_running(self.home, self.repo_key)
+            self.assertEqual(raised.exception.code, 'foreign_service')
+
     async def asyncTearDown(self):
         self.service.stop.set()
         try:

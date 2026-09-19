@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 
@@ -12,11 +13,12 @@ import sys
 # the platform module rather than testing the platform here.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import platform_support
+import runtime_names
 
-MARKER = '# Managed by codex-peer-bridge\n'
-SERVICES = ('codex-peer-notify.service', 'codex-peer-bridge.service')
+MARKER = runtime_names.SERVICE_MARKER
+SERVICES = runtime_names.service_names()
 
-FILES = ('session_observation.py', 'durable_state.py', 'notification_delivery.py', 'notification_health.py', 'notification_journal.py', 'notification_legacy.py', 'notification_memory.py', 'notification_migration.py', 'notification_notices.py', 'notification_provider.py', 'notification_runtime.py', 'notification_source.py', 'notification_state.py', 'subscriptions.py','memory_bindings.py', 'inbox_schema.py', 'database_worker.py', 'service_runtime.py', 'participant_lock.py', 'peer_transport.py', 'peer_guidance.py', 'CHANGELOG.md', 'memory.py', 'session.py', 'codex_instructions.py', 'platform_support.py', 'dsh_delivery.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md', 'docs/NOTIFIER.md', 'docs/PARITY-MEMORY-DESIGN.md')
+FILES = ('runtime_names.py', 'participant_instructions.py', 'session_observation.py', 'durable_state.py', 'notification_delivery.py', 'notification_health.py', 'notification_journal.py', 'notification_legacy.py', 'notification_memory.py', 'notification_migration.py', 'notification_notices.py', 'notification_provider.py', 'notification_runtime.py', 'notification_source.py', 'notification_state.py', 'subscriptions.py','memory_bindings.py', 'inbox_schema.py', 'database_worker.py', 'service_runtime.py', 'participant_lock.py', 'peer_transport.py', 'peer_guidance.py', 'CHANGELOG.md', 'memory.py', 'session.py', 'codex_instructions.py', 'platform_support.py', 'dsh_delivery.py', 'scripts/install.py', 'scripts/uninstall.py', 'scripts/uninstall.sh', 'bridge.py', 'notify.py', 'README.md', 'PROTOCOL.md', 'LICENSE', 'CONTRIBUTING.md', 'AGENTS.md', 'docs/INSTALL.md', 'docs/NOTIFIER.md', 'docs/IDENTIFIER-MIGRATION.md', 'docs/PARITY-MEMORY-DESIGN.md')
 
 
 def unit_arg(value):
@@ -27,7 +29,7 @@ def unit_arg(value):
 
 
 def units(prefix, state, thread, name, repo, python, codex, instance=None,
-          agent='codex', model=None, dsh_url=None, dsh_credentials=None):
+          agent='codex', model=None, dsh_url=None, dsh_credentials=None, legacy=False):
     base = [python, str(prefix/'bridge.py'), '--state-dir', str(state), 'serve']
     watcher = [python, str(prefix/'notify.py'), '--state-dir', str(state), '--thread', thread,
                '--name', name, '--repo', repo]
@@ -45,9 +47,10 @@ def units(prefix, state, thread, name, repo, python, codex, instance=None,
         watcher += ['--codex', codex]
     common = '\nRestart=on-failure\nRestartSec=5\nUMask=0077\n\n[Install]\nWantedBy=default.target\n'
     permanent = '\nRestartPreventExitStatus=' + ' '.join(map(str, platform_support.PERMANENT_EXIT_STATUSES))
+    notify_name, bridge_name = runtime_names.service_names(legacy=legacy)
     rendered = {
-        'codex-peer-bridge.service': MARKER + '[Unit]\nDescription=Local Codex peer messaging bridge\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,base)) + permanent + common,
-        'codex-peer-notify.service': MARKER + '[Unit]\nDescription=Codex peer inbox notifications\nRequires=codex-peer-bridge.service\nAfter=codex-peer-bridge.service\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,watcher)) + permanent + common,
+        bridge_name: MARKER + '[Unit]\nDescription=Koinon local peer messaging bridge\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,base)) + permanent + common,
+        notify_name: MARKER + f'[Unit]\nDescription=Koinon inbox notifications\nRequires={bridge_name}\nAfter={bridge_name}\n\n[Service]\nType=simple\nExecStart=' + ' '.join(map(unit_arg,watcher)) + permanent + common,
     }
 
     if instance:
@@ -55,8 +58,8 @@ def units(prefix, state, thread, name, repo, python, codex, instance=None,
         if not re.fullmatch(r'[a-f0-9]{16}',instance):
             raise ValueError('invalid service instance')
         supervisor = start_command_for(python, prefix, thread, repo, agent, model)
-        rendered = {f'codex-peer-session-{instance}.service': MARKER +
-                    '[Unit]\nDescription=Codex peer session supervisor\n\n[Service]\nType=simple\nExecStart=' +
+        rendered = {runtime_names.service_names(instance, legacy=legacy)[0]: MARKER +
+                    '[Unit]\nDescription=Koinon session supervisor\n\n[Service]\nType=simple\nExecStart=' +
                     ' '.join(map(unit_arg,supervisor)) + permanent + common}
     return rendered
 
@@ -71,19 +74,49 @@ def start_command_for(python, prefix, thread, repo, agent, model):
     return command
 
 
-def check_owned_unit(path):
+def check_owned_unit(path, prefix=None):
     if path.is_symlink():
         raise ValueError(f'refusing symlinked service file: {path}')
     if path.exists() and (not path.is_file() or path.stat().st_uid != os.getuid()
-                          or not path.read_text().startswith(MARKER)):
+                          or not path.read_text().startswith(runtime_names.SERVICE_MARKERS)):
         raise ValueError(f'refusing unrelated service file: {path}')
 
+    if prefix is not None and path.exists() and not unit_targets_prefix(path, prefix):
+        raise ValueError(f'refusing service owned by a different installation: {path}')
 
-def active_units(unit_dir):
+
+def unit_arguments(path):
+    starts = [line[len('ExecStart='):] for line in path.read_text().splitlines()
+              if line.startswith('ExecStart=')]
+    if len(starts) != 1:
+        raise ValueError(f'expected one managed service command: {path}')
+    return shlex.split(starts[0])
+
+
+def unit_targets_prefix(path, prefix):
+    executable = 'session.py' if '-session-' in path.name else ('notify.py' if '-notify.' in path.name else 'bridge.py')
+    expected = str(Path(prefix) / executable).replace('%', '%%').replace('$', '$$')
+    arguments = unit_arguments(path)
+    return len(arguments) > 1 and arguments[1] == expected
+
+
+def saved_unit_option(path, flag):
+    if not path.exists():
+        return None
+    arguments = unit_arguments(path)
+    if arguments.count(flag) != 1:
+        raise ValueError(f'missing or duplicate {flag} in managed service: {path}')
+    index = arguments.index(flag) + 1
+    if index >= len(arguments):
+        raise ValueError(f'missing {flag} value in managed service: {path}')
+    return arguments[index].replace('%%', '%').replace('$$', '$')
+
+
+def active_units(unit_dir, names=SERVICES, prefix=None):
     existing = []
-    for name in SERVICES:
+    for name in names:
         local = unit_dir/name
-        check_owned_unit(local)
+        check_owned_unit(local, prefix)
         result = subprocess.run(['systemctl','--user','show',name,'--property=FragmentPath',
                                  '--value'],check=True,capture_output=True,text=True)
         fragment = result.stdout.strip()
@@ -91,7 +124,7 @@ def active_units(unit_dir):
             actual = Path(fragment)
             if actual != local:
                 raise ValueError(f'refusing service outside selected unit directory: {name}')
-            check_owned_unit(actual)
+            check_owned_unit(actual, prefix)
             existing.append(name)
         elif local.exists():
             existing.append(name)
@@ -108,11 +141,11 @@ def main():
     p.add_argument('--dsh-home', type=Path,
                    default=None,
                    help='harness home whose AGENTS.md receives the managed DeepSeek section')
-    p.add_argument('--name', default='codex-peer')
-    p.add_argument('--repo', default=os.getcwd())
-    p.add_argument('--prefix', type=Path, default=Path.home()/'.local/share/codex-peer-bridge')
-    p.add_argument('--state-dir', type=Path, default=Path.home()/'.local/state/codex-peer-bridge')
-    p.add_argument('--unit-dir', type=Path, default=Path.home()/'.config/systemd/user')
+    p.add_argument('--name')
+    p.add_argument('--repo')
+    p.add_argument('--prefix', type=Path)
+    p.add_argument('--state-dir', type=Path)
+    p.add_argument('--unit-dir', type=Path)
     p.add_argument('--codex', default=shutil.which('codex'))
     p.add_argument('--no-start', action='store_true', help='write files and units without calling systemctl')
     a = p.parse_args()
@@ -120,12 +153,14 @@ def main():
         p.error('Linux or macOS with Python 3.11+ is required')
     if not a.codex or not Path(a.codex).is_absolute() or not os.access(a.codex,os.X_OK):
         p.error('provide an executable absolute --codex path, or install Codex CLI on PATH')
-    a.prefix, a.state_dir, a.unit_dir = [x.expanduser().resolve() for x in (a.prefix,a.state_dir,a.unit_dir)]
+    a.prefix = (a.prefix or runtime_names.default_prefix()).expanduser().resolve()
+    config_path = a.prefix / 'install.json'
+    previous = runtime_names.install_config(a.prefix)
+    a.state_dir = Path(a.state_dir or previous.get('state_root') or runtime_names.default_state_root()).expanduser().resolve()
+    a.unit_dir = Path(a.unit_dir or previous.get('unit_dir') or Path.home()/'.config/systemd/user').expanduser().resolve()
     if not a.thread and not (a.configure_codex or a.configure_deepseek):
         p.error('--thread, --configure-codex or --configure-deepseek is required')
     if a.configure_codex or a.configure_deepseek:
-        config_path = a.prefix/'install.json'
-        previous = json.loads(config_path.read_text()) if config_path.exists() else {}
         a.codex_home = a.codex_home or Path(previous.get('codex_home') or
                                           os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
         a.dsh_home = a.dsh_home or Path(previous.get('dsh_home') or
@@ -142,7 +177,7 @@ def main():
             if (source/file).resolve() != dest.resolve():
                 shutil.copyfile(source/file,dest)
         sys.path.insert(0,str(a.prefix))
-        from codex_instructions import update
+        from participant_instructions import update
         guidance = update(a.codex_home,a.prefix) if a.configure_codex else None
         # The harness reads its guidance from AGENTS.md in the harness home, so a
         # DeepSeek session learns to register and read its inbox the same way a
@@ -159,13 +194,14 @@ def main():
             dsh_credentials=(str(a.dsh_home.expanduser().resolve()/'.credentials.yaml')
                              if a.configure_deepseek else previous.get('dsh_credentials')))))
         print('Installed runtime:',a.prefix)
+        print('State directory:',a.state_dir)
         if guidance is not None:
             print('Managed Codex guidance:',guidance)
         if dsh_guidance is not None:
             print('Managed DeepSeek guidance:',dsh_guidance)
         print('New sessions run session.py ensure with their own session identity.')
         if a.thread and not a.no_start:
-            subprocess.run([sys.executable,str(a.prefix/'session.py'),'ensure','--thread',a.thread,'--repo',a.repo],check=True)
+            subprocess.run([sys.executable,str(a.prefix/'session.py'),'ensure','--thread',a.thread,'--repo',a.repo or os.getcwd()],check=True)
         return
     if platform_support.SERVICE_MANAGER is None and not a.no_start:
         # The managed supervisor is the portable alternative to a service manager:
@@ -176,13 +212,21 @@ def main():
     checkpoint = a.state_dir/'notify-cursor.json'
     if checkpoint.exists() and json.loads(checkpoint.read_text())['thread'] != a.thread:
         p.error('existing state belongs to a different thread; select another state directory')
-    rendered = units(a.prefix,a.state_dir,a.thread,a.name,str(Path(a.repo).resolve()),sys.executable,a.codex)
-    for name in SERVICES:
-        check_owned_unit(a.unit_dir/name)
+    selected = runtime_names.selected_service_names(a.unit_dir)
+    for name in selected:
+        check_owned_unit(a.unit_dir/name, a.prefix)
+    notifier_unit = a.unit_dir / selected[0]
+    saved_target = saved_unit_option(notifier_unit, '--thread')
+    if saved_target is not None and saved_target != a.thread:
+        p.error('existing service belongs to a different thread; preserve its state and select a separate installation')
+    a.name = a.name or saved_unit_option(notifier_unit, '--name') or 'codex-peer'
+    a.repo = a.repo or saved_unit_option(notifier_unit, '--repo') or os.getcwd()
+    rendered = units(a.prefix,a.state_dir,a.thread,a.name,str(Path(a.repo).resolve()),sys.executable,a.codex,
+                     legacy=selected == runtime_names.service_names(legacy=True))
     if not a.no_start:
         # Fail before modifying installation if the user manager is unavailable.
         subprocess.run(['systemctl','--user','show-environment'],check=True,stdout=subprocess.DEVNULL)
-        existing = active_units(a.unit_dir)
+        existing = active_units(a.unit_dir, selected, a.prefix)
         if existing:
             subprocess.run(['systemctl','--user','stop',*existing],check=True)
     os.umask(0o077)
@@ -191,7 +235,8 @@ def main():
     source = Path(__file__).resolve().parent.parent
     for file in FILES:
         (a.prefix/file).parent.mkdir(parents=True,exist_ok=True)
-        shutil.copyfile(source/file,a.prefix/file)
+        if (source/file).resolve() != (a.prefix/file).resolve():
+            shutil.copyfile(source/file,a.prefix/file)
     for name,content in rendered.items():
         (a.unit_dir/name).write_text(content)
     if a.no_start:
@@ -201,8 +246,12 @@ def main():
         subprocess.run(['systemctl','--user','enable','--now',*rendered],check=True)
     print('Installed at',a.prefix)
     print('State directory:',a.state_dir)
-    print('Check: systemctl --user status codex-peer-bridge codex-peer-notify')
+    print('Check: systemctl --user status', *selected)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except runtime_names.NameConflict as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, paths=exc.paths)))
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None

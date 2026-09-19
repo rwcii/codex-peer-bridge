@@ -16,7 +16,8 @@ permissions. Memory consolidation across repositories is not implemented.
 
 Python standard library only. No pip dependencies, cloud relay, or repository-specific integration.
 
-Runtime paths, service names, and registry identifiers retain their existing names. See the
+Fresh installations use Koinon paths and service names. Existing paths and state
+remain in place. External wire identifiers remain unchanged. See the
 [compatibility notes](docs/INSTALL.md#name-and-path-compatibility).
 
 ## Participants
@@ -233,7 +234,8 @@ for the capabilities that remain unverified.
 
 ## Storage and multiple sessions
 
-Persistent state defaults to `$XDG_STATE_HOME/codex-peer-bridge`, or `~/.local/state/codex-peer-bridge`. For another instance, give **both processes** a distinct state directory:
+Fresh persistent state defaults to `$XDG_STATE_HOME/koinon`, or `~/.local/state/koinon`.
+An existing legacy default is reused; if both names exist, supply an explicit path. For another instance, give **both processes** a distinct state directory:
 
 ```sh
 python3 bridge.py --state-dir /path/to/private/state serve

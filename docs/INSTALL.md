@@ -2,21 +2,36 @@
 
 ## Name and path compatibility
 
-Koinon was previously named Codex Peer Bridge. The project name and clone URL have
-changed. The installed runtime still uses `codex-peer-bridge` paths, existing
-`codex-peer-*` service names, and the `codex-peer-bridge` registry entrypoint. Commands
-below deliberately retain those names. No reinstall or restart is needed for this
-documentation change.
+Koinon was previously named Codex Peer Bridge. Fresh installations use
+`~/.local/share/koinon`, state under `$XDG_STATE_HOME/koinon` (or
+`~/.local/state/koinon`), and `koinon-*` service names. The examples below use those
+fresh-install names. Existing installations retain their selected paths and names.
 
-The systemd ownership marker in `scripts/install.py` and the managed guidance markers
-in `codex_instructions.py` are also unchanged. Do not replace them by hand. A future
-migration must recognize existing markers so that upgrades and removal still find the
-owned units and managed sections.
+The installer first selects the prefix: an explicit `--prefix` wins; otherwise,
+a lone legacy `~/.local/share/codex-peer-bridge` is reused. If both prefixes exist,
+specify the intended prefix. It then reads saved installation configuration.
+Explicit state and unit paths win over saved paths; saved paths win over defaults.
+Without saved state configuration, a lone legacy state root is reused. Both state
+names present cause a refusal that names both paths. Default selection reports its
+path and reason on stderr. No state, cursor, memory store, registration or lock is
+moved or reset. Invalid configuration refuses without falling back to empty state.
+Historical explicit-thread installations without `install.json` must repeat any
+custom state and unit paths on upgrade.
 
-Existing local checkouts and worktrees can keep their directory names. Moving a local
-checkout is a separate operation: worktree links, repository identity, peer registration,
-and agent memory keyed by the working-directory path can depend on those paths. Do not
-move state or reset inbox and memory cursors as part of a documentation rename.
+Existing owned `codex-peer-*` unit names remain in use. Both old and new ownership
+markers and participant guidance sections are recognized for upgrade and removal.
+The implementation is `participant_instructions.py`; `codex_instructions.py` remains
+an import shim. The guidance lock filenames remain unchanged so old and new
+updaters cannot write at the same time. Do not replace markers or delete locks by hand.
+
+The Claude registry entrypoint remains `codex-peer-bridge`; the memory handshake
+remains `codex-peer-memory`. Older clients depend on these values. The account-local
+lock namespace remains `koinon-locks`. These are compatibility identifiers, not
+unfinished branding. See the [migration contract](IDENTIFIER-MIGRATION.md).
+
+A source update does not install or restart a runtime. Existing checkouts and
+worktrees can keep their directory names. Moving them is a separate operation:
+repository identity, peer registration and memory can depend on their paths.
 
 ## Requirements
 
@@ -119,7 +134,7 @@ can be installed and removed independently. Repeated configuration retains previ
 registered participants and uses their recorded homes when home flags are omitted.
 Uninstallation removes every managed section recorded by the installation.
 
-This installs runtime files in `~/.local/share/codex-peer-bridge` and adds a clearly
+This installs runtime files in `~/.local/share/koinon` and adds a clearly
 marked section to `$CODEX_HOME/AGENTS.md` (normally `~/.codex/AGENTS.md`). If a global
 `AGENTS.override.md` already exists, the installer manages that higher-priority file
 instead. Existing content is preserved; a private backup is saved before the first
@@ -129,7 +144,7 @@ without restoring an old backup over subsequent user edits.
 The section instructs each Codex conversation to run `session.py ensure` using its
 own `CODEX_THREAD_ID`. It never embeds a fixed thread ID. Each thread gets:
 
-- an isolated directory under `~/.local/state/codex-peer-bridge/sessions/<session-hash>`;
+- an isolated directory under `~/.local/state/koinon/sessions/<session-hash>`;
 - a fleet-style peer name, `codex-<repo-short-name>-<two-hex>`, stable for the session
   (a DeepSeek participant uses `deepseek-<model>-<repo-short-name>-<two-hex>`);
 - its own bridge process, socket, watcher, and notification checkpoint;
@@ -164,20 +179,20 @@ machine-wide services.
 From the intended Codex session's shell:
 
 ```sh
-python3 ~/.local/share/codex-peer-bridge/session.py ensure
+python3 ~/.local/share/koinon/session.py ensure
 ```
 
 If `CODEX_THREAD_ID` is unavailable, pass the **verified** target explicitly:
 
 ```sh
-python3 ~/.local/share/codex-peer-bridge/session.py ensure --thread YOUR_THREAD_ID --repo /path/to/project
+python3 ~/.local/share/koinon/session.py ensure --thread YOUR_THREAD_ID --repo /path/to/project
 ```
 
 Never guess a thread ID or substitute another model session. Verify queue access with
 a harmless `codex queue --thread YOUR_THREAD_ID --message 'Bridge setup test; no action required.'`
 when setting up a new Codex implementation.
 
-With systemd, registration starts `codex-peer-session-<thread-hash>.service`, whose
+With systemd, registration starts `koinon-session-<thread-hash>.service`, whose
 supervisor owns both bridge and notifier. It reports healthy only after both are ready;
 a child failure fails the supervisor so systemd can restart the pair. Per-conversation
 units start on registration, not at every subsequent login. No lingering is enabled.
@@ -201,9 +216,9 @@ verifying their old process is dead. Never purge shared Claude directories.
 ## Use and inspect
 
 ```sh
-python3 ~/.local/share/codex-peer-bridge/session.py status
-python3 ~/.local/share/codex-peer-bridge/bridge.py peers
-python3 ~/.local/share/codex-peer-bridge/session.py stop
+python3 ~/.local/share/koinon/session.py status
+python3 ~/.local/share/koinon/bridge.py peers
+python3 ~/.local/share/koinon/session.py stop
 ```
 
 `status` and `ensure` return this thread's inbox command and state directory. Run
@@ -302,7 +317,7 @@ The pre-existing explicit single-thread mode remains available:
 python3 scripts/install.py --thread YOUR_THREAD_ID --name codex-project --repo /path/to/project
 ```
 
-That legacy mode manages the fixed `codex-peer-bridge`/`codex-peer-notify` pair and does
+That legacy mode manages the fixed `koinon-bridge`/`koinon-notify` pair (or the retained legacy names) and does
 not add global guidance. Prefer Codex-wide mode for concurrent sessions. It does not
 adopt an already running prototype or legacy inbox automatically; stop or migrate that
 instance deliberately to avoid duplicate registrations for one conversation.
@@ -314,8 +329,8 @@ session identity across the OS account. Both acquisitions are nonblocking. A con
 fails startup before registration or delivery, with `participant_in_use`, the provider,
 the `account-local` scope, and the lock digest. Match that digest to `participant_lock`
 in `session.py status` or the running notifier's private `notify-ready.json`. Under systemd, read the refusal JSON with
-`journalctl --user -u codex-peer-notify -n 50 --no-pager` for the legacy pair, or
-`journalctl --user -u codex-peer-session-INSTANCE -n 50 --no-pager` for a session.
+`journalctl --user -u koinon-notify -n 50 --no-pager` for a fresh fixed pair (use the retained name after upgrade), or
+`journalctl --user -u koinon-session-INSTANCE -n 50 --no-pager` for a session.
 Ownership refusals exit with status 78. Both service forms prevent automatic restart
 on that status; the supervisor preserves it after stopping its bridge child. Correct
 the reported condition before explicitly starting the instance again. Stop an
@@ -384,7 +399,7 @@ only confirmed bridge units before migration.
   loads, restart/reload the conversation, then run `session.py ensure` explicitly.
 - **No notification:** check the exact target with a direct queue test and inspect both
   bridge and notifier health, not just socket existence.
-- **Service failed:** `journalctl --user -u codex-peer-session-INSTANCE -n 50 --no-pager`.
+- **Service failed:** `journalctl --user -u koinon-session-INSTANCE -n 50 --no-pager`.
   The instance suffix is the state-directory hash returned by `ensure`.
 - **Name missing in Claude:** refresh its listing; registry `messagingSocketPath` is a
   bare filesystem path, while message addresses use `uds:`.

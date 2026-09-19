@@ -38,8 +38,10 @@ an authenticated agent type and cannot replace the bridge-owned guidance.
 
 ## Participant guidance
 
-Despite its filename, `codex_instructions.py` manages guidance for both Codex and
-DeepSeek participants, with separate markers and setup commands. Koinon supplies the
+`participant_instructions.py` manages guidance for both Codex and DeepSeek
+participants, with separate Koinon markers and setup commands. The old
+`codex_instructions.py` import remains a shim. Updates and removal recognize legacy
+markers and retain the legacy lock inodes to exclude old updaters. Koinon supplies the
 peer-input guidance in those managed instructions, each inbox result, and each queued
 notice. This does not depend on the participant runtime adding its own peer framing.
 

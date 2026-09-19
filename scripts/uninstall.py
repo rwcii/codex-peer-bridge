@@ -6,25 +6,39 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from install import FILES, SERVICES, active_units, check_owned_unit, unit_arg
+from install import FILES, check_owned_unit, unit_targets_prefix
+import platform_support
+import runtime_names
 
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--prefix',type=Path,default=Path.home()/'.local/share/codex-peer-bridge')
+    p.add_argument('--prefix',type=Path)
     a=p.parse_args()
-    prefix=a.prefix.expanduser().resolve()
+    prefix=(a.prefix or runtime_names.default_prefix()).expanduser().resolve()
     config_path=prefix/'install.json'
-    config=json.loads(config_path.read_text()) if config_path.exists() else {}
+    config=runtime_names.install_config(prefix)
     unit_dir=Path(config.get('unit_dir',str(Path.home()/'.config/systemd/user')))
-    state_root=Path(config.get('state_root',str(Path.home()/'.local/state/codex-peer-bridge')))
-    owned=[name for name in SERVICES if not (unit_dir/name).exists() or
-           unit_arg(str(prefix/('notify.py' if 'notify' in name else 'bridge.py'))) in (unit_dir/name).read_text()]
-    owned += [path.name for path in unit_dir.glob('codex-peer-session-*.service')
-              if re.fullmatch(r'codex-peer-session-[a-f0-9]{16}\.service',path.name)
-              and unit_arg(str(prefix/'session.py')) in path.read_text()]
-    for name in owned:
-        check_owned_unit(unit_dir/name)
+    state_root=Path(config.get('state_root') or runtime_names.default_state_root())
+    candidates = set(runtime_names.service_names()) | set(runtime_names.service_names(legacy=True))
+    for stem in ('koinon', 'codex-peer'):
+        candidates.update(path.name for path in unit_dir.glob(f'{stem}-session-*.service')
+                          if re.fullmatch(r'(?:koinon|codex-peer)-session-[a-f0-9]{16}\.service', path.name))
+    owned = []
+    for name in sorted(candidates):
+        path = unit_dir / name
+        if not runtime_names.present(path):
+            continue
+        # Other installations can share the unit directory. Remove only a unit
+        # whose marker and executable both identify this installation.
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f'refusing unsafe service file: {path}')
+        if not unit_targets_prefix(path, prefix):
+            continue
+        # An apparent unit for this prefix with a missing marker is a refusal,
+        # not a reason to delete its executable and orphan the enabled unit.
+        check_owned_unit(path, prefix)
+        owned.append(name)
     if config:
         for registration in (state_root/'sessions').glob('*/session.json'):
             thread=json.loads(registration.read_text())['thread']
@@ -37,7 +51,7 @@ def main():
         subprocess.run(['systemctl','--user','daemon-reload'],check=True)
     if config:
         sys.path.insert(0,str(prefix))
-        from codex_instructions import update
+        from participant_instructions import update
         # Remove the managed section for every participant this installation
         # configured, not just Codex: a harness section left behind would keep
         # telling sessions to register against a runtime that is gone. Older
@@ -54,4 +68,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except runtime_names.NameConflict as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, paths=exc.paths)))
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None

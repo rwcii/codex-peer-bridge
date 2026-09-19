@@ -58,7 +58,7 @@ class InstallTests(unittest.TestCase):
                 check = subprocess.run([sys.executable, str(root/'app'/script), '--help'],
                                        cwd=root, capture_output=True, text=True)
                 self.assertEqual(check.returncode, 0, check.stderr)
-            unit=(root/'units/codex-peer-notify.service').read_text()
+            unit=(root/'units/koinon-notify.service').read_text()
             self.assertIn('test-thread',unit)
             self.assertIn('--codex',unit)
             self.assertFalse((root/'state').exists())

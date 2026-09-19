@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local Claude peer protocol adapter. Python standard library only."""
 import argparse
+import runtime_names
 import asyncio
 import json
 import os
@@ -22,7 +23,7 @@ import subscriptions
 import memory_bindings
 
 from peer_transport import LIMIT, credentials, encode, peer_token, private_dir, target_path, control_exchange, UnsafeServiceEndpoint, NoControlReply
-DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge')
+DEFAULT = str(Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'koinon')
 
 
 def peers():
@@ -499,7 +500,7 @@ async def client(root, request):
 def cli_main():
     os.umask(0o077)
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--state-dir', default=DEFAULT)
+    p.add_argument('--state-dir')
     sub = p.add_subparsers(dest='op', required=True)
     for op in ('serve','status','stop','peers'):
         sub.add_parser(op)
@@ -527,7 +528,7 @@ def cli_main():
     s = sub.add_parser('memory-bindings')
     s.add_argument('--after', default='')
     a = vars(p.parse_args())
-    root = Path(a.pop('state_dir')).absolute()
+    root = Path(a.pop('state_dir') or runtime_names.default_state_root()).absolute()
     startup_directory(root)
     if a['op'] == 'peers':
         print(json.dumps(peers(), indent=2))
@@ -540,6 +541,9 @@ def cli_main():
 def main():
     try:
         cli_main()
+    except runtime_names.NameConflict as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, paths=exc.paths)))
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None
     except inbox_schema.InboxSchemaError as exc:
         print(json.dumps(dict(ok=False, code='incompatible_inbox', error=str(exc))))
         raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None

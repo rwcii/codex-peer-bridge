@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Register the live bridge and queue inbox notifications to a selected participant."""
 import argparse
+import runtime_names
 import json
 import os
 from pathlib import Path
@@ -167,7 +168,7 @@ def main():
     p.add_argument('--codex', default='codex', help='Codex CLI executable')
     p.add_argument('--dsh-url', default=os.environ.get('DSH_WEB_URL'))
     p.add_argument('--dsh-credentials', type=Path, default=dsh_credentials_default())
-    p.add_argument('--state-dir', default=DEFAULT)
+    p.add_argument('--state-dir')
     p.add_argument('--name', default='codex-peer')
     p.add_argument('--repo', default=os.getcwd())
     p.add_argument('--after', type=int, default=0)
@@ -192,6 +193,7 @@ def main():
         except dsh_delivery.DeliveryError:
             p.error('DeepSeek delivery requires a valid loopback harness URL')
     try:
+        a.state_dir = a.state_dir or runtime_names.default_state_root()
         if a.action == 'rebuild-journal':
             os.umask(0o077)
             root = Path(a.state_dir).absolute()
@@ -200,6 +202,9 @@ def main():
         if a.action is not None:
             return asyncio.run(control(a))
         return run(a) or 0
+    except runtime_names.NameConflict as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, paths=exc.paths)), flush=True)
+        return platform_support.CONFIGURATION_EXIT_STATUS
     except OwnershipError as exc:
         print(json.dumps(exc.result()), flush=True)
         return platform_support.CONFIGURATION_EXIT_STATUS

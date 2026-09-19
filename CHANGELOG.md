@@ -5,6 +5,12 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+- Use Koinon defaults for new runtime paths, services and managed participant
+  guidance. Reuse legacy paths and owned service names, preserve saved custom
+  paths, and refuse ambiguous defaults. Upgrade and removal recognize both marker
+  families. Registry, memory handshake and cross-version lock identifiers remain
+  unchanged; no runtime state is moved or reset.
+
 - Select private control endpoints from canonical state paths on both platforms. Preserve validated legacy endpoints for clients and refuse duplicate or ambiguous old/new listeners during upgrades. Peer messaging paths remain literal.
 
 ### Added

@@ -1,5 +1,6 @@
 """Notifier orchestration: private control, journal owner, provider, and health."""
 import asyncio
+import runtime_names
 from contextlib import asynccontextmanager
 import json
 import os
@@ -465,7 +466,7 @@ class Runtime:
             self.bridge_start = started
             metadata = dict(pid=self.bridge['pid'], name=self.options.name, cwd=self.options.repo,
                 startedAt=int(time.time()*1000), procStart=started, kind='daemon',
-                entrypoint='codex-peer-bridge', pidDomain=platform_support.pid_domain(),
+                entrypoint=runtime_names.REGISTRY_ENTRYPOINT, pidDomain=platform_support.pid_domain(),
                 messagingSocketPath=self.bridge['address'].removeprefix('uds:'), peerProtocol=1,
                 peerFeatures=['reply_across_default_dirs'], status='waiting',
                 statusUpdatedAt=int(time.time()*1000), bridgeOwner=self.generation)

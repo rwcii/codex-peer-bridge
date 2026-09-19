@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -37,22 +39,18 @@ class StartMarkerTests(unittest.TestCase):
 class ProcessTests(unittest.TestCase):
     def test_self_is_alive_and_reaped_child_is_not(self):
         self.assertTrue(platform_support.process_alive(os.getpid()))
-        child = os.fork()
-        if child == 0:
-            os._exit(0)
-        os.waitpid(child, 0)
-        self.assertFalse(platform_support.process_alive(child))
+        with subprocess.Popen([sys.executable, '-c', 'pass']) as child:
+            self.assertEqual(child.wait(timeout=5), 0)
+        self.assertFalse(platform_support.process_alive(child.pid))
 
     def test_a_vanished_process_raises_process_lookup_on_both_platforms(self):
         # Callers such as the notifier's bridge-liveness check catch exactly this,
         # so a stopped bridge must break their loop cleanly rather than raise a
         # platform-specific error out of the notifier.
-        child = os.fork()
-        if child == 0:
-            os._exit(0)
-        os.waitpid(child, 0)
+        with subprocess.Popen([sys.executable, '-c', 'pass']) as child:
+            self.assertEqual(child.wait(timeout=5), 0)
         with self.assertRaises(ProcessLookupError):
-            platform_support.proc_start(child)
+            platform_support.proc_start(child.pid)
 
     def test_pid_domain_names_this_platform(self):
         if platform_support.DARWIN:

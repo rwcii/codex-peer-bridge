@@ -23,6 +23,7 @@ from bridge import private_dir, peers
 import dsh_delivery
 from notify import save
 import platform_support
+import runtime_names
 import notification_health
 import session_observation
 from scripts.install import units, check_owned_unit, start_command_for
@@ -290,9 +291,9 @@ def main():
             print(json.dumps(data))
             return
         if a.action=='stop':
-            unit=Path(config['unit_dir'])/f'codex-peer-session-{key}.service'
+            unit=Path(config['unit_dir'])/runtime_names.selected_service_names(Path(config['unit_dir']), key)[0]
             if unit.exists():
-                check_owned_unit(unit)
+                check_owned_unit(unit, prefix)
                 try:
                     available=subprocess.run(['systemctl','--user','show-environment'],stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,timeout=5).returncode==0
@@ -329,13 +330,15 @@ def main():
                 print(json.dumps(result(prefix,state,name,a.thread,repo,'manual_required',agent,model)))
                 return
             unit_dir=Path(config['unit_dir'])
+            selected = runtime_names.selected_service_names(unit_dir, key)
             rendered=units(prefix,state,a.thread,name,repo,sys.executable,config['codex'],instance=key,
                            agent=agent,model=model,dsh_url=config.get('dsh_url'),
-                           dsh_credentials=config.get('dsh_credentials'))
+                           dsh_credentials=config.get('dsh_credentials'),
+                           legacy=selected == runtime_names.service_names(key, legacy=True))
             unit_dir.mkdir(parents=True,exist_ok=True)
             for filename,content in rendered.items():
                 target=unit_dir/filename
-                check_owned_unit(target)
+                check_owned_unit(target, prefix)
                 target.write_text(content)
             # `run` needs this lock before it can start either child. Keep the
             # lifecycle lock until both children are ready, so another ensure,
@@ -356,4 +359,8 @@ def main():
 
 
 if __name__=='__main__':
-    main()
+    try:
+        main()
+    except runtime_names.NameConflict as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, paths=exc.paths)))
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None
