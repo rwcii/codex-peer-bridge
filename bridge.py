@@ -54,10 +54,11 @@ def peers():
                 continue
             address=record.get('messagingSocketPath','')
             target_path('uds:'+address)
+            activity = participant_presence.registry_activity(record)
             found.append(dict(pid=pid,name=record.get('name'),address='uds:'+address,
-                              repo=record.get('cwd'),status=participant_presence.registry_activity(record)['state'],
+                              repo=record.get('cwd'),status=activity['state'],
                               presence=dict(service=participant_presence.service('kernel_process_start', 'running'),
-                                            model_activity=participant_presence.registry_activity(record)),
+                                            model_activity=activity),
                               implementation=record.get('entrypoint'),protocol=record.get('peerProtocol')))
         except (OSError,ValueError,TypeError,KeyError,IndexError,subprocess.SubprocessError):
             continue
@@ -140,6 +141,10 @@ class InboxStore:
                     key = 'out:'+delivery_ledger.digest([delivery_ledger.identity(self.db), address, msg_id])
                     delivery_ledger.conflict(self.db, key, now)
             raise
+
+    def failed_before_connect(self, key):
+        with inbox_schema.transaction(self.db):
+            return delivery_ledger.failed_before_connect(self.db, key, time.time())
 
     def transported(self, key, pid):
         with inbox_schema.transaction(self.db):
@@ -282,7 +287,11 @@ class Bridge:
         writer = None
         try:
             async with asyncio.timeout(min(4, max(0, deadline - time.time()))):
-                reader, writer = await asyncio.open_unix_connection(str(path), limit=LIMIT)
+                try:
+                    reader, writer = await asyncio.open_unix_connection(str(path), limit=LIMIT)
+                except (FileNotFoundError, ConnectionRefusedError):
+                    result = await self.worker.call('failed_before_connect', attempt['key'])
+                    return dict(key=attempt['key'], **result)
                 pid = credentials(writer.get_extra_info('socket'))
                 token = peer_token(pid, path)
                 if token:
@@ -296,7 +305,7 @@ class Bridge:
             return dict(key=attempt['key'], **result)
         except (OSError, TimeoutError):
             # The reservation is durable. Never replay a possibly accepted native
-            # frame; even failures before write retain this conservative outcome.
+            # frame. Unclassified failures retain this conservative outcome.
             return attempt
         finally:
             if writer is not None:
@@ -616,7 +625,7 @@ async def client(root, request):
             entry['guidance'] = (MEMORY_POINTER_GUIDANCE if entry.get('kind') == 'memory-pointer'
                                  else PEER_GUIDANCE)
     emit(result)
-    if request['op'] == 'send' and result.get('ok') and result.get('result', {}).get('status') == 'indeterminate':
+    if request['op'] == 'send' and result.get('ok') and result.get('result', {}).get('status') in ('indeterminate', 'failed_before_connect'):
         return 1
     return 0 if result['ok'] else 1
 

@@ -74,13 +74,13 @@ acknowledgement. After both retention and inbox ownership end, a native frame ma
 be accepted again: the bridge does not know a native sender's retry policy.
 Never assume native peers deduplicate an uncertain send.
 
-There are at most 10,000 incoming and outgoing records combined. Record JSON is
-limited to 4,096 UTF-8 bytes; internal keys and fingerprints have fixed bounded
-lengths. The JSON allowance is therefore at most 40,960,000 bytes, plus bounded
+There are at most 10,000 incoming and 10,000 outgoing records, with independent limits.
+Record JSON is limited to 4,096 UTF-8 bytes; internal keys and fingerprints have fixed bounded
+lengths. The JSON allowance is therefore at most 81,920,000 bytes, plus bounded
 SQLite row/index overhead; this is not a physical database size guarantee.
 Admission prunes eligible expired records and otherwise refuses with
-`delivery_capacity`. It never evicts an unexpired key. Inbox capacity remains
-1,000 peer entries. Original message bodies are not copied into the ledger.
+`delivery_capacity`. It never evicts an unexpired key. Outgoing sends cannot
+consume incoming receipt slots. Inbox capacity remains 1,000 peer entries. Original message bodies are not copied into the ledger.
 
 For a repeatable outgoing command, choose both identifiers before sending:
 
@@ -97,11 +97,16 @@ indeterminate result or restart. Changed parameters conflict. Expired deadlines
 are refused. A genuinely new send requires a new ID and an explicit decision about
 possible duplicate work. No automatic native replay is implemented.
 
+A missing socket or a refused connection is recorded as `failed_before_connect`: no
+native frame was sent. Repeating that ID returns the same result; choose a new ID
+for an explicit retry (`--msg-id`; the result reports `retry: use_new_msg_id`). Same-ID replay remains disabled for all outcomes. Other
+connection errors, timeouts and failures after connecting remain indeterminate.
+
 Without supplied identifiers, the CLI creates an ID and a five-minute deadline
 and includes them in its JSON response, including ambiguous reply errors. The
 socket attempt lasts at most four seconds, bounded further by the deadline.
-An indeterminate send returns nonzero CLI status; it does not mean the receiver
-failed. Receipt lookup is separate from replay. No new fields are added to native
+An indeterminate or failed-before-connect send returns nonzero CLI status.
+Indeterminate does not mean the receiver failed. Receipt lookup is separate from replay. No new fields are added to native
 wire frames; the random persistent installation ID stays local.
 
 ## Presence and priority
@@ -113,12 +118,17 @@ Every presence value carries source, observation time and a 15-second freshness
 window. Unknown activity has no fabricated observation. Consumers must expire
 cached observations; an old successful status response does not survive a disconnect.
 
-For Claude `cli` records, a fresh `statusUpdatedAt` with `busy`, `shell`, `idle`, or
-`waiting` provides registry activity evidence. `shell` maps to busy. Waiting does
-not distinguish approval from user-input waits. Missing, future-dated, stale or
-unrecognized evidence is unknown. Koinon's own daemon registry record omits
-activity instead of permanently asserting waiting. Claude's UI may display Idle
-for an absent status; that UI fallback is not a Koinon activity claim.
+For Claude `cli` records, `busy`, `shell`, `idle`, or `waiting` provides registry
+activity evidence after the process-start liveness check. `shell` maps to busy.
+`observed_at_ms` is the read time; `since_ms` is the registry's `statusUpdatedAt`,
+which records a status change, not a heartbeat. A long-running state stays valid
+while its process is live. Consumers expire their observation after 15 seconds.
+Waiting does not distinguish approval from user-input waits. Missing, malformed,
+future-dated or unrecognized evidence is unknown. The `peers` top-level `status`
+now contains this normalized state rather than the raw registry value.
+Koinon's own daemon registry record omits activity instead of permanently asserting
+waiting. Claude's UI may display Idle for an absent status; that UI fallback is
+not a Koinon activity claim.
 
 Codex and DeepSeek activity remains unknown: no verified read-only source owned by
 the selected participant is integrated. Codex app-server schemas expose status and
@@ -152,9 +162,8 @@ cannot infer notification evidence from an old notifier's checkpoint.
 The Claude registry status enum and native receipt/priority parsers were inspected
 in version 2.1.276. They are undocumented, version-dependent interfaces. The
 status-omission discovery fixture has not run: its shared-registry mutation was
-rejected by the reviewer's automatic approval layer. This remains a release gate,
-not a verified compatibility claim. No runtime upgrade has been performed for
-this feature.
+rejected by the reviewer's automatic approval layer. No live compatibility claim
+is made. No runtime upgrade has been performed for this feature.
 
 An offline check traced the actual daemon reader and `listLivePeerSessions` path
 in Claude 2.1.276. Extracted parser and listing functions accepted both an
@@ -162,5 +171,9 @@ in-memory daemon record with `idle` and one with status omitted. Liveness and
 socket reachability were supplied by synthetic stubs; no registry files, processes,
 native CLI instances or model sessions were created. The extracted function set
 had SHA-256 `67781457284b87697cde91432429ac5aec7b97fdd6937ef585b12df57a08379a`.
-This establishes parser/filter acceptance, not end-to-end native discovery. The
-live gate remains open. Vendor implementation text is not included in this repository.
+The reviewer independently confirmed the parser accepts omitted status. The
+listing-filter result rests on the driver’s extraction. Both observations are
+limited to version 2.1.276 and do not establish end-to-end native discovery.
+Offline compatibility evidence is sufficient for this implementation review.
+Live discovery remains unverified. Vendor implementation text is not included
+in this repository.

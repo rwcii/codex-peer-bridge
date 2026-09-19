@@ -10,6 +10,7 @@ def unknown(reason='no_verified_activity_source'):
 
 
 def registry_activity(record, now=None):
+    # Caller must first verify that the registry process and start marker are live.
     now = int(time.time() * 1000) if now is None else now
     stamp = record.get('statusUpdatedAt')
     raw = record.get('status')
@@ -18,9 +19,9 @@ def registry_activity(record, now=None):
         return unknown('registry_activity_source_unverified')
     if state is None or type(stamp) is not int:
         return unknown('registry_activity_missing')
-    if not 0 <= now - stamp <= FRESHNESS_MS:
-        return unknown('registry_activity_stale')
-    return dict(state=state, source='claude_registry', observed_at_ms=stamp,
+    if not 0 <= stamp <= now:
+        return unknown('registry_activity_timestamp_invalid')
+    return dict(state=state, source='claude_registry', observed_at_ms=now, since_ms=stamp,
                 freshness_ms=FRESHNESS_MS, reason=None)
 
 

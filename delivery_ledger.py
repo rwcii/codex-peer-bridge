@@ -9,7 +9,7 @@ import time
 import uuid
 
 RETENTION = 86400
-MAX_RECORDS = 10000
+MAX_RECORDS = 10000  # Per direction; outgoing traffic cannot exhaust inbound slots.
 MAX_RECORD_BYTES = 4096
 
 
@@ -62,15 +62,16 @@ def get(db, key=None, seq=None):
     return dict(key=row[0], fingerprint=row[1], data=json.loads(row[2]), expires=row[3])
 
 
-def capacity(db, now):
+def capacity(db, now, incoming=True):
     # Never evict unexpired evidence or evidence for a retained inbox entry.
     db.execute('DELETE FROM delivery_record WHERE expires<? AND (seq IS NULL OR seq NOT IN (SELECT seq FROM inbox))', (now,))
-    if db.execute('SELECT count(*) FROM delivery_record').fetchone()[0] >= MAX_RECORDS:
+    direction = 'seq IS NOT NULL' if incoming else 'seq IS NULL'
+    if db.execute('SELECT count(*) FROM delivery_record WHERE ' + direction).fetchone()[0] >= MAX_RECORDS:
         raise DeliveryError('delivery_capacity')
 
 
 def insert(db, key, seq, fingerprint, data, now):
-    capacity(db, now)
+    capacity(db, now, incoming=seq is not None)
     encoded = canonical(data)
     if len(encoded.encode()) > MAX_RECORD_BYTES:
         raise DeliveryError('delivery_record_too_large')
@@ -167,3 +168,12 @@ def conflict(db, key, now):
         diagnostic['count'] = min(1000000000, diagnostic['count'] + 1)
         diagnostic['last_at'] = now
         update(db, record, now)
+
+
+def failed_before_connect(db, key, now):
+    record = get(db, key=key)
+    if record is None:
+        raise DeliveryError('delivery_record_missing')
+    record['data'].update(status='failed_before_connect', retry='use_new_msg_id')
+    update(db, record, now)
+    return record['data']

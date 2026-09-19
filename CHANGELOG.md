@@ -8,7 +8,10 @@ into a dated release section when promoted to `main`.
 - Add bounded local delivery records, acknowledgement-independent deduplication,
   explicit handled outcomes, and durable notification evidence export. Preserve
   uncertain outcomes without replaying native messages. Separate observed service
-  health from fresh model activity and declare provider priority limits.
+  health from fresh model activity and declare provider priority limits. Normalize
+  `peers` status values (including shell to busy); distinguish observation time
+  from the time a Claude status changed. Isolate incoming/outgoing ledger capacity
+  and report definite missing/refused socket connections separately from uncertainty.
 
 - Add explicit local Codex/Claude usage collection, source-lineage roles, before-work
   markers, retrospective reports, report combining, and eight-column rendering.

@@ -68,6 +68,14 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(len(self.store.command(dict(op='inbox'))), 1)
             self.assertTrue(self.store.store(os.getpid(), FRAME)['duplicate'])
 
+    def test_outgoing_and_incoming_capacity_are_independent(self):
+        with mock.patch.object(ledger, 'MAX_RECORDS', 1):
+            self.store.outgoing('uds:/tmp/target.sock', 'body', 'next', 'id', time.time()+60)
+            self.store.store(os.getpid(), FRAME)
+            with self.assertRaisesRegex(ledger.DeliveryError, 'delivery_capacity'):
+                self.store.outgoing('uds:/tmp/target.sock', 'body', 'next', 'other', time.time()+60)
+            self.assertEqual(len(self.store.command(dict(op='inbox'))), 1)
+
     def test_expiry_never_evicts_retained_inbox_but_acknowledged_key_can_expire(self):
         with mock.patch.object(bridge.time, 'time', return_value=100):
             self.store.store(os.getpid(), FRAME)
@@ -236,16 +244,23 @@ class OutboxTests(unittest.TestCase):
 
 
 class PresenceTests(unittest.TestCase):
-    def test_stale_missing_foreign_and_future_activity_stays_unknown(self):
+    def test_missing_foreign_and_future_activity_stays_unknown(self):
         record = dict(entrypoint='cli', status='idle', statusUpdatedAt=100)
         self.assertEqual(presence.registry_activity(record, 101)['state'], 'idle')
-        for altered, now in [(record, 99), (record, 15101),
+        for altered, now in [(record, 99),
                              (dict(record, entrypoint='codex-peer-bridge'), 101),
                              (dict(record, statusUpdatedAt=None), 101),
                              (dict(record, status='invented'), 101),
                              (dict(record, status=[]), 101)]:
             self.assertEqual(presence.registry_activity(altered, now)['state'], 'unknown')
         self.assertEqual(presence.registry_activity(dict(record, status='waiting'), 101)['state'], 'waiting')
+
+    def test_long_running_state_is_freshly_observed_with_original_since(self):
+        record = dict(entrypoint='cli', status='busy', statusUpdatedAt=100)
+        result = presence.registry_activity(record, 180000)
+        self.assertEqual(result['state'], 'busy')
+        self.assertEqual(result['observed_at_ms'], 180000)
+        self.assertEqual(result['since_ms'], 100)
 
     def test_priority_limits_separate_schema_reachability_and_verification(self):
         for provider in ('codex', 'deepseek'):
@@ -325,6 +340,18 @@ class SocketEvidenceTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             writer.close()
             await writer.wait_closed()
+
+    async def test_definite_connect_failure_is_durable_without_replay(self):
+        for error in (FileNotFoundError(), ConnectionRefusedError()):
+            deadline = time.time()+60
+            msg_id = type(error).__name__
+            with mock.patch.object(bridge, 'target_path', return_value=self.root/'absent.sock'), mock.patch.object(bridge.asyncio, 'open_unix_connection', side_effect=error) as connect:
+                result = await self.bus.send('uds:/tmp/absent.sock', 'body', 'next', msg_id, deadline)
+                self.assertEqual(result['status'], 'failed_before_connect')
+                self.assertEqual(result['retry'], 'use_new_msg_id')
+                repeated = await self.bus.send('uds:/tmp/absent.sock', 'body', 'next', msg_id, deadline)
+                self.assertEqual(repeated['status'], 'failed_before_connect')
+                self.assertEqual(connect.call_count, 1)
 
     async def test_cancelled_native_send_is_never_replayed(self):
         reached, release = asyncio.Event(), asyncio.Event()
