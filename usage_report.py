@@ -84,9 +84,9 @@ def capture(manifest, until=None):
 def begin(manifest, work_block):
     sources = []
     for agent, source in capture(manifest):
-        if source['issues']:
-            raise ValueError('cannot mark a source with invalid or incomplete lines')
-        sources.append(dict(selection=agent, boundary=source['boundary'],
+        if 'incomplete:trailing_line' in source['issues']:
+            raise ValueError('cannot mark a source with an incomplete trailing line')
+        sources.append(dict(selection=agent, boundary=source['boundary'], issues=source['issues'],
                             response_ids=[r['response_id'] for r in source['records']]))
     return dict(schema_version=1, work_block=text(work_block, 'work_block'), sources=sources,
                 created_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -138,6 +138,8 @@ def report(manifest, work_block=None, marker=None, since=None, until=None):
             excluded = set(saved['response_ids'])
         selected = []
         issues = list(source['issues'])
+        if marker is not None:
+            issues.extend(marker['sources'][index].get('issues', []))
         for record in source['records']:
             at = record['timestamp']
             if at > end:
@@ -157,13 +159,19 @@ def report(manifest, work_block=None, marker=None, since=None, until=None):
             groups.setdefault(record['model'], []).append(record)
         for model, records in groups.items():
             row_issues = sorted(set(i for r in records for i in r['issues']))
-            counters = {key: (None if any(r['counters'][key] is None for r in records)
-                              else sum(r['counters'][key] for r in records)) for key in FIELDS}
+            counted = [r for r in records if r['complete'] and not r['issues']]
+            excluded = [dict(response_id=r['response_id'], timestamp=r['timestamp'],
+                             reasons=r['issues'], native=r['native'], counters=r['counters'])
+                        for r in records if not r['complete'] or r['issues']]
+            counters = {key: sum(r['counters'][key] for r in counted) if counted else None
+                        for key in FIELDS}
             status = ('inconsistent' if any(i.startswith(('invalid:', 'inconsistent:')) for i in row_issues)
                       else 'incomplete' if row_issues else 'complete')
             rows.append(dict(agent_id=agent['agent_id'], session_id=agent['session_id'], model=model,
                              role=source['role'], role_source=source['role_source'], **counters,
                              status=status, issues=row_issues, responses=len(records),
+                             counted_responses=len(counted), excluded_responses=excluded,
+                             counter_coverage='complete_responses_only',
                              native_totals={key: (None if any(r['native'].get(key) is None for r in records)
                                                  else sum(r['native'][key] for r in records))
                                             for key in records[0]['native']
@@ -174,6 +182,7 @@ def report(manifest, work_block=None, marker=None, since=None, until=None):
             issues.append('incomplete:no_observed_responses')
         evidence.append(dict(selection=agent, adapter_version=ADAPTER_VERSION,
                              boundary=source['boundary'], selected_responses=len(selected),
+                             excluded_api_error_rows=source['excluded_api_error_rows'],
                              issues=sorted(set(issues))))
         all_issues.extend(issues)
     status = ('inconsistent' if any(i.startswith(('invalid:', 'inconsistent:')) for i in all_issues)
@@ -225,7 +234,8 @@ def table(value):
     def cell(value):
         return str(value if value is not None else 'unavailable').replace('|', '\\|').replace('\n', ' ').replace('\r', ' ')
     for row in value['rows']:
-        lines.extend(['Agent: ' + cell(row['agent_id']) + ' (' + row['status'] + ')', '',
+        lines.extend(['Agent: ' + cell(row['agent_id']) + ' (' + row['status'] + '; ' + str(row.get('counted_responses', 0))
+                      + ' counted, ' + str(len(row.get('excluded_responses', []))) + ' excluded)', '',
                       '| ' + ' | '.join(headings) + ' |',
                       '| ' + ' | '.join(['---'] * 8) + ' |',
                       '| ' + ' | '.join(cell(row.get(key)) for key in ('model', 'role') + FIELDS) + ' |', ''])

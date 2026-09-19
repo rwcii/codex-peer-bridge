@@ -121,6 +121,7 @@ def collect(selection, until=None):
     path = Path(selection['path'])
     records, issues, model = {}, [], None
     metadata = {}
+    excluded_api_error_rows = 0
     digest = hashlib.sha256()
     with path.open('rb') as stream:
         stat = os.fstat(stream.fileno())
@@ -137,7 +138,16 @@ def collect(selection, until=None):
             digest.update(line)
             line_no += 1
             if len(line) > MAX_LINE:
-                raise ValueError('source line exceeds byte limit')
+                while not line.endswith(b'\n') and remaining:
+                    line = stream.readline(min(MAX_LINE + 1, remaining))
+                    if not line:
+                        raise ValueError('source truncated during collection')
+                    remaining -= len(line)
+                    digest.update(line)
+                issues.append(f'incomplete:record:{line_no}:oversized_line')
+                if len(issues) > 1000:
+                    raise ValueError('source exceeds diagnostic limit')
+                continue
             if not line.endswith(b'\n'):
                 issues.append('incomplete:trailing_line')
                 break
@@ -145,6 +155,11 @@ def collect(selection, until=None):
                 row = json.loads(line)
                 if not isinstance(row, dict):
                     raise ValueError('record must be an object')
+                if (selection['provider'] == 'claude' and row.get('type') == 'assistant'
+                        and (row.get('isApiErrorMessage') is True
+                             or row.get('message', {}).get('model') == '<synthetic>')):
+                    excluded_api_error_rows += 1
+                    continue
                 if selection['provider'] == 'codex' and row.get('type') == 'session_meta':
                     metadata = row.get('payload', {})
                     if metadata.get('id') != selection['session_id']:
@@ -181,4 +196,5 @@ def collect(selection, until=None):
     elif role != selection['role']:
         issues.append('inconsistent:selected_role_disagrees_with_lineage')
     return dict(records=list(records.values()), issues=issues, role=role, role_source=role_source,
+                excluded_api_error_rows=excluded_api_error_rows,
                 boundary=dict(bytes=size, sha256=digest.hexdigest(), device=stat.st_dev, inode=stat.st_ino))

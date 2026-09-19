@@ -94,6 +94,13 @@ excludes reasoning. Total is stored explicitly. Native totals are retained where
 available; Claude's total is derived from its native input/output and cache counters.
 A complete breakdown must sum to Total. Inconsistency is reported without correcting
 Total, clamping native counters, or substituting zero for missing measurements.
+For partial rows, numeric columns are subtotals of complete, consistent responses
+only, and `counter_coverage` states that rule. Other responses remain in
+`excluded_responses`, with identity, timestamp, reasons, native values, and normalized
+counters (including an inconsistent original total). The row stays incomplete or
+inconsistent. If no response qualifies, the subtotal is unavailable, not zero.
+The table states how many responses were counted and excluded. Synthetic Claude
+API-error rows are excluded from model rows and counted separately in evidence.
 Native counter aggregates, source prefix hashes, selection, and mapping version are
 retained as evidence. No conversation bodies enter reports.
 
@@ -116,6 +123,7 @@ Only native Codex and Claude sources are accepted in this release. Generic
 normalized-record import is not included. Missing keys remain unknown. Boolean,
 negative, noninteger, and out-of-range counters are invalid. Sources are bounded to
 1 GiB, 4 MiB per line, and 250,000 unique responses; manifests select at most 256
-sources. Partial trailing lines are diagnosed. Missing, unreadable, oversized, or
-unrecoverable sources fail explicitly; no permission changes or automatic discovery
+sources. Partial trailing lines are diagnosed. Oversized lines are consumed in bounded chunks and diagnosed while other records
+remain available. Missing, unreadable, oversized source files, or
+unrecoverable boundaries fail explicitly; no permission changes or automatic discovery
 of unrelated sessions is attempted.

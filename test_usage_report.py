@@ -89,20 +89,23 @@ class UsageTests(unittest.TestCase):
         row = self.result()['rows'][0]
         self.assertIsNone(row['reasoning'])
         self.assertIsNone(row['tokens_out'])
-        self.assertEqual(row['total'], 115)
+        self.assertIsNone(row['total'])
+        self.assertEqual(row['excluded_responses'][0]['native']['total_tokens'], 115)
         self.assertEqual(row['status'], 'incomplete')
 
     def test_missing_claude_reasoning_preserves_derivable_total(self):
         self.claude(usage={k: v for k, v in CLAUDE.items() if k != 'output_tokens_details'})
         row = self.result()['rows'][0]
         self.assertIsNone(row['reasoning'])
-        self.assertEqual(row['total'], 115)
+        self.assertIsNone(row['total'])
+        self.assertEqual(row['excluded_responses'][0]['counters']['total'], 115)
 
     def test_inconsistent_total_is_retained_and_flagged(self):
         self.codex(usage=dict(CODEX, total_tokens=999))
         result = self.result()
         self.assertEqual(result['status'], 'inconsistent')
-        self.assertEqual(result['rows'][0]['total'], 999)
+        self.assertIsNone(result['rows'][0]['total'])
+        self.assertEqual(result['rows'][0]['excluded_responses'][0]['counters']['total'], 999)
 
     def test_negative_boolean_and_overlap_rejected(self):
         for change in (dict(input_tokens=-1), dict(output_tokens=True), dict(cached_input_tokens=101)):
@@ -255,6 +258,43 @@ class UsageTests(unittest.TestCase):
         table = report.table(self.result())
         self.assertIn('| Model | Role | Tokens In | Tokens Out | Cache Write | Cache Read | Reasoning | Total |', table)
         self.assertIn('Agent: agent-a', table)
+
+    def test_claude_synthetic_error_rows_are_evidence_not_models(self):
+        self.claude()
+        self.append(dict(type='assistant', isApiErrorMessage=True, sessionId='session-a',
+                         timestamp=MID, message=dict(id='error-a', model='<synthetic>', usage={})))
+        result = self.result()
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(len(result['rows']), 1)
+        self.assertEqual(result['evidence'][0]['excluded_api_error_rows'], 1)
+
+    def test_three_complete_plus_interrupted_keeps_usable_subtotal(self):
+        for n in range(3):
+            self.claude(response='complete-' + str(n))
+        partial = dict(CLAUDE)
+        del partial['output_tokens_details']
+        self.claude(response='interrupted', complete=False, usage=partial)
+        row = self.result()['rows'][0]
+        self.assertEqual(row['status'], 'incomplete')
+        self.assertEqual(row['counted_responses'], 3)
+        self.assertEqual(row['total'], 345)
+        self.assertEqual(row['tokens_out'], 30)
+        self.assertEqual(row['reasoning'], 15)
+        self.assertEqual(len(row['excluded_responses']), 1)
+        self.assertEqual(row['excluded_responses'][0]['response_id'], 'interrupted')
+        self.assertEqual(row['excluded_responses'][0]['native']['output_tokens'], 15)
+
+    def test_oversized_line_is_bounded_diagnostic_and_does_not_erase_usage(self):
+        self.codex()
+        with self.path.open('a') as stream:
+            stream.write('x' * 2048 + '\n')
+        self.codex(response='response-b')
+        with patch.object(sources, 'MAX_LINE', 1024):
+            result = self.result()
+            self.assertEqual(result['status'], 'incomplete')
+            self.assertEqual(result['rows'][0]['counted_responses'], 2)
+            marker = report.begin(self.manifest, 'work-a')
+            self.assertTrue(marker['sources'][0]['issues'])
 
     def test_limits_and_boundary_validation(self):
         with self.assertRaises(ValueError):

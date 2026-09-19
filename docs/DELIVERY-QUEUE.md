@@ -24,10 +24,10 @@ Stage 6 history pruning. Investigating a requirement does not settle its protoco
 ## DQ-01 — Universal per-agent usage reports
 
 **Source:** user requirement conveyed by the reviewer and explicitly requested for
-this queue by the user. **Status:** Codex/Claude implementation prepared; native
-DeepSeek usage is explicitly deferred for this release by scope decision. See
-[the implemented contract and availability matrix](USAGE.md). DeepSeek messaging, delivery, and installation remain supported; the exclusion
-applies only to usage reporting.
+this queue by the user. **Status:** Codex/Claude implementation delivered on develop. DeepSeek usage
+is explicitly deferred for this release by scope decision. See [the implemented contract and availability matrix](USAGE.md). DeepSeek
+messaging, delivery, and installation remain supported; the exclusion applies
+only to usage reporting.
 
 An agent reports its own model and token usage for a specified work block on
 request. The request may be made at the start of the block or after it completes.
@@ -102,7 +102,8 @@ The interface supports explicit local selection, native source-lineage roles,
 before-work markers, retrospective observation windows, source identity checks,
 per-response deduplication, report combining, and the agreed table. Native counters,
 Total, source coverage, and mapping version remain available in JSON. No peer wire
-format, capture hooks, notes pipeline, or cost tooling is added. DeepSeek usage is a named deferred item for a later release. Generic normalized
+format, capture hooks, notes pipeline, or cost tooling is added. DeepSeek usage is a named deferred item
+for a later release. Generic normalized
 import is not included in this release.
 
 ## DQ-02 — DeepSeek-only installation must not require Codex
