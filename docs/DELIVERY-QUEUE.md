@@ -29,10 +29,17 @@ required before implementation.
 
 An agent reports its own model and token usage for a specified work block on
 request. The request may be made at the start of the block or after it completes.
-Return one row per reporting agent, with these columns:
+Preserve each reporting agent's identity, with model/role segments where needed,
+and these columns:
 
 | Model | Role | Tokens In | Tokens Out | Cache Write | Cache Read | Reasoning | Total |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+
+The user clarified through the reviewer that Role means `main` or `subagent`
+(harness position). Driver and reviewer describe a participant's task or function,
+not Role. Keep any such assignment as metadata, not a ninth displayed column.
+Preserve agent identity alongside model and role so distinct agents never collapse
+into one row merely because their model and harness role match.
 
 The figures support commit provenance notes. Cost estimation is a separate work
 product and is excluded. The user specifically named the provenance-notes skills in
@@ -73,7 +80,8 @@ Acquisition evidence from the design conference:
   JSONL record. `payload.usage` contains `input_tokens`, `output_tokens`,
   `cache_write_input_tokens`, `cached_input_tokens`, `reasoning_output_tokens`, and
   `total_tokens`. Model identity is present in `turn_context.payload.model`; role
-  remains declared project metadata. The driver read its own records and verified
+  means harness position (`main` or `subagent`), established from session lineage
+  rather than a token counter. The driver read its own records and verified
   their session attribution, response identifiers, and all six fields.
 - In that inspected sample, per-response sums matched the thread aggregate, total
   equalled input plus output, and cache reads and reasoning were bounded by input
@@ -103,7 +111,7 @@ Reference reconciliation still required:
   Commit-time windows are defaults; explicit time windows and post-commit review-tail
   capture also exist. These defaults do not replace arbitrary requested work blocks.
 - Its model/main-or-subagent aggregation is distinct from the requested per-reporting-
-  agent presentation. Resolve Role semantics and model changes without losing agent
+  agent presentation. Preserve the confirmed harness-role meaning and model changes without losing agent
   identity or silently changing the user's requested granularity.
 - Forge's `scripts/provenance-notes.sh` includes a reasoning counter and an accounting
   expression that adds output and reasoning. Trace its upstream normalization before
@@ -184,8 +192,9 @@ evidence or a substitute for this contract.
 **Source:** gap discussed with the user; the proposed solution below is not an
 approved implementation contract. **Status:** scope/design decision pending.
 
-Records carry type, scope, scope target, and optional path. Current `recall` uses FTS token matching when the index is usable and a body-substring
-scan otherwise, and paginates newest-first; it has no metadata filters or first-class topic
+Records carry type, scope, scope target, and optional path. Current `recall` uses FTS
+token matching when the index is usable and a body-substring scan otherwise, and
+paginates newest-first; it has no metadata filters or first-class topic
 model. Initial sync selects repository records and later sync returns repository
 changes; stored scope is not a server-side audience filter. Typed storage alone does
 not give agents selective retrieval or scope isolation.
