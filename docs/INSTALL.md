@@ -497,3 +497,25 @@ inspect their owners before proceeding. No inbox or memory state is reset.
 The installer copies the local usage-report CLI and adapters. It starts no collector
 and registers no hooks. See [USAGE.md](USAGE.md) for explicit source selection,
 private markers, reporting, and the explicit DeepSeek usage deferral for this release.
+
+## Delivery evidence upgrade
+
+Upgrade the bridge and notifier together. Inbox schema 3 migrates transactionally
+to 4; the notification journal migrates from 1 to 2. An interrupted migration rolls
+back. The persistent installation identity is generated once in the inbox database
+and remains with that state through reinstall and restart. It is not a thread ID.
+
+Before an authorized upgrade, stop the selected notifier and bridge and verify both
+have exited. Copy that installation's entire private state directory to a private
+backup, preserving permissions, including databases, SQLite sidecars, migration and
+activation records, cursors, bindings and targets. Do not copy only a live main
+SQLite file. Do not remove the original or reset its checkpoints. Install with the
+same prefix, state paths and selected target, then restart and verify the pair.
+
+Older binaries refuse the new schemas. To roll back, first stop and verify both new
+processes have exited, then restore the complete stopped-state backup with the old
+binaries and the same target. Never combine an older journal backup with a newer
+inbox or switch targets during rollback. Restoring a backup loses subsequent local
+records and requires an explicit decision about that loss. Keep the new state for
+recovery rather than deleting it. Installation alone does not establish native
+receipt support or close the discovery verification gate in [DELIVERY.md](DELIVERY.md).

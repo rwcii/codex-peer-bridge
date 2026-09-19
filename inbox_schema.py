@@ -4,10 +4,11 @@ import json
 import re
 import sqlite3
 import uuid
+import delivery_ledger
 
-SCHEMA = 3
+SCHEMA = 4
 MAX_SEQUENCE = (1 << 63) - 1
-CAPABILITIES = ('inbox_ack_watermark', 'notification_journal_activation')
+CAPABILITIES = ('inbox_ack_watermark', 'notification_journal_activation', 'delivery_ledger')
 KEYS = {'schema', 'ack_through', 'journal_activation'}
 LEGACY_COLUMNS = ('seq', 'received', 'pid', 'frame')
 COLUMNS = LEGACY_COLUMNS + ('kind', 'binding', 'binding_instance')
@@ -74,14 +75,19 @@ def initialize(db):
         if 'inbox_meta' in tables:
             if not {'inbox', 'memory_binding', 'sqlite_sequence'} <= tables:
                 raise InboxSchemaError('incomplete inbox schema')
-            state = metadata(db, versions=(2, SCHEMA))
+            state = metadata(db, versions=(2, 3, SCHEMA))
+            if state['schema'] == SCHEMA and not {'delivery_identity', 'delivery_record'} <= tables:
+                raise InboxSchemaError('incomplete delivery ledger schema')
             columns = tuple(row[1] for row in db.execute('PRAGMA table_info(inbox)'))
             expected = COLUMNS[:-1] if state['schema'] == 2 else COLUMNS
             if columns != expected:
                 raise InboxSchemaError('incompatible inbox columns')
             if state['schema'] == 2:
                 add_binding_observations(db)
+            if state['schema'] < 4:
+                delivery_ledger.initialize(db)
                 db.execute("UPDATE inbox_meta SET value=? WHERE key='schema'", (str(SCHEMA),))
+            delivery_ledger.identity(db)
             validate_bindings(db)
             return
         if tables - {'inbox', 'sqlite_sequence'}:
@@ -105,6 +111,7 @@ def initialize(db):
                        [('schema', str(SCHEMA)), ('ack_through', '0'), ('journal_activation', 'null')])
         add_binding_observations(db)
         validate_bindings(db)
+        delivery_ledger.initialize(db)
         metadata(db)
 
 

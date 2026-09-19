@@ -126,7 +126,11 @@ validate their required executable. Preserve saved paths, targets, and state.
 
 ## DQ-03 — Stage 5 presence, priority, and delivery evidence
 
-**Source:** approved programme contract. **Status:** pending implementation.
+**Source:** approved programme contract. **Status:** implemented on `develop`
+(PR #24). Status-omission compatibility
+is supported by offline evidence limited to Claude 2.1.276, with independent parser
+confirmation and driver-extracted listing-filter evidence. Live discovery remains
+unverified. No release or runtime deployment is claimed. See [DELIVERY.md](DELIVERY.md).
 
 Separate fresh, evidenced model activity from service health. Unknown activity must
 remain unknown. Declare provider priority limits from measurement. Distinguish

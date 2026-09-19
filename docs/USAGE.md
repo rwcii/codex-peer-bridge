@@ -127,3 +127,7 @@ sources. Partial trailing lines are diagnosed. Oversized lines are consumed in b
 remain available. Missing, unreadable, oversized source files, or
 unrecoverable boundaries fail explicitly; no permission changes or automatic discovery
 of unrelated sessions is attempted.
+
+`excluded_api_error_rows` counts synthetic/API-error rows in the whole captured
+source prefix, not only the selected work window. It is source evidence rather
+than a response count for that window.

@@ -10,9 +10,10 @@ class DeliveryLoop:
     accepted subprocess work on cancellation before returning. No provider callback
     runs inside a source snapshot or journal transaction.
     """
-    def __init__(self, worker, render, deliver, *, clock=time.time):
+    def __init__(self, worker, render, deliver, *, clock=time.time, export=None):
         self.worker, self.render, self.deliver = worker, render, deliver
         self.clock = clock
+        self.export = export
         self.busy = False
         self.started = False
         self.unresolved = False
@@ -25,6 +26,8 @@ class DeliveryLoop:
             if not self.started or self.unresolved:
                 await self.worker.call('ready', int(self.clock()))
                 self.started, self.unresolved = True, False
+            if self.export is not None:
+                await self.export()
             prepared = await self.worker.call('prepare', int(self.clock()))
             if not prepared['sequences']:
                 return prepared
@@ -39,6 +42,8 @@ class DeliveryLoop:
             outcome = await self.deliver(notice)
             result = await self.worker.call('resolve', outcome, int(self.clock()))
             self.unresolved = False
+            if self.export is not None:
+                await self.export()
             return dict(admission=prepared['admission'], **result)
         finally:
             self.busy = False

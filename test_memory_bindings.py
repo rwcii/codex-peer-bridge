@@ -273,7 +273,7 @@ CREATE TABLE memory_binding(binding TEXT PRIMARY KEY,repo_path TEXT,repo_key TEX
         self.legacy_inbox()
         store = bridge.InboxStore(self.root)
         try:
-            self.assertEqual(inbox_schema.metadata(store.db)['schema'], 3)
+            self.assertEqual(inbox_schema.metadata(store.db)['schema'], inbox_schema.SCHEMA)
             self.assertEqual(inbox_schema.allocated_head(store.db), 7)
             self.assertEqual(inbox_schema.metadata(store.db)['ack_through'], 5)
             self.assertEqual(store.command(dict(op='inbox'))[0]['frame'], FRAME)
@@ -301,7 +301,7 @@ inbox_schema.initialize(db)
             self.assertEqual(len(db.execute('PRAGMA table_info(memory_binding)').fetchall()), 4)
         store = bridge.InboxStore(self.root)
         try:
-            self.assertEqual(inbox_schema.metadata(store.db)['schema'], 3)
+            self.assertEqual(inbox_schema.metadata(store.db)['schema'], inbox_schema.SCHEMA)
             self.assertEqual(inbox_schema.allocated_head(store.db), 7)
             self.assertEqual(inbox_schema.metadata(store.db)['ack_through'], 5)
         finally:

@@ -15,6 +15,7 @@ class NotificationState:
     """
     def __init__(self, root, provider, participant, after, schema, capabilities):
         self.source = self.migration = None
+        self.receipt_capable = 'delivery_ledger' in capabilities
         self.capable = 'notification_journal_activation' in capabilities
         if self.capable and 'inbox_ack_watermark' not in capabilities:
             raise JournalError('journal_invalid_capability')
@@ -54,7 +55,7 @@ class NotificationState:
 
     def ready(self, now):
         """Run once per serial delivery owner, before any new reservation."""
-        self.journal.recover_attempt(now)
+        self.journal.recover_attempt(now, record_receipts=self.receipt_capable)
         if not self.journal.meta()['pointers_seeded']:
             seed = self.source.seed_pointers() if self.source.pointers else dict(records=[])
             self.journal.seed_pointers(seed)
@@ -87,8 +88,15 @@ class NotificationState:
         return self.journal.reserve(sequences, now) if sequences else []
 
     def resolve(self, outcome, now):
-        self.journal.resolve(outcome, now)
+        self.journal.resolve(outcome, now, record_receipts=self.receipt_capable)
         return self.status()
+
+    def receipts(self):
+        state = self.journal.meta()
+        return dict(target_digest=state['target_digest'], nonce=state['nonce'], records=self.journal.receipts())
+
+    def confirm_receipts(self, records, unrecorded=()):
+        self.journal.confirm_receipts(records, unrecorded)
 
     def retry(self, sequences):
         # An explicit retry must never revive a source row already acknowledged.

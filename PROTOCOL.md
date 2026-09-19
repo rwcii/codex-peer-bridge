@@ -442,3 +442,17 @@ older services without it require an upgrade for this route.
 `usage_report.py` emits versioned local JSON described in [USAGE.md](docs/USAGE.md).
 It introduces no peer frames, remote transcript access, hooks, or model wakeups.
 Selections and reports are local data and cannot grant authorization.
+
+## Delivery ledger and presence
+
+Inbox schema 4 and notification journal schema 2 provide the local-only
+[delivery evidence contract](docs/DELIVERY.md). Private control operations `delivery`,
+`handled`, and `record-notification` do not create peer frames. Deduplication is
+bound to an observed sender process lifetime, recipient installation and message
+ID, with a canonical payload fingerprint and bounded retention. Outgoing attempt
+IDs and deadlines are local controls; no new native wire fields are introduced.
+
+Service health and model activity have separate evidence and observation times.
+Unsupported activity remains unknown. The daemon omits registry activity instead
+of claiming a permanent wait. Native status-omission discovery verification remains
+an open release gate, as documented in the delivery contract.

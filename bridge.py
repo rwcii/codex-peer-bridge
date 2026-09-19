@@ -19,6 +19,8 @@ from service_runtime import Admission, close_writer, drain_handlers, database_st
 from peer_guidance import PEER_GUIDANCE, MEMORY_POINTER_GUIDANCE
 import platform_support
 import inbox_schema
+import delivery_ledger
+import participant_presence
 import subscriptions
 import memory_bindings
 
@@ -52,8 +54,11 @@ def peers():
                 continue
             address=record.get('messagingSocketPath','')
             target_path('uds:'+address)
+            activity = participant_presence.registry_activity(record)
             found.append(dict(pid=pid,name=record.get('name'),address='uds:'+address,
-                              repo=record.get('cwd'),status=record.get('status'),
+                              repo=record.get('cwd'),status=activity['state'],
+                              presence=dict(service=participant_presence.service('kernel_process_start', 'running'),
+                                            model_activity=activity),
                               implementation=record.get('entrypoint'),protocol=record.get('peerProtocol')))
         except (OSError,ValueError,TypeError,KeyError,IndexError,subprocess.SubprocessError):
             continue
@@ -96,13 +101,60 @@ class InboxStore:
                 raise ValueError('invalid user message')
         elif kind != 'control':
             raise ValueError('unsupported frame')
-        # Store controls as inert data; never execute rename or any other action.
-        if self.db.execute("SELECT count(*) FROM inbox WHERE kind='peer'").fetchone()[0] >= 1000:
-            raise ValueError('inbox full; acknowledge older entries')
-        with self.db:
-            self.db.execute('INSERT INTO inbox(received,pid,frame) VALUES(?,?,?)', (time.time(), pid, json.dumps(frame)))
+        # No ID means no deduplication claim and no process probe is needed.
+        sender = None
+        msg_id = frame.get('msg_id')
+        if isinstance(msg_id, str) and 1 <= len(msg_id.encode()) <= 128:
+            try:
+                start = platform_support.proc_start(pid)
+                sender = delivery_ledger.digest([pid, platform_support.normalize_start(start)])
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        now = time.time()
+        try:
+            with inbox_schema.transaction(self.db):
+                key, fingerprint, duplicate = delivery_ledger.incoming(self.db, frame, sender, now)
+                if duplicate is not None:
+                    return dict(seq=duplicate, duplicate=True)
+                if self.db.execute("SELECT count(*) FROM inbox WHERE kind='peer'").fetchone()[0] >= 1000:
+                    raise ValueError('inbox full; acknowledge older entries')
+                cursor = self.db.execute('INSERT INTO inbox(received,pid,frame) VALUES(?,?,?)', (now, pid, json.dumps(frame)))
+                seq = cursor.lastrowid
+                delivery_ledger.stored(self.db, key, fingerprint, seq, frame, sender, now)
+        except delivery_ledger.DeliveryError as exc:
+            if exc.code == 'delivery_payload_conflict':
+                with inbox_schema.transaction(self.db):
+                    delivery_ledger.conflict(self.db, delivery_ledger.incoming_key(self.db, frame, sender), now)
+            raise
         if self.on_change is not None:
             self.on_change()
+        return dict(seq=seq, duplicate=False)
+
+    def outgoing(self, address, message, priority, msg_id, deadline):
+        now = time.time()
+        try:
+            with inbox_schema.transaction(self.db):
+                return delivery_ledger.outbound(self.db, address, message, priority, msg_id, deadline, now)
+        except delivery_ledger.DeliveryError as exc:
+            if exc.code == 'delivery_payload_conflict':
+                with inbox_schema.transaction(self.db):
+                    key = 'out:'+delivery_ledger.digest([delivery_ledger.identity(self.db), address, msg_id])
+                    delivery_ledger.conflict(self.db, key, now)
+            raise
+
+    def failed_before_connect(self, key):
+        with inbox_schema.transaction(self.db):
+            return delivery_ledger.failed_before_connect(self.db, key, time.time())
+
+    def transported(self, key, pid):
+        with inbox_schema.transaction(self.db):
+            return delivery_ledger.transported(self.db, key, pid, time.time())
+
+    def fetched(self, sequences):
+        now = time.time()
+        with inbox_schema.transaction(self.db):
+            return [delivery_ledger.stage(self.db, seq, 'fetched',
+                    dict(at=now, source='control_reply_drained'), now) for seq in sequences]
 
     def bindings(self):
         return memory_bindings.rows(self.db)
@@ -138,6 +190,45 @@ class InboxStore:
             return dict(inbox_count=count, inbox_schema=state['schema'],
                         ack_through=state['ack_through'], journal_activation=state['journal_activation'],
                         capabilities=list(inbox_schema.CAPABILITIES))
+        if op == 'delivery':
+            seq, key = r.get('seq'), r.get('key')
+            if (seq is None) == (key is None):
+                raise ValueError('select seq or key')
+            if seq is not None and (type(seq) is not int or not 0 < seq <= inbox_schema.MAX_SEQUENCE):
+                raise ValueError('invalid sequence')
+            if key is not None and (not isinstance(key, str) or len(key) > 128):
+                raise ValueError('invalid delivery key')
+            record = delivery_ledger.get(self.db, key=key, seq=seq)
+            return dict(available=False) if record is None else dict(available=True, **record)
+        if op == 'handled':
+            seq, outcome = r.get('seq'), r.get('outcome')
+            if type(seq) is not int or not 0 < seq <= inbox_schema.MAX_SEQUENCE or outcome not in ('done', 'failed', 'refused'):
+                raise ValueError('explicit sequence and handled outcome required')
+            now = time.time()
+            with inbox_schema.transaction(self.db):
+                return delivery_ledger.stage(self.db, seq, 'handled',
+                    dict(at=now, source='participant_report', outcome=outcome), now)
+        if op == 'record-notification':
+            activation = inbox_schema.metadata(self.db)['journal_activation']
+            if activation != dict(target_digest=r.get('target_digest'), nonce=r.get('nonce')):
+                raise delivery_ledger.DeliveryError('delivery_activation_mismatch')
+            records = r.get('records')
+            if not isinstance(records, list) or not 1 <= len(records) <= 10:
+                raise ValueError('invalid notification evidence batch')
+            now = time.time()
+            with inbox_schema.transaction(self.db):
+                results = []
+                for item in records:
+                    if (not isinstance(item, dict) or set(item) != {'seq', 'at', 'started', 'provider', 'outcome'}
+                            or type(item['seq']) is not int or not 0 < item['seq'] <= inbox_schema.MAX_SEQUENCE
+                            or item['provider'] not in ('codex', 'deepseek') or item['outcome'] not in ('delivered', 'unknown')
+                            or type(item['at']) is not int or type(item['started']) is not int
+                            or item['started'] < 0 or not 0 <= item['at'] <= now + 1):
+                        raise ValueError('invalid notification evidence')
+                    evidence = dict(item, source='provider_result')
+                    evidence.pop('seq')
+                    results.append(delivery_ledger.stage(self.db, item['seq'], 'notified', evidence, now))
+            return results
         if op == 'inbox':
             rows = self.db.execute('SELECT seq,received,pid,frame,kind,binding FROM inbox WHERE seq>? ORDER BY seq LIMIT 10', (int(r.get('after', 0)),)).fetchall()
             entries = []
@@ -177,31 +268,48 @@ class Bridge:
         self.tasks = set()
         self.closing = False
 
-    async def send(self, address, message, priority='next'):
+    async def send(self, address, message, priority='next', msg_id=None, deadline=None):
         if not isinstance(message, str) or not message.strip():
             raise ValueError('message must be nonempty text')
         if priority not in ('now', 'next', 'later'):
             raise ValueError('invalid priority')
-        frame = dict(msgV=1, msg_id=str(uuid.uuid4()), type='user', priority=priority,
+        path = target_path(address)
+        msg_id = msg_id or str(uuid.uuid4())
+        deadline = deadline if deadline is not None else time.time() + 300
+        frame = dict(msgV=1, msg_id=msg_id, type='user', priority=priority,
                      message=dict(role='user', content=message), **{'from': self.address})
         data = encode(frame)
-        path = target_path(address)
-        reader, writer = await asyncio.open_unix_connection(str(path), limit=LIMIT)
+        if len(data) > 65536:
+            raise ValueError('message exceeds 64 KiB')
+        attempt = await self.worker.call('outgoing', address, message, priority, msg_id, deadline)
+        if not attempt.pop('new'):
+            return attempt
+        writer = None
         try:
-            pid = credentials(writer.get_extra_info('socket'))
-            token = peer_token(pid, path)
-            if token:
-                writer.write(encode(dict(type='auth', token=token)))
-            writer.write(data)
-            await writer.drain()
-            writer.write_eof()
-            # Transport completion is not a model acknowledgement.
-            while await reader.read(4096):
-                pass
+            async with asyncio.timeout(min(4, max(0, deadline - time.time()))):
+                try:
+                    reader, writer = await asyncio.open_unix_connection(str(path), limit=LIMIT)
+                except (FileNotFoundError, ConnectionRefusedError):
+                    result = await self.worker.call('failed_before_connect', attempt['key'])
+                    return dict(key=attempt['key'], **result)
+                pid = credentials(writer.get_extra_info('socket'))
+                token = peer_token(pid, path)
+                if token:
+                    writer.write(encode(dict(type='auth', token=token)))
+                writer.write(data)
+                await writer.drain()
+                writer.write_eof()
+                while await reader.read(4096):
+                    pass
+            result = await self.worker.call('transported', attempt['key'], pid)
+            return dict(key=attempt['key'], **result)
+        except (OSError, TimeoutError):
+            # The reservation is durable. Never replay a possibly accepted native
+            # frame. Unclassified failures retain this conservative outcome.
+            return attempt
         finally:
-            writer.close()
-            await writer.wait_closed()
-        return dict(msg_id=frame['msg_id'], status='transport_complete', peer_pid=pid)
+            if writer is not None:
+                await close_writer(writer)
 
     async def store(self, pid, frame):
         return await self.worker.call('store', pid, frame)
@@ -211,6 +319,7 @@ class Bridge:
         self.tasks.add(task)
         slot = None
         request = None
+        reply_started = False
         try:
             if self.closing:
                 raise CapacityError('service is stopping')
@@ -237,8 +346,18 @@ class Bridge:
                     slot = None
                     slot = self.admission.enter('control' if request.get('op') in ('status', 'stop') else 'ordinary')
                     result = await self.command(request)
-                    writer.write(encode(dict(ok=True, result=result)))
+                    response = encode(dict(ok=True, result=result))
+                    reply_started = True
+                    writer.write(response)
                     await writer.drain()
+                    if request.get('op') == 'inbox':
+                        # Evidence is written only after the successful reply drain.
+                        # A failed write leaves receipt evidence unknown; it cannot
+                        # retract the already returned entries or emit a second reply.
+                        try:
+                            await self.worker.call('fetched', [item['seq'] for item in result])
+                        except Exception:
+                            print('fetched evidence could not be recorded', flush=True)
                 else:
                     for _ in range(32):
                         line = await reader.readline()
@@ -256,7 +375,7 @@ class Bridge:
                 key = request.get('binding')
                 if isinstance(key, str) and key in self.binding_health:
                     self.record_binding_health(key, 'refused', exc.code)
-            if isinstance(exc, memory_bindings.BindingError):
+            if isinstance(exc, (memory_bindings.BindingError, delivery_ledger.DeliveryError)):
                 code = exc.code
             elif isinstance(exc, CapacityError):
                 code = 'capacity'
@@ -266,9 +385,12 @@ class Bridge:
                 code = 'rejected'
             else:
                 code = 'internal_error'
-            if control:
+            if control and not reply_started:
                 try:
                     error = dict(ok=False, code=code, error=type(exc).__name__)
+                    if (isinstance(request, dict) and request.get('op') == 'send'
+                            and isinstance(exc, (TimeoutError, OSError, WorkerFailure))):
+                        error.update(code='delivery_indeterminate', outcome='unknown')
                     if isinstance(exc, memory_bindings.BindingError):
                         error['recovery'] = exc.recovery
                         if exc.code == 'binding_timeout':
@@ -278,7 +400,7 @@ class Bridge:
                 except (OSError, TimeoutError):
                     pass
             else:
-                print(f'peer request failed: {code}', flush=True)
+                print(f'request completion failed: {code}', flush=True)
         finally:
             try:
                 await close_writer(writer)
@@ -306,9 +428,13 @@ class Bridge:
                 state['capabilities'].extend(('inbox_subscription', 'memory_binding'))
             return dict(pid=os.getpid(), address=self.address, generation=self.generation,
                         **state, **diagnostics,
+                        presence=dict(service=participant_presence.service('live_bridge_control'),
+                                      model_activity=participant_presence.unknown()),
                         delivery='inbox available; run notify.py to notify the selected participant session')
         if op == 'send':
-            return await self.send(r.get('to'), r.get('message'), r.get('priority', 'next'))
+            return await self.send(r.get('to'), r.get('message'), r.get('priority', 'next'), r.get('msg_id'), r.get('deadline'))
+        if op in ('delivery', 'handled', 'record-notification'):
+            return await self.worker.call('command', r)
         if op in ('inbox', 'ack'):
             if op == 'ack' and 'through' not in r:
                 raise ValueError('through is required')
@@ -453,47 +579,54 @@ class Bridge:
 
 
 async def client(root, request):
+    def emit(value):
+        if request.get('op') == 'send':
+            value['delivery_attempt'] = {key: request.get(key) for key in ('msg_id', 'deadline')}
+        print(json.dumps(value, indent=2))
+
     try:
         if isinstance(request.get('op'), str) and request['op'] in memory_bindings.OPERATIONS:
             result, _pid = await control_exchange(root, request, timeout=memory_bindings.CLIENT_TIMEOUT)
         else:
             result, _pid = await control_exchange(root, request)
     except UnsafeServiceEndpoint as exc:
-        print(json.dumps(dict(ok=False, code='unsafe_service_endpoint', error=str(exc))))
+        emit(dict(ok=False, code='unsafe_service_endpoint', error=str(exc)))
         return 1
     except (ConnectionRefusedError, FileNotFoundError) as exc:
         # Keep the existing CLI diagnostic for a missing or stale endpoint.
         raise SystemExit(f'no bridge is running for {root} (no control endpoint is listening)') from exc
     except TimeoutError:
-        print(json.dumps(dict(ok=False, code='service_unresponsive',
-                              error='control request timed out; mutation outcome is unknown')))
+        emit(dict(ok=False, code='service_unresponsive',
+                              error='control request timed out; mutation outcome is unknown'))
         return 1
     except NoControlReply:
-        print(json.dumps(dict(ok=False, code='no_reply',
-                              error='service closed without a reply; mutation outcome is unknown')))
+        emit(dict(ok=False, code='no_reply',
+                              error='service closed without a reply; mutation outcome is unknown'))
         return 1
     except OSError:
-        print(json.dumps(dict(ok=False, code='service_unavailable',
-                              error='control exchange failed; mutation outcome is unknown')))
+        emit(dict(ok=False, code='service_unavailable',
+                              error='control exchange failed; mutation outcome is unknown'))
         return 1
     except ValueError:
-        print(json.dumps(dict(ok=False, code='invalid_service_response',
-                              error='invalid control reply; mutation outcome is unknown')))
+        emit(dict(ok=False, code='invalid_service_response',
+                              error='invalid control reply; mutation outcome is unknown'))
         return 1
     if type(result.get('ok')) is not bool or (result['ok'] and 'result' not in result):
-        print(json.dumps(dict(ok=False, code='invalid_service_response',
-                              error='invalid control reply; mutation outcome is unknown')))
+        emit(dict(ok=False, code='invalid_service_response',
+                              error='invalid control reply; mutation outcome is unknown'))
         return 1
     if request['op'] == 'inbox' and result.get('ok'):
         if not isinstance(result['result'], list) or any(not isinstance(entry, dict) for entry in result['result']):
-            print(json.dumps(dict(ok=False, code='invalid_service_response',
-                                  error='invalid inbox reply')))
+            emit(dict(ok=False, code='invalid_service_response',
+                                  error='invalid inbox reply'))
             return 1
         # Also protect reads from servers started before a runtime upgrade.
         for entry in result['result']:
             entry['guidance'] = (MEMORY_POINTER_GUIDANCE if entry.get('kind') == 'memory-pointer'
                                  else PEER_GUIDANCE)
-    print(json.dumps(result, indent=2))
+    emit(result)
+    if request['op'] == 'send' and result.get('ok') and result.get('result', {}).get('status') in ('indeterminate', 'failed_before_connect'):
+        return 1
     return 0 if result['ok'] else 1
 
 
@@ -508,6 +641,15 @@ def cli_main():
     s.add_argument('to')
     s.add_argument('message')
     s.add_argument('--priority', choices=['now','next','later'], default='next')
+    s.add_argument('--msg-id')
+    s.add_argument('--deadline', type=float)
+    s = sub.add_parser('delivery')
+    selection = s.add_mutually_exclusive_group(required=True)
+    selection.add_argument('--seq', type=int)
+    selection.add_argument('--key')
+    s = sub.add_parser('handled')
+    s.add_argument('seq', type=int)
+    s.add_argument('--outcome', required=True, choices=['done', 'failed', 'refused'])
     s = sub.add_parser('inbox')
     s.add_argument('--after', type=int, default=0)
     s = sub.add_parser('ack')
@@ -528,6 +670,11 @@ def cli_main():
     s = sub.add_parser('memory-bindings')
     s.add_argument('--after', default='')
     a = vars(p.parse_args())
+    if a['op'] == 'send':
+        if (a['msg_id'] is None) != (a['deadline'] is None):
+            p.error('--msg-id and --deadline must be supplied together')
+        a['msg_id'] = a['msg_id'] or str(uuid.uuid4())
+        a['deadline'] = a['deadline'] if a['deadline'] is not None else time.time() + 300
     root = Path(a.pop('state_dir') or runtime_names.default_state_root()).absolute()
     startup_directory(root)
     if a['op'] == 'peers':

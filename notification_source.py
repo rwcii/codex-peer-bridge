@@ -32,9 +32,9 @@ class InboxSource:
         self.schema = schema
         self.acknowledgements = 'inbox_ack_watermark' in capabilities
         self.pointers = 'memory_binding' in capabilities
-        if self.acknowledgements and (type(schema) is not int or schema not in (2, 3)):
+        if self.acknowledgements and (type(schema) is not int or schema not in (2, 3, 4)):
             raise SourceError('source_version_mismatch')
-        if self.pointers and (schema != 3 or not self.acknowledgements):
+        if self.pointers and (schema not in (3, 4) or not self.acknowledgements):
             raise SourceError('source_version_mismatch')
         self.db = sqlite3.connect(Path(path).absolute().as_uri() + '?mode=ro',
                                   uri=True, isolation_level=None, timeout=.1)

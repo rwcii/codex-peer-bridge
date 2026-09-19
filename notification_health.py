@@ -13,6 +13,7 @@ from notification_journal import COUNTERS, MAX_WORK
 FRESHNESS_MS = 15_000
 PUBLISH_INTERVAL = 2
 REASONS = frozenset((
+    'notified_outbox_full', 'pending_receipt_evidence', 'receipt_evidence_unrecorded',
     'storage_wait', 'storage_error', 'version_compatibility', 'journal_capacity',
     'journal_recovery_required', 'journal_upgrade_required', 'journal_unsafe_state',
     'journal_unsupported_runtime', 'source_fault', 'pending_delivery',
@@ -39,12 +40,13 @@ def valid_identity(value):
 
 
 def valid_journal(value):
-    if not isinstance(value, dict) or set(value) != JOURNAL_FIELDS:
+    if not isinstance(value, dict) or set(value) not in (JOURNAL_FIELDS, JOURNAL_FIELDS | {'receipt_pending'}):
         return False
     flags = ('history_lost', 'activation_confirmed', 'pointers_seeded')
     counts = ('imported_through', 'scan_through', 'enumerated_through', 'pending', 'exhausted', 'uncertain')
     counters = value['counters']
-    return (all(type(value[key]) is bool for key in flags)
+    return (('receipt_pending' not in value or (uint(value['receipt_pending']) and value['receipt_pending'] <= MAX_WORK))
+            and all(type(value[key]) is bool for key in flags)
             and all(uint(value[key]) for key in counts)
             and value['pending'] + value['exhausted'] <= MAX_WORK
             and value['uncertain'] <= MAX_WORK
@@ -59,6 +61,10 @@ def journal_reasons(journal):
         ('uncertain', 'uncertain_delivery'), ('history_lost', 'history_lost')) if journal[field]}
     if not journal['activation_confirmed'] or not journal['pointers_seeded']:
         flags.add('starting')
+    if journal['counters'].get('receipt_unrecorded'):
+        flags.add('receipt_evidence_unrecorded')
+    if journal.get('receipt_pending'):
+        flags.add('pending_receipt_evidence')
     return flags
 
 

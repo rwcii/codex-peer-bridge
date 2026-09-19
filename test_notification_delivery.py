@@ -20,7 +20,7 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.inbox = bridge.InboxStore(self.root)
         self.worker = DatabaseWorker(lambda: NotificationState(
-            self.root, 'codex', 'synthetic-delivery-session', 0, 3, CAPABILITIES))
+            self.root, 'codex', 'synthetic-delivery-session', 0, inbox_schema.SCHEMA, CAPABILITIES))
         request = await self.worker.call('activation')
         evidence = self.inbox.command(request)
         await self.worker.call('confirm_activation', evidence)

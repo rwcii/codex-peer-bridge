@@ -13,7 +13,7 @@ import sqlite3
 
 from inbox_schema import MAX_SEQUENCE, hex_value
 
-SCHEMA = 1
+SCHEMA = 2
 PAGE_SIZE = 4096
 MAX_PAGES = 1024
 MAX_WORK = 2048
@@ -21,7 +21,7 @@ MAX_MEMBERS = 10
 MAX_ATTEMPTS = 3
 MAX_DATABASE_BYTES = PAGE_SIZE * MAX_PAGES
 MAX_WAL_BYTES = 32 + (MAX_PAGES + 16) * (PAGE_SIZE + 24)
-COUNTERS = ('delivered', 'acknowledged', 'obsolete', 'failed', 'unknown', 'missing', 'attempts', 'ignored')
+COUNTERS = ('delivered', 'acknowledged', 'obsolete', 'failed', 'unknown', 'missing', 'attempts', 'ignored', 'receipt_unrecorded')
 META_KEYS = ('schema', 'provider', 'namespace', 'target_digest', 'nonce', 'imported_through',
              'scan_through', 'enumerated_through', 'pointers_seeded', 'activation_confirmed', 'history_lost',
              'history_acknowledged', 'counters')
@@ -33,6 +33,10 @@ DDL = (
     "CREATE TABLE attempt_member(attempt_id INTEGER NOT NULL REFERENCES attempt(id) ON DELETE CASCADE, seq INTEGER PRIMARY KEY REFERENCES work(seq) ON DELETE CASCADE)",
 )
 
+LEGACY_DDL = DDL
+RECEIPT_DDL = "CREATE TABLE receipt_outbox(seq INTEGER PRIMARY KEY CHECK(seq>0), at INTEGER NOT NULL CHECK(at>=0), started INTEGER NOT NULL CHECK(started>=0), provider TEXT NOT NULL CHECK(provider IN ('codex','deepseek')), outcome TEXT NOT NULL CHECK(outcome IN ('delivered','unknown')))"
+DDL = LEGACY_DDL + (RECEIPT_DDL,)
+
 
 # Recovery is a control/health policy, not an inferred SQLite failure. Only actual
 # storage conditions and internal API defects latch the database worker fault.
@@ -40,6 +44,7 @@ ERROR_POLICY = {
     'journal_activation_mismatch': ('operator_action', None),
     'journal_attempt_in_progress': ('retry', None),
     'journal_capacity': ('capacity', None),
+    'notified_outbox_full': ('capacity', None),
     'journal_checkpoint_failed': ('retry', 'storage_error'),
     'journal_identity_invalid': ('internal_error', 'internal_error'),
     'journal_identity_mismatch': ('operator_action', None),
@@ -112,6 +117,27 @@ class Journal:
                 "SELECT sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
             ).fetchall()
             if catalog:
+                if sorted(row[0] for row in catalog) == sorted(LEGACY_DDL):
+                    old = self.meta()
+                    if type(old.get('schema')) is not int or old['schema'] != 1:
+                        raise JournalError('journal_recovery_required')
+                    for key in ('provider', 'namespace', 'target_digest', 'nonce', 'imported_through', 'history_lost'):
+                        if old.get(key) != wanted[key]:
+                            raise JournalError('journal_identity_mismatch')
+                    if bootstrap and (self.rows() or self.db.execute('SELECT count(*) FROM attempt').fetchone()[0]
+                                      or any(old['counters'].values()) or old['pointers_seeded']
+                                      or old['activation_confirmed'] or old['history_acknowledged']
+                                      or old['scan_through'] != old['imported_through']
+                                      or old['enumerated_through'] != old['imported_through']):
+                        raise JournalError('journal_recovery_required')
+                    self.configure()
+                    with self.transaction():
+                        self.db.execute(RECEIPT_DDL)
+                        counters = old['counters'].copy()
+                        counters.setdefault('receipt_unrecorded', 0)
+                        self.put('counters', counters)
+                        self.put('schema', SCHEMA)
+                    catalog = self.db.execute("SELECT sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
                 if sorted(row[0] for row in catalog) != sorted(DDL):
                     raise JournalError('journal_recovery_required')
                 state = self.validate()
@@ -259,6 +285,15 @@ class Journal:
             raise JournalError('journal_recovery_required')
         for value in state['counters'].values():
             integer(value)
+        receipts = self.receipts(limit=MAX_WORK + 1)
+        if len(receipts) > MAX_WORK:
+            raise JournalError('journal_capacity')
+        for item in receipts:
+            integer(item['seq'], 1)
+            integer(item['at'])
+            integer(item['started'])
+            if item['provider'] != state['provider'] or item['outcome'] not in ('delivered', 'unknown'):
+                raise JournalError('journal_recovery_required')
         rows = self.rows()
         if len(rows) > MAX_WORK:
             raise JournalError('journal_capacity')
@@ -409,6 +444,8 @@ class Journal:
                 raise JournalError('journal_invalid_reservation')
             if len({row['kind'] for row in selected}) != 1 or (selected[0]['kind'] == 'memory-pointer' and len(selected) != 1):
                 raise JournalError('journal_invalid_reservation')
+            if self.db.execute('SELECT count(*) FROM receipt_outbox').fetchone()[0] + len(sequences) > MAX_WORK:
+                raise JournalError('notified_outbox_full')
             self.db.execute('INSERT INTO attempt VALUES(1,?)', (now,))
             for seq in sequences:
                 self.db.execute("UPDATE work SET disposition='reserved',attempts=attempts+1,retry_at=0 WHERE seq=?", (seq,))
@@ -416,7 +453,7 @@ class Journal:
             self.count('attempts', len(sequences))
         return [row for row in self.rows() if row['seq'] in sequences]
 
-    def resolve(self, outcome, now):
+    def resolve(self, outcome, now, *, record_receipts=True):
         integer(now)
         if outcome not in ('delivered', 'failed', 'unknown'):
             raise JournalError('journal_invalid_outcome')
@@ -424,9 +461,14 @@ class Journal:
             members = {row[0] for row in self.db.execute('SELECT seq FROM attempt_member')}
             if not members:
                 raise JournalError('journal_no_attempt')
+            started = self.db.execute('SELECT started FROM attempt WHERE id=1').fetchone()[0]
+            provider = self.meta()['provider']
             for row in self.rows():
                 if row['seq'] not in members:
                     continue
+                if record_receipts and outcome in ('delivered', 'unknown') and row['kind'] == 'peer':
+                    self.db.execute("INSERT INTO receipt_outbox VALUES(?,?,?,?,?) ON CONFLICT(seq) DO UPDATE SET at=excluded.at,started=excluded.started,outcome=excluded.outcome WHERE receipt_outbox.outcome!='delivered'",
+                                    (row['seq'], now, started, provider, outcome))
                 uncertain = int(bool(row['uncertain']) or outcome == 'unknown')
                 if outcome == 'delivered':
                     disposition, retry_at = 'delivered', 0
@@ -442,10 +484,27 @@ class Journal:
             self.db.execute('DELETE FROM attempt')
             self.advance()
 
-    def recover_attempt(self, now):
+    def receipts(self, limit=MAX_MEMBERS):
+        return [dict(zip(('seq', 'at', 'started', 'provider', 'outcome'), row))
+                for row in self.db.execute('SELECT seq,at,started,provider,outcome FROM receipt_outbox ORDER BY seq LIMIT ?', (limit,))]
+
+    def confirm_receipts(self, records, unrecorded=()):
+        if not isinstance(records, list) or len(records) > MAX_MEMBERS:
+            raise JournalError('journal_invalid_reservation')
+        if len(set(unrecorded)) != len(unrecorded) or not set(unrecorded) <= {item['seq'] for item in records}:
+            raise JournalError('journal_invalid_reservation')
+        with self.transaction():
+            for item in records:
+                # A concurrent later outcome must not be removed by an old ACK.
+                cursor = self.db.execute('DELETE FROM receipt_outbox WHERE seq=? AND at=? AND started=? AND provider=? AND outcome=?',
+                                tuple(item[key] for key in ('seq', 'at', 'started', 'provider', 'outcome')))
+                if cursor.rowcount and item['seq'] in unrecorded:
+                    self.count('receipt_unrecorded')
+
+    def recover_attempt(self, now, *, record_receipts=True):
         if not self.db.execute('SELECT count(*) FROM attempt').fetchone()[0]:
             return False
-        self.resolve('unknown', now)
+        self.resolve('unknown', now, record_receipts=record_receipts)
         return True
 
     def retry(self, sequences):
@@ -528,6 +587,7 @@ class Journal:
         return dict(imported_through=state['imported_through'],
                     scan_through=state['scan_through'], enumerated_through=state['enumerated_through'],
                     counters=state['counters'],
+                    receipt_pending=self.db.execute('SELECT count(*) FROM receipt_outbox').fetchone()[0],
                     pending=sum(row['disposition'] in ('pending', 'reserved') for row in rows),
                     exhausted=sum(row['disposition'] in ('failed', 'unknown') for row in rows),
                     uncertain=sum(bool(row['uncertain']) for row in rows),

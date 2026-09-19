@@ -24,6 +24,7 @@ from notification_provider import Provider
 from notification_source import SourceError
 from notification_state import NotificationState
 import platform_support
+import participant_presence
 from peer_transport import control_exchange, credentials, encode, LIMIT, private_dir
 from service_runtime import Admission, HANDSHAKE_TIMEOUT, close_writer, drain_handlers
 import subscriptions
@@ -159,7 +160,8 @@ class Runtime:
                     raise JournalError('journal_activation_mismatch')
                 await self.worker.call('confirm_activation', response.get('result'))
             self.last_status = await self.worker.call('ready', int(time.time()))
-            self.delivery = DeliveryLoop(self.worker, self.render, self.deliver)
+            self.delivery = DeliveryLoop(self.worker, self.render, self.deliver,
+                export=self.export_receipts if 'delivery_ledger' in status.get('capabilities', []) else None)
             self.reason = None
         except BaseException:
             worker, self.worker = self.worker, None
@@ -186,6 +188,24 @@ class Runtime:
             if not hex_value(cursor, 64) or cursor <= after or not page['bindings']:
                 raise ValueError('invalid memory binding cursor')
             after = cursor
+
+    async def export_receipts(self):
+        # One bounded batch per scan. The journal retains evidence across a lost
+        # reply or restart, and admission backpressures if this handoff stalls.
+        evidence = await self.worker.call('receipts')
+        if not evidence['records']:
+            return
+        reply = await self.bridge_call(dict(op='record-notification', **evidence))
+        if reply.get('ok') is not True:
+            raise BridgeUnavailable('notification evidence handoff refused')
+        results = reply.get('result')
+        if (not isinstance(results, list) or len(results) != len(evidence['records'])
+                or any(not isinstance(result, dict) or result.get('seq') != item['seq']
+                       or (result.get('recorded') is not True and result.get('reason') != 'unavailable_or_expired')
+                       for item, result in zip(evidence['records'], results))):
+            raise ValueError('invalid notification evidence acknowledgement')
+        await self.worker.call('confirm_receipts', evidence['records'],
+                               [item['seq'] for item in results if item.get('recorded') is not True])
 
     async def render(self, rows):
         # Refresh configured routes before constructing a pointer command. No
@@ -367,6 +387,10 @@ class Runtime:
         if op == 'status':
             value = await self.observed_health()
             return dict(generation=self.generation, pid=os.getpid(), lifecycle='stopping' if self.closing else 'running',
+                        presence=dict(service=participant_presence.service('live_notifier_control'),
+                                      model_activity=participant_presence.unknown()),
+                        priority=participant_presence.priority(self.options.agent),
+                        receipt_export='supported' if 'delivery_ledger' in (self.bridge or {}).get('capabilities', []) else 'unavailable',
                         delivery_health={key: value[key] for key in ('state', 'reasons', 'journal')})
         if op not in ('retry', 'ack-health'):
             raise ValueError('unknown notifier operation')
@@ -468,8 +492,7 @@ class Runtime:
                 startedAt=int(time.time()*1000), procStart=started, kind='daemon',
                 entrypoint=runtime_names.REGISTRY_ENTRYPOINT, pidDomain=platform_support.pid_domain(),
                 messagingSocketPath=self.bridge['address'].removeprefix('uds:'), peerProtocol=1,
-                peerFeatures=['reply_across_default_dirs'], status='waiting',
-                statusUpdatedAt=int(time.time()*1000), bridgeOwner=self.generation)
+                peerFeatures=['reply_across_default_dirs'], bridgeOwner=self.generation)
             try:
                 fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             except OSError as exc:

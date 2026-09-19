@@ -391,12 +391,12 @@ class FailureClassificationTests(unittest.TestCase):
         for code, reason in (('journal_checkpoint_failed', 'storage_error'),
                              ('journal_attempt_in_progress', 'storage_wait')):
             with self.subTest(code=code):
-                runtime = Runtime(argparse.Namespace(), Path('/synthetic'), 'synthetic', provider=SyntheticProvider())
+                runtime = Runtime(argparse.Namespace(agent='codex'), Path('/synthetic'), 'synthetic', provider=SyntheticProvider())
                 runtime.record_failure(JournalError(code))
                 self.assertEqual(runtime.reason, reason)
                 self.assertFalse(runtime.operator_blocked)
                 self.assertFalse(runtime.internal_fault)
-        runtime = Runtime(argparse.Namespace(), Path('/synthetic'), 'synthetic', provider=SyntheticProvider())
+        runtime = Runtime(argparse.Namespace(agent='codex'), Path('/synthetic'), 'synthetic', provider=SyntheticProvider())
         unexpected = JournalError('journal_invalid_retry')
         runtime.record_failure(unexpected)
         self.assertEqual(runtime.reason, 'internal_error')
@@ -409,7 +409,7 @@ class FailureClassificationTests(unittest.TestCase):
         wrapped = WorkerFailure('storage_error')
         wrapped.__cause__ = fault
         for error in (fault, wrapped):
-            runtime = Runtime(argparse.Namespace(), Path('/synthetic'), 'synthetic', provider=SyntheticProvider())
+            runtime = Runtime(argparse.Namespace(agent='codex'), Path('/synthetic'), 'synthetic', provider=SyntheticProvider())
             runtime.record_failure(error)
             self.assertEqual(runtime.reason, 'source_fault')
             self.assertTrue(runtime.operator_blocked)
@@ -442,7 +442,7 @@ class OperatorRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_operator_fault_suspends_delivery_but_keeps_controls_available(self):
         from notification_journal import JournalError
         from notification_runtime import ControlRefusal
-        runtime = Runtime(argparse.Namespace(), Path('/synthetic'), 'synthetic', provider=SyntheticProvider())
+        runtime = Runtime(argparse.Namespace(agent='codex'), Path('/synthetic'), 'synthetic', provider=SyntheticProvider())
         runtime.owner = dict(owner='a'*32, bridge_pid=1, notifier_pid=2, proc_start='synthetic')
         runtime.observe_bridge = mock.AsyncMock()
         runtime.initialize_journal = mock.AsyncMock()
