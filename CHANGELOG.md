@@ -5,6 +5,71 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+- Use Koinon defaults for new runtime paths, services and managed participant
+  guidance. Reuse legacy paths and owned service names, preserve saved custom
+  paths, and refuse ambiguous defaults. Upgrade and removal recognize both marker
+  families. Registry, memory handshake and cross-version lock identifiers remain
+  unchanged; no runtime state is moved or reset. Unit ownership recognizes
+  directory aliases, including macOS paths, during upgrade and removal.
+
+- Select private control endpoints from canonical state paths on both platforms. Preserve validated legacy endpoints for clients and refuse duplicate or ambiguous old/new listeners during upgrades. Peer messaging paths remain literal.
+
+### Added
+
+- Bounded notification journal core, crash-safe migration state, attempt accounting,
+  and read-only source reconciliation. Worker integration tests cover acknowledgement
+  races and process termination.
+
+- Journal-backed asynchronous Codex and DeepSeek delivery, bounded automatic retry,
+  content-free memory sync notices, and independent delivery health. Notifier controls
+  expose status, explicit retry, health acknowledgement and accepted-loss rebuild.
+  Session lifecycle checks preserve running processes during delivery faults and
+  report an unconfirmed stop as unknown. Exact memory service paths are supported
+  by `memory.py --service-dir`, with repository and generation checks.
+
+- Explicit verified memory bindings and atomic content-free pointer refresh, with
+  independent inbox quotas, durable observation state and replacement diagnostics.
+  Inbox schema 2 upgrades to 3; memory schema 3 upgrades to 4 with a stable store UUID.
+  Binding deadlines cover verification and cleanup; process identity probes stay
+  bounded and off the service loop.
+
+- Explicit bridge and memory change subscriptions with bounded connections, coalesced
+  content-free hints after commit, and a shared reconnect/rescan helper. The notifier
+  subscribes before each durable recheck and retains finite fallback checks.
+
+- Inbox schema 2 with atomic migration, a bounded acknowledgement watermark and
+  durable journal activation evidence. Status advertises only those implemented
+  capabilities. Bridge software faults preserve exit 70 through the supervisor and
+  stop automatic restarts.
+
+- Bridge startup reserves both socket paths before opening the inbox and retains
+  ownership until database shutdown completes. Endpoint refusal exits 78 without
+  changing the store. Directory ownership refusals use the same status, and both
+  direct and supervised services preserve it without automatic restart. Control timeouts and invalid or lost replies report structured
+  errors without automatically repeating mutations.
+
+- Private directory creation now gives missing parent directories mode 0700 even under
+  a permissive process umask, while preserving existing parent permissions.
+
+- Dedicated bridge and memory database workers with bounded queues, separate control
+  admission, and shutdown that settles accepted writes even after caller cancellation.
+  Status reports observed storage and programming faults separately from input refusals.
+  Memory startup distinguishes a busy, unresponsive or invalid service from an absent
+  listener and refuses replacement before constructing another database owner. The CLI
+  reports expected lifecycle errors as structured responses, with exit 75 for temporary
+  conditions, exit 70 for internal software errors, and exit 78 for refusals that need
+  operator correction.
+
+- Separate control endpoint validation and bounded exchanges for bridge and memory
+  clients. Control sockets are excluded from generic messaging and discovery; memory
+  reuse verifies the connected process, its start marker and current generation.
+- Account-local notifier ownership across state directories. Duplicate provider/session
+  targets fail before registration; conflict diagnostics and session status expose a
+  matching digest. Persistent Koinon lock paths do not depend on agent home overrides,
+  and delivery subprocesses cannot retain the lock after notifier exit. Ownership
+  refusals exit with status 78; legacy and supervised services wait for an explicit
+  restart after correction instead of repeatedly restarting the refused instance.
+
 ## 2026-09-18 — Koinon
 
 ### Changed

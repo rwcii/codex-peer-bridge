@@ -2,21 +2,36 @@
 
 ## Name and path compatibility
 
-Koinon was previously named Codex Peer Bridge. The project name and clone URL have
-changed. The installed runtime still uses `codex-peer-bridge` paths, existing
-`codex-peer-*` service names, and the `codex-peer-bridge` registry entrypoint. Commands
-below deliberately retain those names. No reinstall or restart is needed for this
-documentation change.
+Koinon was previously named Codex Peer Bridge. Fresh installations use
+`~/.local/share/koinon`, state under `$XDG_STATE_HOME/koinon` (or
+`~/.local/state/koinon`), and `koinon-*` service names. The examples below use those
+fresh-install names. Existing installations retain their selected paths and names.
 
-The systemd ownership marker in `scripts/install.py` and the managed guidance markers
-in `codex_instructions.py` are also unchanged. Do not replace them by hand. A future
-migration must recognize existing markers so that upgrades and removal still find the
-owned units and managed sections.
+The installer first selects the prefix: an explicit `--prefix` wins; otherwise,
+a lone legacy `~/.local/share/codex-peer-bridge` is reused. If both prefixes exist,
+specify the intended prefix. It then reads saved installation configuration.
+Explicit state and unit paths win over saved paths; saved paths win over defaults.
+Without saved state configuration, a lone legacy state root is reused. Both state
+names present cause a refusal that names both paths. Default selection reports its
+path and reason on stderr. No state, cursor, memory store, registration or lock is
+moved or reset. Invalid configuration refuses without falling back to empty state.
+Historical explicit-thread installations without `install.json` must repeat any
+custom state and unit paths on upgrade.
 
-Existing local checkouts and worktrees can keep their directory names. Moving a local
-checkout is a separate operation: worktree links, repository identity, peer registration,
-and agent memory keyed by the working-directory path can depend on those paths. Do not
-move state or reset inbox and memory cursors as part of a documentation rename.
+Existing owned `codex-peer-*` unit names remain in use. Both old and new ownership
+markers and participant guidance sections are recognized for upgrade and removal.
+The implementation is `participant_instructions.py`; `codex_instructions.py` remains
+an import shim. The guidance lock filenames remain unchanged so old and new
+updaters cannot write at the same time. Do not replace markers or delete locks by hand.
+
+The Claude registry entrypoint remains `codex-peer-bridge`; the memory handshake
+remains `codex-peer-memory`. Older clients depend on these values. The account-local
+lock namespace remains `koinon-locks`. These are compatibility identifiers, not
+unfinished branding. See the [migration contract](IDENTIFIER-MIGRATION.md).
+
+A source update does not install or restart a runtime. Existing checkouts and
+worktrees can keep their directory names. Moving them is a separate operation:
+repository identity, peer registration and memory can depend on their paths.
 
 ## Requirements
 
@@ -54,11 +69,20 @@ nothing would load.
 
 A start binds exclusively and never removes a socket it did not create, so a bridge killed
 with `SIGKILL` leaves its socket behind and blocks the next start. The failure names the
-path:
+path in a JSON diagnostic on stdout and exits with status 78. For example
+(the operating-system error number can differ):
 
-```text
-OSError: cannot bind /tmp/cc-socks/<hash>-control.sock: [Errno 48] Address already in use
+```json
+{"ok": false, "code": "endpoint_unavailable", "error": "cannot bind /tmp/cc-socks/<hash>-control.sock: [Errno 48] Address already in use"}
 ```
+
+On Linux, installed systemd bridge and session services prevent automatic restart
+on exit 70 (internal software error) or 78 (configuration refusal). On macOS,
+these errors end the manually started process; after
+correcting the path, start it again with the command described in the
+[macOS setup](#macos). The macOS leftover-socket note at the end of this recovery
+section also applies. An unsafe startup directory also reports this refusal. Correct the named path
+before starting the service again; do not bypass its ownership checks.
 
 Proving the owner is gone cannot be done by connecting. A live listener whose accept queue
 is full refuses a connection on macOS exactly as a dead owner does, so a refusal is not
@@ -110,7 +134,7 @@ can be installed and removed independently. Repeated configuration retains previ
 registered participants and uses their recorded homes when home flags are omitted.
 Uninstallation removes every managed section recorded by the installation.
 
-This installs runtime files in `~/.local/share/codex-peer-bridge` and adds a clearly
+This installs runtime files in `~/.local/share/koinon` and adds a clearly
 marked section to `$CODEX_HOME/AGENTS.md` (normally `~/.codex/AGENTS.md`). If a global
 `AGENTS.override.md` already exists, the installer manages that higher-priority file
 instead. Existing content is preserved; a private backup is saved before the first
@@ -120,7 +144,7 @@ without restoring an old backup over subsequent user edits.
 The section instructs each Codex conversation to run `session.py ensure` using its
 own `CODEX_THREAD_ID`. It never embeds a fixed thread ID. Each thread gets:
 
-- an isolated directory under `~/.local/state/codex-peer-bridge/sessions/<session-hash>`;
+- an isolated directory under `~/.local/state/koinon/sessions/<session-hash>`;
 - a fleet-style peer name, `codex-<repo-short-name>-<two-hex>`, stable for the session
   (a DeepSeek participant uses `deepseek-<model>-<repo-short-name>-<two-hex>`);
 - its own bridge process, socket, watcher, and notification checkpoint;
@@ -155,20 +179,20 @@ machine-wide services.
 From the intended Codex session's shell:
 
 ```sh
-python3 ~/.local/share/codex-peer-bridge/session.py ensure
+python3 ~/.local/share/koinon/session.py ensure
 ```
 
 If `CODEX_THREAD_ID` is unavailable, pass the **verified** target explicitly:
 
 ```sh
-python3 ~/.local/share/codex-peer-bridge/session.py ensure --thread YOUR_THREAD_ID --repo /path/to/project
+python3 ~/.local/share/koinon/session.py ensure --thread YOUR_THREAD_ID --repo /path/to/project
 ```
 
 Never guess a thread ID or substitute another model session. Verify queue access with
 a harmless `codex queue --thread YOUR_THREAD_ID --message 'Bridge setup test; no action required.'`
 when setting up a new Codex implementation.
 
-With systemd, registration starts `codex-peer-session-<thread-hash>.service`, whose
+With systemd, registration starts `koinon-session-<thread-hash>.service`, whose
 supervisor owns both bridge and notifier. It reports healthy only after both are ready;
 a child failure fails the supervisor so systemd can restart the pair. Per-conversation
 units start on registration, not at every subsequent login. No lingering is enabled.
@@ -192,9 +216,9 @@ verifying their old process is dead. Never purge shared Claude directories.
 ## Use and inspect
 
 ```sh
-python3 ~/.local/share/codex-peer-bridge/session.py status
-python3 ~/.local/share/codex-peer-bridge/bridge.py peers
-python3 ~/.local/share/codex-peer-bridge/session.py stop
+python3 ~/.local/share/koinon/session.py status
+python3 ~/.local/share/koinon/bridge.py peers
+python3 ~/.local/share/koinon/session.py stop
 ```
 
 `status` and `ensure` return this thread's inbox command and state directory. Run
@@ -213,7 +237,20 @@ numbers to avoid repeating work. A successful socket send is not proof of model 
 ## Shared repository memory
 
 The memory service is optional and independent of the bridge. It is not installed as a service
-unit, and nothing starts it automatically. Run one per repository, from inside that repository:
+unit, and nothing starts it automatically. Memory CLI errors use a structured
+`ok:false` response with a recovery code. Exit 75 means temporary unavailability or
+capacity; retry after pending work settles. Exit 78 means an identity, ownership,
+configuration, permissions or invalid-handshake refusal that needs operator correction.
+A blocked store also exits 78: use `recover` explicitly after correcting its reported
+condition. Unsupported SQLite builds and oversized stores require correction, not a
+restart loop. Request-specific errors and ambiguous lost replies exit 1; do not treat
+an exit code alone as permission to repeat an uncertain write. If you manage memory with a separate service manager,
+keep 75 retryable and exclude both 70 (internal software error) and 78 from automatic
+restarts. Internal errors require investigation or a code correction; they are not
+reported as incompatible user data. No memory service unit is
+created by the installer.
+
+Run one per repository, from inside that repository:
 
 ```sh
 python3 memory.py serve
@@ -280,10 +317,51 @@ The pre-existing explicit single-thread mode remains available:
 python3 scripts/install.py --thread YOUR_THREAD_ID --name codex-project --repo /path/to/project
 ```
 
-That legacy mode manages the fixed `codex-peer-bridge`/`codex-peer-notify` pair and does
+That legacy mode manages the fixed `koinon-bridge`/`koinon-notify` pair (or the retained legacy names) and does
 not add global guidance. Prefer Codex-wide mode for concurrent sessions. It does not
 adopt an already running prototype or legacy inbox automatically; stop or migrate that
 instance deliberately to avoid duplicate registrations for one conversation.
+
+## Notifier ownership
+
+The notifier takes its state-directory lock first, then a lock for the provider and
+session identity across the OS account. Both acquisitions are nonblocking. A conflict
+fails startup before registration or delivery, with `participant_in_use`, the provider,
+the `account-local` scope, and the lock digest. Match that digest to `participant_lock`
+in `session.py status` or the running notifier's private `notify-ready.json`. Under systemd, read the refusal JSON with
+`journalctl --user -u koinon-notify -n 50 --no-pager` for a fresh fixed pair (use the retained name after upgrade), or
+`journalctl --user -u koinon-session-INSTANCE -n 50 --no-pager` for a session.
+Ownership refusals exit with status 78. Both service forms prevent automatic restart
+on that status; the supervisor preserves it after stopping its bridge child. Correct
+the reported condition before explicitly starting the instance again. Stop an
+unwanted instance through its own session command; do not remove a lock file to bypass it.
+
+Participant identity compares exact UTF-8 bytes; callers must supply the provider's
+canonical session ID. Different spellings are not normalized into one identity. Real
+and effective user IDs must match; set-user-ID execution is refused as `uid_mismatch`.
+
+The shared namespace is derived from the effective user's operating-system account
+entry, not `HOME`, `XDG_STATE_HOME`, `CODEX_HOME`, `DSH_HOME`, or the delivery URL:
+
+- Linux: `<account-home>/.local/state/koinon-locks`.
+- macOS: `<account-home>/Library/Application Support/koinon-locks`.
+
+An unavailable account home produces `account_home_unavailable`; startup does not fall
+back to a different namespace. A state directory equal to or below the resolved lock
+namespace is refused, including symlink aliases. An ancestor state directory is allowed;
+removal must preserve the shared namespace and must not recursively purge that state root.
+
+Lock files persist after exit and uninstall. Each distinct historical provider/session
+identity adds a zero-length file; inode and directory-entry use is not bounded by a
+journal or memory-store budget. Never unlink these files while notifiers may use them.
+Descriptors are close-on-exec, so a launched delivery command cannot retain the lock
+once the notifier exits. Unrelated tools that do not take this lock are not coordinated.
+
+When upgrading from a runtime without participant locks, stop and upgrade all Koinon
+notifiers that could target the same participant before restarting them. An older
+notifier in another state directory does not hold the new lock and cannot be excluded
+by it. Preserve inboxes, checkpoints, registration targets and unrelated bridge instances;
+do not treat installing files with `--no-start` as activating the new exclusion rule.
 
 ## Upgrades and removal
 
@@ -321,10 +399,88 @@ only confirmed bridge units before migration.
   loads, restart/reload the conversation, then run `session.py ensure` explicitly.
 - **No notification:** check the exact target with a direct queue test and inspect both
   bridge and notifier health, not just socket existence.
-- **Service failed:** `journalctl --user -u codex-peer-session-INSTANCE -n 50 --no-pager`.
+- **Service failed:** `journalctl --user -u koinon-session-INSTANCE -n 50 --no-pager`.
   The instance suffix is the state-directory hash returned by `ensure`.
 - **Name missing in Claude:** refresh its listing; registry `messagingSocketPath` is a
   bare filesystem path, while message addresses use `uds:`.
 - **Custom Claude home:** set `CLAUDE_CONFIG_DIR` consistently for the supervisor. For
   systemd use a service override with `Environment=CLAUDE_CONFIG_DIR=/your/path`.
 - **Inbox full:** read and acknowledge handled entries; the limit is 1,000 records.
+
+## Inbox schema upgrade
+
+Inbox schema 3 migrates legacy and schema-2 inboxes on bridge startup after exclusive socket reservation. Stop the old
+bridge and notifier together, install the new runtime at the existing target and paths,
+and restart both. Apply the same sequence to manual macOS processes. An installation
+with `--no-start` does not upgrade running processes. Preserve the inbox and legacy
+notification checkpoint; do not reset either to activate the schema.
+
+Do not run an older bridge against an upgraded inbox. Schema-2 runtimes refuse
+schema 3; earlier runtimes do not maintain the acknowledgement watermark. Restore a consistent pre-upgrade backup for a
+rollback instead of mixing runtime and metadata versions. The schema change preserves
+ordinary-reader compatibility but does not upgrade an old notifier. The new notifier
+uses subscriptions and imports the legacy checkpoint into its separate journal.
+Explicit bindings require memory schema 4; restart each optional memory service with
+the new runtime before binding. Activation controls store evidence only. They are
+not a substitute for [stopped-notifier recovery](NOTIFIER.md).
+
+Migration and acknowledgements use SQLite transactions. Process-termination tests
+verify rollback and retry; they do not establish power-loss durability on every
+filesystem. Keep the existing state and checkpoint backups when upgrading.
+
+Inbox startup storage failures, including a lock that outlasts SQLite's finite
+busy timeout, exit 78. This deliberately requires inspection and an explicit restart;
+it does not classify every SQLite operational error as retryable. Do not assume
+that a storage failure means the migration or a prior mutation was lost.
+The supervisor preserves bridge exit codes 70 and 78 through each startup phase
+and its running loop. All installer-managed units exclude both permanent statuses
+70 and 78 from automatic restart, while 75 remains retryable.
+
+
+## Explicit memory bindings
+
+Memory remains optional and is not started by the installer. After starting the
+repository's memory service, use its exact state directory to bind it:
+
+```sh
+python3 bridge.py --state-dir /private/bridge-state bind-memory \
+  --repo-path /path/to/repository --memory-state-dir /private/memory-state
+python3 bridge.py --state-dir /private/bridge-state memory-bindings
+python3 bridge.py --state-dir /private/bridge-state refresh-memory BINDING_KEY
+python3 bridge.py --state-dir /private/bridge-state ack-binding-health BINDING_KEY
+python3 bridge.py --state-dir /private/bridge-state unbind-memory BINDING_KEY
+```
+
+Binding verifies the live service but does not create a pointer until refresh.
+The new notifier performs this refresh automatically and queues a content-free
+sync command with the exact service root and a stable consumer identity. The legacy
+notifier does not deliver memory pointers. Binding and notification do not acknowledge
+or import memory; the consumer must run sync and acknowledge issued pages explicitly.
+
+Memory schema 3 upgrades to schema 4 in a transaction that adds a durable store UUID
+and changes the schema version together. Records, snapshots and consumer cursors
+are retained. A schema-4 store with missing or invalid identity is refused, never
+silently assigned a replacement identity. Older runtimes refuse schema 4. Preserve
+consistent backups before upgrade; rollback means restoring a compatible backup,
+not changing a schema number. An inbox upgrade does not restart memory for you.
+If `memory_upgrade_required` is returned, stop that memory service and start it
+with the new runtime. Missing or unhealthy memory leaves existing bridge state intact.
+
+
+### Upgrading a state directory reached through an alias
+
+New private control sockets use the resolved state path when checking the Unix
+socket path-length limit. Roots without aliases keep their endpoint. A short
+alias to a long directory could have selected a direct socket in an older release;
+a long alias to a short directory could have selected the hashed fallback instead.
+Clients retain both legacy routes; new startup refuses a distinct retained legacy
+endpoint before creating a second listener.
+
+Stop the old service before restarting it with the new code. The new bridge
+client can reach the old endpoint when given the original configured state path.
+Memory clients can also recover its exact old path from the validated owner
+record. An ownerless bridge cannot reconstruct an unknown alias from a long
+canonical path: use its original configured `--state-dir`, or stop its verified
+process through the service manager. Do not remove a socket while its owner is
+alive. If both old and new control endpoints exist, clients refuse the ambiguity;
+inspect their owners before proceeding. No inbox or memory state is reset.

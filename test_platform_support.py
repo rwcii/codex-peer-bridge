@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -37,22 +39,18 @@ class StartMarkerTests(unittest.TestCase):
 class ProcessTests(unittest.TestCase):
     def test_self_is_alive_and_reaped_child_is_not(self):
         self.assertTrue(platform_support.process_alive(os.getpid()))
-        child = os.fork()
-        if child == 0:
-            os._exit(0)
-        os.waitpid(child, 0)
-        self.assertFalse(platform_support.process_alive(child))
+        with subprocess.Popen([sys.executable, '-c', 'pass']) as child:
+            self.assertEqual(child.wait(timeout=5), 0)
+        self.assertFalse(platform_support.process_alive(child.pid))
 
     def test_a_vanished_process_raises_process_lookup_on_both_platforms(self):
         # Callers such as the notifier's bridge-liveness check catch exactly this,
         # so a stopped bridge must break their loop cleanly rather than raise a
         # platform-specific error out of the notifier.
-        child = os.fork()
-        if child == 0:
-            os._exit(0)
-        os.waitpid(child, 0)
+        with subprocess.Popen([sys.executable, '-c', 'pass']) as child:
+            self.assertEqual(child.wait(timeout=5), 0)
         with self.assertRaises(ProcessLookupError):
-            platform_support.proc_start(child)
+            platform_support.proc_start(child.pid)
 
     def test_pid_domain_names_this_platform(self):
         if platform_support.DARWIN:
@@ -94,7 +92,7 @@ class SocketPolicyTests(unittest.TestCase):
         limit = platform_support.SUN_PATH_BYTES[platform_support.DARWIN] - 1
         with tempfile.TemporaryDirectory() as temp:
             shallow = platform_support.control_socket_path(Path(temp))
-            self.assertEqual(shallow, Path(temp) / 'control.sock')
+            self.assertEqual(shallow, Path(temp).resolve() / 'control.sock')
             deep = platform_support.control_socket_path(Path(temp) / ('x' * 120))
             self.assertLess(len(str(shallow)), limit)
             self.assertLess(len(str(deep)), limit)
@@ -247,3 +245,79 @@ class ExistingSocketTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AsyncProcessProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_callers_do_not_release_running_probe_capacity(self):
+        import asyncio
+        release = threading.Event()
+        entered = 0
+        lock = threading.Lock()
+        def blocked(pid):
+            nonlocal entered
+            with lock:
+                entered += 1
+            if not release.wait(5):
+                raise RuntimeError('synthetic probe barrier expired')
+            return 'synthetic'
+        with patch.object(platform_support, 'proc_start', side_effect=blocked):
+            tasks = [asyncio.create_task(platform_support.async_proc_start(42)) for _ in range(2)]
+            try:
+                async with asyncio.timeout(2):
+                    while entered != 2:
+                        await asyncio.sleep(.001)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                with self.assertRaises(BlockingIOError):
+                    await platform_support.async_proc_start(42)
+            finally:
+                release.set()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            async with asyncio.timeout(2):
+                while True:
+                    try:
+                        self.assertEqual(await platform_support.async_proc_start(42), 'synthetic')
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(.001)
+
+    async def test_async_probe_preserves_current_process_identity(self):
+        self.assertEqual(await platform_support.async_proc_start(os.getpid()),
+                         platform_support.proc_start(os.getpid()))
+
+    async def test_macos_process_query_has_a_finite_subprocess_budget(self):
+        from types import SimpleNamespace
+        with patch.object(platform_support, 'LINUX', False), patch.object(
+                platform_support.subprocess, 'run', return_value=SimpleNamespace(stdout='synthetic')) as run:
+            self.assertEqual(await platform_support.async_proc_start(42), 'synthetic')
+        self.assertEqual(run.call_args.kwargs['timeout'], platform_support.PROCESS_QUERY_TIMEOUT)
+
+
+class ControlAliasTests(unittest.TestCase):
+    def test_short_and_long_aliases_select_one_endpoint_and_exclude_duplicates(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temp:
+            base = Path(temp).resolve()
+            for suffix in ('short', 'x' * 110):
+                with self.subTest(suffix=suffix):
+                    real = base / suffix
+                    real.mkdir(mode=0o700)
+                    alias = base / ('alias-' + str(len(suffix)))
+                    alias.symlink_to(real, target_is_directory=True)
+                    chosen = platform_support.control_socket_path(real)
+                    self.assertEqual(platform_support.control_socket_path(alias), chosen)
+                    if suffix == 'short':
+                        self.assertEqual(chosen, real / 'control.sock')
+                    else:
+                        self.assertNotEqual(chosen, real / 'control.sock')
+                    chosen.parent.mkdir(mode=0o700, exist_ok=True)
+                    first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    try:
+                        first.bind(str(chosen))
+                        with self.assertRaises(OSError):
+                            second.bind(str(platform_support.control_socket_path(alias)))
+                    finally:
+                        first.close()
+                        second.close()
+                        chosen.unlink(missing_ok=True)
