@@ -37,8 +37,9 @@ Return one row per reporting agent, with these columns:
 The figures support commit provenance notes. Cost estimation is a separate work
 product and is excluded. The user specifically named the provenance-notes skills in
 `cordalo/forge` and `cordalo/unify-messaging`; inspect those skills and their supporting
-implementation before choosing metric sources. Their behavior has not yet been
-verified here.
+implementation before choosing metric sources. The driver has read the
+unify-messaging provenance skill and parser, and the Forge notes script. Their
+end-to-end capture behavior has not been tested here.
 
 Acceptance requirements:
 
@@ -88,6 +89,26 @@ Acquisition evidence from the design conference:
   or adding cache fields to Codex input would be incorrect without normalization.
 - Keep only field names and sanitized findings in repository documentation. Private
   session paths, identifiers, contents, and actual runtime counts stay outside it.
+
+Reference reconciliation still required:
+
+- Unify-messaging's `.claude/skills/provenance/SKILL.md` and
+  `scripts/provenance-parse.sh` use local transcripts and out-of-band Git notes.
+  Commit-time windows are defaults; explicit time windows and post-commit review-tail
+  capture also exist. These defaults do not replace arbitrary requested work blocks.
+- Its model/main-or-subagent aggregation is distinct from the requested per-reporting-
+  agent presentation. Resolve Role semantics and model changes without losing agent
+  identity or silently changing the user's requested granularity.
+- Forge's `scripts/provenance-notes.sh` includes a reasoning counter and an accounting
+  expression that adds output and reasoning. Trace its upstream normalization before
+  applying it to Codex, whose inspected runtime output already includes reasoning.
+  The references are not one interchangeable schema. Cost remains out of scope.
+- Local collection with explicit session selection and a Git-notes destination is the
+  current recommendation, not an implemented feature. Same-host peer transport does
+  not prove that every transcript is retained, mounted, or readable from a collector's
+  sandbox. Preserve existing permissions and never scan unrelated sessions by default.
+- Best-effort capture does not waive validation of local records or permit missing
+  values to become measured zeros. Report coverage separately from valid counts.
 
 **Open design decision:** reporting convention versus bridge protocol support.
 No wire-format change is approved by this queue. First inspect the reference
