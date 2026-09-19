@@ -122,6 +122,16 @@ Reference reconciliation still required:
   with separately retained cache subsets is also reversible when their relationships
   are known; the choice is compatibility, not loss of information by definition.
 
+Recommended report convention, pending design acceptance: make the five numeric
+components disjoint. Tokens In means ordinary input excluding cache reads and writes;
+Tokens Out means output excluding reasoning. Total is Tokens In + Tokens Out +
+Cache Write + Cache Read + Reasoning. Keep native counters and the mapping version
+as acquisition evidence. The proposed partitions reconcile for the inspected samples;
+nonzero Codex cache-write semantics still require verification. Missing components
+are not zeros and cannot silently produce a complete normalized breakdown. A measured
+native total can remain available even when its breakdown is incomplete. This is a
+reporting convention, not a change to provider-native counter meanings.
+
 **Open design decision:** reporting convention versus bridge protocol support.
 No wire-format change is approved by this queue. First inspect the reference
 implementations and establish the report/data-source contract, then recommend the
