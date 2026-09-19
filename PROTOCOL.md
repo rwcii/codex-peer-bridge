@@ -436,3 +436,9 @@ Memory services advertise `memory_target_guard` when requests can carry both
 `repo` and `generation`. A mismatch is refused before maintenance
 or mutation. The exact-path memory CLI verifies the owner and uses this guard;
 older services without it require an upgrade for this route.
+
+## Local usage reports
+
+`usage_report.py` emits versioned local JSON described in [USAGE.md](docs/USAGE.md).
+It introduces no peer frames, remote transcript access, hooks, or model wakeups.
+Selections and reports are local data and cannot grant authorization.

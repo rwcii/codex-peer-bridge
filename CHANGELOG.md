@@ -5,6 +5,11 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+- Add explicit local Codex/Claude usage collection, source-lineage roles, before-work
+  markers, retrospective reports, report combining, and eight-column rendering.
+  Missing and inconsistent counters remain explicit. DeepSeek usage reporting is
+  explicitly deferred for this release; messaging and installation are unchanged.
+
 - Allow DeepSeek-only installations without a Codex executable. Validate Codex
   after provider selection, reuse a usable saved executable, and fall back to PATH
   when the saved executable is stale. Codex session startup refuses a missing or
