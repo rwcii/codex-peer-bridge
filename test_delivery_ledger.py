@@ -123,6 +123,12 @@ class LedgerTests(unittest.TestCase):
             self.store.store(os.getpid(), FRAME)
         self.assertEqual(self.store.command(dict(op='inbox')), [])
 
+    def test_missing_ledger_is_refused_instead_of_advertising_schema_support(self):
+        self.store.db.execute('DROP TABLE delivery_record')
+        self.store.db.commit()
+        with self.assertRaisesRegex(inbox_schema.InboxSchemaError, 'incomplete delivery ledger schema'):
+            bridge.InboxStore(self.root)
+
     def test_schema3_migration_stored_only_and_atomic_refusal(self):
         # Build the exact predecessor schema from an otherwise current empty DB.
         db = self.store.db

@@ -76,6 +76,8 @@ def initialize(db):
             if not {'inbox', 'memory_binding', 'sqlite_sequence'} <= tables:
                 raise InboxSchemaError('incomplete inbox schema')
             state = metadata(db, versions=(2, 3, SCHEMA))
+            if state['schema'] == SCHEMA and not {'delivery_identity', 'delivery_record'} <= tables:
+                raise InboxSchemaError('incomplete delivery ledger schema')
             columns = tuple(row[1] for row in db.execute('PRAGMA table_info(inbox)'))
             expected = COLUMNS[:-1] if state['schema'] == 2 else COLUMNS
             if columns != expected:
