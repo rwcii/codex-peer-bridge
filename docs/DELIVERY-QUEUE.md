@@ -21,7 +21,7 @@ contract and its evidence sources, resolve the provider installation defect, the
 continue Stage 5. Keep the retrieval proposals visible for a scope decision before
 Stage 6 history pruning. Investigating a requirement does not settle its protocol.
 
-## DQ-01 — Per-agent usage reports for commit provenance
+## DQ-01 — Universal per-agent usage reports
 
 **Source:** user requirement conveyed by the reviewer and explicitly requested for
 this queue by the user. **Status:** queued; report contract and acquisition design
@@ -41,8 +41,17 @@ not Role. Keep any such assignment as metadata, not a ninth displayed column.
 Preserve agent identity alongside model and role so distinct agents never collapse
 into one row merely because their model and harness role match.
 
-The figures support commit provenance notes. Cost estimation is a separate work
-product and is excluded. The user specifically named the provenance-notes skills in
+The deliverable is usage data available to agents universally: acquisition,
+normalization, hazard handling, and a report for a requested work block. Participant
+session enumeration is in scope so relevant records can be identified. Enumeration
+must preserve explicit participant selection and existing permissions; it is not
+permission to read every session on the host.
+
+Commit notes are one consumer of this report, not a Koinon repository-tooling
+pipeline. Writing notes, pushing notes refs, capture hooks, merge aggregation,
+pricing tables, cost derivation, and cost reports are out of scope. The downstream
+commit note and the cost/provenance note produced by a merge-time action are separate
+records. Existing user tooling adapts to the agent data interface, not the reverse. The user specifically named the provenance-notes skills in
 `cordalo/forge` and `cordalo/unify-messaging`; inspect those skills and their supporting
 implementation before choosing metric sources. The driver has read the
 unify-messaging provenance skill and parser, and the Forge notes script. Their
@@ -53,6 +62,8 @@ Acceptance requirements:
 - Support a request made before work and a retrospective request for completed work.
 - Identify the reporting agent and work block unambiguously; retain the eight
   requested columns and one row per reporting agent.
+- Store Total as a field in the report for automation; do not leave it solely as a
+  display-time calculation.
 - Include only the metrics required for the commit notes. The eight requested columns
   are the complete report set for this requirement; additional metrics and cost
   estimation are separate scope.
@@ -71,6 +82,9 @@ Proposed correctness gates, to resolve in the implementation contract:
   Do not substitute zero, infer another agent's usage, or invent historical data.
   Report incomplete coverage explicitly; do not count it as full implementation.
 - State the source and coverage of a report and define model changes within a block.
+- For a complete normalized breakdown, verify stored Total against its components.
+  Report a mismatch as inconsistent data; do not silently rewrite either the stored
+  total or its components. A partial breakdown cannot establish that equality.
 - Test before-work and retrospective requests, missing historical measurements,
   multiple agents, partial reports, and prevention of double counting.
 
@@ -117,34 +131,36 @@ Reference reconciliation still required:
   expression that adds output and reasoning. Trace its upstream normalization before
   applying it to Codex, whose inspected runtime output already includes reasoning.
   The references are not one interchangeable schema. Cost remains out of scope.
-- Local collection with explicit session selection and a Git-notes destination is the
-  current recommendation, not an implemented feature. Same-host peer transport does
+- Local collection with explicit session selection is the current recommendation,
+  not an implemented feature. Git notes are an example downstream consumer, not
+  the destination this project must implement. Same-host peer transport does
   not prove that every transcript is retained, mounted, or readable from a collector's
   sandbox. Preserve existing permissions and never scan unrelated sessions by default.
 - Best-effort capture does not waive validation of local records or permit missing
   values to become measured zeros. Report coverage separately from valid counts.
-- Recommend disjoint ordinary-input, cache-read, and cache-write categories for
-  compatibility with the reference, retaining native measurements for reconciliation.
+- Recommend disjoint ordinary-input, cache-read, and cache-write categories for an
+  explicit report contract, retaining native measurements for reconciliation.
   Codex subtraction is checked only for observed zero-cache-write records; nonzero
   cache-write inclusion and category disjointness still need evidence. Inclusive input
   with separately retained cache subsets is also reversible when their relationships
-  are known; the choice is compatibility, not loss of information by definition.
+  are known; the chosen report contract is not dictated by a reference file layout.
 
 Recommended report convention, pending design acceptance: make the five numeric
 components disjoint. Tokens In means ordinary input excluding cache reads and writes;
-Tokens Out means output excluding reasoning. Total is Tokens In + Tokens Out +
-Cache Write + Cache Read + Reasoning. Keep native counters and the mapping version
+Tokens Out means output excluding reasoning. Store Total explicitly as Tokens In + Tokens Out +
+Cache Write + Cache Read + Reasoning when the normalized breakdown is complete. Keep native counters and the mapping version
 as acquisition evidence. The proposed partitions reconcile for the inspected samples;
 nonzero Codex cache-write semantics still require verification. Missing components
 are not zeros and cannot silently produce a complete normalized breakdown. A measured
 native total can remain available even when its breakdown is incomplete. This is a
 reporting convention, not a change to provider-native counter meanings.
 
-**Open design decision:** reporting convention versus bridge protocol support.
-No wire-format change is approved by this queue. First inspect the reference
-implementations and establish the report/data-source contract, then recommend the
-smallest complete integration supported by the evidence. Do not build a costing
-system or a new transport merely to populate commit notes.
+**Implementation design remaining:** define the agent-facing request/report interface,
+participant enumeration, work-block boundaries, source adapters, and completeness
+rules. Local collection is the recommended acquisition path for the measured sources.
+No new wire format, hooks, note-writing pipeline, or downstream cost tooling is
+implied by this queue. Keep the report independent of Forge's file layout and call
+conventions; existing consumers will adapt to this interface.
 
 ## DQ-02 — DeepSeek-only installation must not require Codex
 
