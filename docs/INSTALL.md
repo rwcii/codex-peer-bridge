@@ -491,3 +491,9 @@ canonical path: use its original configured `--state-dir`, or stop its verified
 process through the service manager. Do not remove a socket while its owner is
 alive. If both old and new control endpoints exist, clients refuse the ambiguity;
 inspect their owners before proceeding. No inbox or memory state is reset.
+
+## Usage collection
+
+The installer copies the local usage-report CLI and adapters. It starts no collector
+and registers no hooks. See [USAGE.md](USAGE.md) for explicit source selection,
+private markers, reporting, and the explicit DeepSeek usage deferral for this release.

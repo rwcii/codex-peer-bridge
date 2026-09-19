@@ -24,8 +24,10 @@ Stage 6 history pruning. Investigating a requirement does not settle its protoco
 ## DQ-01 — Universal per-agent usage reports
 
 **Source:** user requirement conveyed by the reviewer and explicitly requested for
-this queue by the user. **Status:** queued; report contract and acquisition design
-required before implementation.
+this queue by the user. **Status:** Codex/Claude implementation prepared; native
+DeepSeek usage is explicitly deferred for this release by scope decision. See
+[the implemented contract and availability matrix](USAGE.md). DeepSeek messaging, delivery, and installation remain supported; the exclusion
+applies only to usage reporting.
 
 An agent reports its own model and token usage for a specified work block on
 request. The request may be made at the start of the block or after it completes.
@@ -88,79 +90,20 @@ Proposed correctness gates, to resolve in the implementation contract:
 - Test before-work and retrospective requests, missing historical measurements,
   multiple agents, partial reports, and prevention of double counting.
 
-Acquisition evidence from the design conference:
+Verification findings and the implemented interface are recorded in
+[USAGE.md](USAGE.md). The nonzero Codex cache-write parse fixture supports the
+selected inclusive-input mapping but is not a live nonzero measurement or a
+universal provider guarantee. Forge's capture path copies OpenCode counters, whose
+normalizer uses disjoint categories but defaults missing fields and clamps negative
+results; Koinon preserves those diagnostics. Claude completion uses an observed
+stop reason, with unfinished or abandoned responses retained as provisional.
 
-- The current Codex runtime writes `token_usage_record` entries to its own session
-  JSONL record. `payload.usage` contains `input_tokens`, `output_tokens`,
-  `cache_write_input_tokens`, `cached_input_tokens`, `reasoning_output_tokens`, and
-  `total_tokens`. Model identity is present in `turn_context.payload.model`; role
-  means harness position (`main` or `subagent`), established from session lineage
-  rather than a token counter. The driver read its own records and verified
-  their session attribution, response identifiers, and all six fields.
-- In that inspected sample, per-response sums matched the thread aggregate, total
-  equalled input plus output, and cache reads and reasoning were bounded by input
-  and output respectively. All observed cache-write counts were zero, so the sample
-  does not establish nonzero cache-write accounting. Do not generalize this evidence
-  to every provider or runtime version.
-- Some separate `token_count` event snapshots had a nonzero total with zero component
-  fields. They are not interchangeable with per-response usage records. A collector
-  must distinguish event kinds and avoid summing cumulative snapshots or duplicate
-  responses. A session total is not a work-block report without identified boundaries.
-- The reviewer independently reports a Claude session-record source. Its provider
-  mapping and aggregation require their own checks; copying the Codex total formula
-  or adding cache fields to Codex input would be incorrect without normalization.
-- Keep only field names and sanitized findings in repository documentation. Private
-  session paths, identifiers, contents, and actual runtime counts stay outside it.
-
-- The reviewer found repeated Claude message IDs carrying growing streaming usage
-  updates and withdrew its earlier sum of all usage rows. Deduplicate within the
-  selected provider/session/response identity. The last observed update is not
-  necessarily final during an active response; establish completion or label the
-  report provisional and define how later updates replace it.
-
-Reference reconciliation still required:
-
-- Unify-messaging's `.claude/skills/provenance/SKILL.md` and
-  `scripts/provenance-parse.sh` use local transcripts and out-of-band Git notes.
-  Commit-time windows are defaults; explicit time windows and post-commit review-tail
-  capture also exist. These defaults do not replace arbitrary requested work blocks.
-- Its model/main-or-subagent aggregation is distinct from the requested per-reporting-
-  agent presentation. Preserve the confirmed harness-role meaning and model changes without losing agent
-  identity or silently changing the user's requested granularity.
-- Forge's `scripts/provenance-notes.sh` includes a reasoning counter and an accounting
-  expression that adds output and reasoning. Trace its upstream normalization before
-  applying it to Codex, whose inspected runtime output already includes reasoning.
-  The references are not one interchangeable schema. Cost remains out of scope.
-- Local collection with explicit session selection is the current recommendation,
-  not an implemented feature. Git notes are an example downstream consumer, not
-  the destination this project must implement. Same-host peer transport does
-  not prove that every transcript is retained, mounted, or readable from a collector's
-  sandbox. Preserve existing permissions and never scan unrelated sessions by default.
-- Best-effort capture does not waive validation of local records or permit missing
-  values to become measured zeros. Report coverage separately from valid counts.
-- Recommend disjoint ordinary-input, cache-read, and cache-write categories for an
-  explicit report contract, retaining native measurements for reconciliation.
-  Codex subtraction is checked only for observed zero-cache-write records; nonzero
-  cache-write inclusion and category disjointness still need evidence. Inclusive input
-  with separately retained cache subsets is also reversible when their relationships
-  are known; the chosen report contract is not dictated by a reference file layout.
-
-Recommended report convention, pending design acceptance: make the five numeric
-components disjoint. Tokens In means ordinary input excluding cache reads and writes;
-Tokens Out means output excluding reasoning. Store Total explicitly as Tokens In + Tokens Out +
-Cache Write + Cache Read + Reasoning when the normalized breakdown is complete. Keep native counters and the mapping version
-as acquisition evidence. The proposed partitions reconcile for the inspected samples;
-nonzero Codex cache-write semantics still require verification. Missing components
-are not zeros and cannot silently produce a complete normalized breakdown. A measured
-native total can remain available even when its breakdown is incomplete. This is a
-reporting convention, not a change to provider-native counter meanings.
-
-**Implementation design remaining:** define the agent-facing request/report interface,
-participant enumeration, work-block boundaries, source adapters, and completeness
-rules. Local collection is the recommended acquisition path for the measured sources.
-No new wire format, hooks, note-writing pipeline, or downstream cost tooling is
-implied by this queue. Keep the report independent of Forge's file layout and call
-conventions; existing consumers will adapt to this interface.
+The interface supports explicit local selection, native source-lineage roles,
+before-work markers, retrospective observation windows, source identity checks,
+per-response deduplication, report combining, and the agreed table. Native counters,
+Total, source coverage, and mapping version remain available in JSON. No peer wire
+format, capture hooks, notes pipeline, or cost tooling is added. DeepSeek usage is a named deferred item for a later release. Generic normalized
+import is not included in this release.
 
 ## DQ-02 — DeepSeek-only installation must not require Codex
 

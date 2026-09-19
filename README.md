@@ -361,3 +361,11 @@ state before reserving journal work and calling a provider. See the
 
 Outstanding requirements, confirmed defects, and proposals are recorded in the
 [delivery queue](docs/DELIVERY-QUEUE.md).
+
+## Usage reports
+
+Use the local [usage-report interface](docs/USAGE.md) for explicitly selected Codex
+and Claude sessions, including before-work markers, retrospective windows, and
+combining separate agent reports. DeepSeek usage reporting
+is explicitly deferred for this release; its messaging and installation support
+are unchanged.
