@@ -73,7 +73,7 @@ class InstallTests(unittest.TestCase):
 
     def test_deepseek_only_install_and_repeat_without_codex(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             env = dict(os.environ, PATH=str(root/'empty-path'))
             command = self.isolated_command(root, '--configure-deepseek')
             for _ in range(2):
@@ -93,7 +93,7 @@ class InstallTests(unittest.TestCase):
                  ('--configure-deepseek', '--thread', 'synthetic-thread')]
         for mode in modes:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp)
+                root = Path(temp).resolve()
                 result = subprocess.run(self.isolated_command(root, *mode),
                     env=dict(os.environ, PATH=str(root/'empty-path')),
                     capture_output=True, text=True)
@@ -103,7 +103,7 @@ class InstallTests(unittest.TestCase):
 
     def test_deepseek_install_refuses_invalid_codex_and_codex_session(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             env = dict(os.environ, PATH=str(root/'empty-path'))
             command = self.isolated_command(root, '--configure-deepseek')
             failed = subprocess.run(command + ['--codex', 'relative'], env=env,
@@ -140,9 +140,34 @@ class InstallTests(unittest.TestCase):
                                     capture_output=True, text=True)
             self.assertEqual(enabled.returncode, 0, enabled.stderr)
 
+    def test_stale_saved_codex_falls_back_to_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            old = root/'old-codex'
+            old.write_text('#!/bin/sh\nexit 0\n')
+            old.chmod(0o700)
+            command = self.isolated_command(root, '--configure-codex')
+            installed = subprocess.run(command + ['--codex', str(old)],
+                                       capture_output=True, text=True)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            old.unlink()
+            binary_dir = root/'bin'
+            binary_dir.mkdir()
+            replacement = binary_dir/'codex'
+            replacement.write_text('#!/bin/sh\nexit 0\n')
+            replacement.chmod(0o700)
+            env = dict(os.environ, PATH=str(binary_dir))
+            upgraded = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+            config = json.loads((root/'app/install.json').read_text())
+            self.assertEqual(config['codex'], str(replacement))
+            refused = subprocess.run(command + ['--codex', str(old)], env=env,
+                                     capture_output=True, text=True)
+            self.assertEqual(refused.returncode, 2)
+
     def test_saved_codex_preserved_and_explicit_invalid_override_refused(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             env = dict(os.environ, PATH=str(root/'empty-path'))
             command = self.isolated_command(root, '--configure-codex', '--codex', sys.executable)
             first = subprocess.run(command, env=env, capture_output=True, text=True)
@@ -167,7 +192,7 @@ class InstallTests(unittest.TestCase):
 
     def test_uninstall_preserves_shared_locks_under_an_ancestor_state_root(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             account = root/'account'
             app = root/'app'
             lock_dir = account/'.local/state/koinon-locks'

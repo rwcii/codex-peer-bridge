@@ -43,8 +43,8 @@ A DeepSeek (DSH) participant needs no Codex CLI. It needs the running harness, w
 exports `DSH_HOME`, `DSH_SESSION_ID` and `DSH_WEB_URL` to a session's shell.
 `--configure-deepseek` alone does not require Codex. Installations with a saved or
 selected Codex participant, and explicit `--thread` mode, still require it.
-The executable selection order is explicit `--codex`, saved installation value,
-then Codex on `PATH`; an invalid selected executable fails before files are written.
+The executable selection order is explicit `--codex`, a saved installation value
+that is still an executable file, then Codex on `PATH`; an invalid selected executable fails before files are written.
 
 On macOS the system `python3` is often 3.9, which is below the floor; use a 3.11+
 interpreter explicitly, for example `python3.12`.

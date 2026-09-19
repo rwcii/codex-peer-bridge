@@ -203,7 +203,11 @@ def main():
     participants.update(name for name, chosen in (('codex', a.configure_codex),
                                                   ('deepseek', a.configure_deepseek)) if chosen)
     explicit_codex = a.codex is not None
-    a.codex = a.codex if explicit_codex else previous.get('codex') or shutil.which('codex')
+    saved_codex = previous.get('codex')
+    saved_codex_usable = (saved_codex and Path(saved_codex).is_absolute()
+                          and Path(saved_codex).is_file() and os.access(saved_codex, os.X_OK))
+    if not explicit_codex:
+        a.codex = saved_codex if saved_codex_usable else shutil.which('codex')
     # --thread starts a Codex session even when only DeepSeek guidance is selected.
     if explicit_codex or a.thread or 'codex' in participants:
         if (not a.codex or not Path(a.codex).is_absolute()

@@ -164,8 +164,8 @@ conventions; existing consumers will adapt to this interface.
 
 ## DQ-02 — DeepSeek-only installation must not require Codex
 
-**Source:** recorded implementation defect (F071). **Status:** correction implemented;
-review and CI pending. DeepSeek-only setup and repeat installation no longer require
+**Source:** recorded implementation defect (F071). **Status:** implemented on develop;
+release and runtime deployment remain separate. DeepSeek-only setup and repeat installation no longer require
 Codex. Codex startup refuses a missing executable before creating new session state.
 
 The installer validates the Codex executable unconditionally before it resolves the

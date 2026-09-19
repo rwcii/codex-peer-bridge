@@ -6,7 +6,9 @@ into a dated release section when promoted to `main`.
 ## Unreleased
 
 - Allow DeepSeek-only installations without a Codex executable. Validate Codex
-  after provider selection and preserve its saved executable on repeat installs.
+  after provider selection, reuse a usable saved executable, and fall back to PATH
+  when the saved executable is stale. Codex session startup refuses a missing or
+  invalid executable before creating new session state.
 
 - Record outstanding usage-reporting requirements, provider defects, and remaining
   programme work in a repository delivery queue, with proposals marked separately.
