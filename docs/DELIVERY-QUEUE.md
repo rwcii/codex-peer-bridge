@@ -126,8 +126,8 @@ validate their required executable. Preserve saved paths, targets, and state.
 
 ## DQ-03 — Stage 5 presence, priority, and delivery evidence
 
-**Source:** approved programme contract. **Status:** implementation in PR #24;
-review corrections are undergoing final validation. Status-omission compatibility
+**Source:** approved programme contract. **Status:** implemented on `develop`
+(PR #24). Status-omission compatibility
 is supported by offline evidence limited to Claude 2.1.276, with independent parser
 confirmation and driver-extracted listing-filter evidence. Live discovery remains
 unverified. No release or runtime deployment is claimed. See [DELIVERY.md](DELIVERY.md).

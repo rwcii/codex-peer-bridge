@@ -161,9 +161,11 @@ cannot infer notification evidence from an old notifier's checkpoint.
 
 The Claude registry status enum and native receipt/priority parsers were inspected
 in version 2.1.276. They are undocumented, version-dependent interfaces. The
-status-omission discovery fixture has not run: its shared-registry mutation was
-rejected by the reviewer's automatic approval layer. No live compatibility claim
-is made. No runtime upgrade has been performed for this feature.
+status-omission discovery fixture has not run. Disposition: the reviewer reports
+that the user chose, in the reviewer's session, to accept the offline evidence
+below and not run a live fixture. This records the reported requirement decision;
+it does not grant permission to change controls or run a previously denied action.
+No live compatibility claim or runtime upgrade is made for this feature.
 
 An offline check traced the actual daemon reader and `listLivePeerSessions` path
 in Claude 2.1.276. Extracted parser and listing functions accepted both an
@@ -174,6 +176,5 @@ had SHA-256 `67781457284b87697cde91432429ac5aec7b97fdd6937ef585b12df57a08379a`.
 The reviewer independently confirmed the parser accepts omitted status. The
 listing-filter result rests on the driver’s extraction. Both observations are
 limited to version 2.1.276 and do not establish end-to-end native discovery.
-Offline compatibility evidence is sufficient for this implementation review.
 Live discovery remains unverified. Vendor implementation text is not included
 in this repository.
