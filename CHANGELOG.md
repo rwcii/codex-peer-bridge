@@ -9,6 +9,11 @@ into a dated release section when promoted to `main`.
 
 ### Added
 
+- Bounded notification journal core, crash-safe migration state, attempt accounting,
+  and read-only source reconciliation. Worker integration tests cover acknowledgement
+  races and process termination. The notifier CLI and provider adapters still use
+  the existing delivery path; the journal is not enabled by this component.
+
 - Explicit verified memory bindings and atomic content-free pointer refresh, with
   independent inbox quotas, durable observation state and replacement diagnostics.
   Inbox schema 2 upgrades to 3; memory schema 3 upgrades to 4 with a stable store UUID.

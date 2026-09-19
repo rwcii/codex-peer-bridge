@@ -1,6 +1,6 @@
 # Stage 4 implementation design for review
 
-Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented and reviewed. Subscriptions and the shared reconnect/rescan helper are implemented and reviewed. Explicit bindings/pointers and store identity migrations are implemented in the current candidate, pending review. Automatic notifier integration and the notifier journal remain pending. No stage 4 runtime changes are deployed.
+Status: all five concrete design gates accepted in independent review. Shared transport, participant ownership, database workers and startup exclusion are implemented and reviewed. Inbox schema-2 migration, acknowledgement metadata and activation evidence are implemented and reviewed. Subscriptions and the shared reconnect/rescan helper are implemented and reviewed. Explicit bindings/pointers, store identity migrations, and private control alias compatibility are implemented, independently reviewed, and verified on Linux and macOS. The journal storage and serial delivery core are implemented with tests; independent review and CLI/provider integration remain pending. No stage 4 runtime changes are deployed.
 Baseline: develop 84f35e727b0f17a9469de182db9a843e7a28d092, integrated by signed merge 7503dc1.
 Codex is the sole driver. Claude is the reviewer. The merged baseline was independently verified. Implementation branch: feature/shared-transport-delivery.
 
@@ -510,3 +510,83 @@ event loop. Slots are released by actual completion, not caller cancellation; th
 macOS subprocess has a finite 5s policy. This is not a claim that filesystem or
 kernel operations have hard physical latency bounds. Notifier binding refresh
 clients must use the complete binding client budget, not the generic RPC default.
+
+
+### Durable activation confirmation and compatibility
+
+The notification journal keeps `activation_confirmed` in its transactional meta
+state, initially false. Ready-marker publication does not set it. After the
+bridge has returned verified matching target/nonce activation evidence, the
+journal commits this flag. Provider attempt reservation requires this flag and
+completed one-time pointer seeding. A crash after bridge activation but before
+this commit retries the same idempotent activation; an older bridge cannot finish
+that incomplete transition.
+
+On a capable bridge, compare its evidence before registration can change it.
+A true local flag with missing or different bridge evidence is recovery-required;
+registration must not recreate evidence and hide the disagreement. Matching
+identity is still registered and verified on every start. A false flag with
+matching evidence retries idempotently and then commits the flag. Conflicting
+identity requires the explicit accepted-loss rebuild route.
+
+An existing journal can use old-bridge ordinary-message compatibility only when
+its local activation flag is true. This proves prior verified activation, not
+continued availability of corroborating inbox evidence from a bridge that cannot
+report it. Unknown binding metadata is distinct from an empty binding set: it
+cannot prove that a memory binding was removed or make a pointer obsolete.
+Unsupported pointer work remains retained while ordinary compatibility work can
+continue, subject to the journal's bounded capacity.
+
+`history_lost` remains immutable journal identity after accepted-loss rebuild.
+`ack-health` sets a separate `history_acknowledged` flag; it never erases that
+identity, acknowledges source data, resets retry budgets, or advances memory.
+
+### State publication implementation
+
+Migration and health files each use one fixed private replacement file, with
+4096-byte limits on both the current file and replacement. Their writer holds
+notifier ownership and validates any stale replacement before reuse. Publication
+flushes file data, atomically replaces the destination, synchronizes its parent
+directory, and requests a final file/device flush. An error after replacement
+has an unknown durable outcome and does not permit delivery by assumption.
+
+Platform support requests `F_FULLFSYNC` on macOS and reports failure rather than
+silently dropping that request. SQLite uses `synchronous=FULL` with `fullfsync=ON`
+and `checkpoint_fullfsync=ON`. These are synchronization requests, conditional on
+the filesystem and device honoring them; process-crash tests are not power-loss
+proof. See [Apple's fcntl documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
+and [SQLite's synchronization pragmas](https://www.sqlite.org/pragma.html#pragma_fullfsync).
+
+
+### Journal enumeration and crash recovery
+
+The journal stores `enumerated_through` separately from `scan_through`. Only a
+bounded source scan advances the enumeration boundary. A retained pointer seeded
+beyond that boundary cannot advance the scan checkpoint over ordinary messages
+that have not been enumerated. Completed seeded work stays bounded journal work
+until the scan reaches it, then folds into aggregate accounting.
+
+Exclusive locking is selected before the first schema read, including recovery
+of a retained WAL. Existing shared-memory or rollback-journal sidecars are refused
+and preserved; this owner does not adopt another SQLite locking policy. Process
+termination tests cover preparing, schema commit, ready publication, activation,
+attempt reservation, provider acceptance and result commit. They demonstrate
+restart accounting, not behavior under power loss.
+
+Journal errors have an exhaustive recovery policy. Capacity, configuration,
+operator recovery and invalid explicit retry requests do not become permanent
+worker storage faults. Invalid internal API transitions are internal faults.
+Malformed persisted identity or counters require recovery, without claiming the
+cause was a programming defect. Unknown codes are internal faults by construction.
+
+
+The source/journal worker now reconciles admitted identities before preparation
+and again before reservation. It reads at most 128 new source rows per cycle,
+counts ignored control frames once, and never opens its source writable. Source
+acknowledgement during provider I/O ends retry responsibility on the next cycle;
+it does not claim to cancel an already submitted notice. Status uses the worker's
+reserved admission while provider I/O runs outside that worker. These components
+are not yet connected to the notifier CLI, live provider adapters or subscriptions.
+Unseen sequence gaps are permitted: pointer coalescing and unbinding remove rows
+without acknowledgement. Missing previously admitted ordinary work above the
+known acknowledgement watermark remains an explicit source fault.

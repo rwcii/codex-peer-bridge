@@ -337,3 +337,26 @@ def participant_lock_dir():
     if DARWIN:
         return home / 'Library' / 'Application Support' / 'koinon-locks'
     return home / '.local' / 'state' / 'koinon-locks'
+
+
+def sync_state_file(fd):
+    """Flush one state file; request the stronger device flush on macOS.
+
+    Fail visibly if the platform cannot honor the requested flush. Filesystem and
+    device compliance remains an assumption, not a process-crash test result.
+    """
+    os.fsync(fd)
+    if DARWIN:
+        import fcntl
+        operation = getattr(fcntl, 'F_FULLFSYNC', None)
+        if operation is None:
+            raise OSError('full state synchronization is unavailable')
+        fcntl.fcntl(fd, operation)
+
+
+def sync_state_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
