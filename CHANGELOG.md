@@ -5,6 +5,9 @@ into a dated release section when promoted to `main`.
 
 ## Unreleased
 
+- Allow DeepSeek-only installations without a Codex executable. Validate Codex
+  after provider selection and preserve its saved executable on repeat installs.
+
 - Record outstanding usage-reporting requirements, provider defects, and remaining
   programme work in a repository delivery queue, with proposals marked separately.
 

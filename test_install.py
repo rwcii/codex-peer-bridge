@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -62,6 +64,106 @@ class InstallTests(unittest.TestCase):
             self.assertIn('test-thread',unit)
             self.assertIn('--codex',unit)
             self.assertFalse((root/'state').exists())
+
+    def isolated_command(self, root, *mode):
+        return [sys.executable, 'scripts/install.py', *mode, '--no-start',
+                '--prefix', str(root/'app'), '--state-dir', str(root/'state'),
+                '--unit-dir', str(root/'units'), '--codex-home', str(root/'codex'),
+                '--dsh-home', str(root/'dsh')]
+
+    def test_deepseek_only_install_and_repeat_without_codex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = dict(os.environ, PATH=str(root/'empty-path'))
+            command = self.isolated_command(root, '--configure-deepseek')
+            for _ in range(2):
+                result = subprocess.run(command, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = json.loads((root/'app/install.json').read_text())
+                self.assertEqual(config['participants'], ['deepseek'])
+                self.assertIsNone(config['codex'])
+                self.assertEqual(config['state_root'], str(root/'state'))
+                self.assertTrue((root/'dsh/AGENTS.md').exists())
+                self.assertFalse((root/'codex').exists())
+                self.assertFalse((root/'units').exists())
+
+    def test_codex_modes_refuse_missing_executable_before_writing(self):
+        modes = [('--configure-codex',), ('--configure-codex', '--configure-deepseek'),
+                 ('--thread', 'synthetic-thread'),
+                 ('--configure-deepseek', '--thread', 'synthetic-thread')]
+        for mode in modes:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                result = subprocess.run(self.isolated_command(root, *mode),
+                    env=dict(os.environ, PATH=str(root/'empty-path')),
+                    capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('executable absolute --codex', result.stderr)
+                self.assertEqual(list(root.iterdir()), [])
+
+    def test_deepseek_install_refuses_invalid_codex_and_codex_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = dict(os.environ, PATH=str(root/'empty-path'))
+            command = self.isolated_command(root, '--configure-deepseek')
+            failed = subprocess.run(command + ['--codex', 'relative'], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2)
+            self.assertEqual(list(root.iterdir()), [])
+            installed = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            before = (root/'app/install.json').read_bytes()
+            attempted = subprocess.run(self.isolated_command(root, '--configure-codex'),
+                                       env=env, capture_output=True, text=True)
+            self.assertEqual(attempted.returncode, 2)
+            self.assertEqual((root/'app/install.json').read_bytes(), before)
+            session_command = [sys.executable, str(root/'app/session.py'), 'ensure',
+                               '--agent', 'codex', '--thread', 'synthetic-thread']
+            refused = subprocess.run(session_command, env=env, capture_output=True, text=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn('Codex participant requires', refused.stdout + refused.stderr)
+            self.assertFalse((root/'state').exists())
+            import session
+            state = root/'state/sessions'/session.identity('synthetic-thread')
+            state.mkdir(parents=True, mode=0o700)
+            registration = state/'session.json'
+            registration.write_text(json.dumps(dict(thread='synthetic-thread', agent='codex',
+                                                    name='synthetic-peer', repo='/synthetic')))
+            before = registration.read_bytes()
+            refused = subprocess.run(session_command, env=env, capture_output=True, text=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn('Codex participant requires', refused.stdout + refused.stderr)
+            self.assertEqual(registration.read_bytes(), before)
+            self.assertFalse((root/'units').exists())
+            enabled = subprocess.run(self.isolated_command(root, '--configure-codex',
+                                    '--codex', sys.executable), env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+
+    def test_saved_codex_preserved_and_explicit_invalid_override_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = dict(os.environ, PATH=str(root/'empty-path'))
+            command = self.isolated_command(root, '--configure-codex', '--codex', sys.executable)
+            first = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            command = [sys.executable, 'scripts/install.py', '--configure-deepseek',
+                       '--prefix', str(root/'app'), '--no-start']
+            repeated = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            config_path = root/'app/install.json'
+            config = json.loads(config_path.read_text())
+            self.assertEqual(config['participants'], ['codex', 'deepseek'])
+            self.assertEqual(config['codex'], sys.executable)
+            self.assertEqual(config['state_root'], str(root/'state'))
+            self.assertEqual(config['unit_dir'], str(root/'units'))
+            self.assertEqual(config['dsh_home'], str(root/'dsh'))
+            before = config_path.read_bytes()
+            for invalid in (str(root/'missing'), str(root)):
+                failed = subprocess.run(command + ['--codex', invalid], env=env,
+                                        capture_output=True, text=True)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertEqual(config_path.read_bytes(), before)
 
     def test_uninstall_preserves_shared_locks_under_an_ancestor_state_root(self):
         with tempfile.TemporaryDirectory() as temp:

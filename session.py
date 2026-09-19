@@ -213,6 +213,15 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
                         child.wait()
 
 
+def validate_participant_executable(config, agent, action):
+    if agent == 'codex' and action in ('ensure', 'run'):
+        executable = config.get('codex')
+        if (not executable or not Path(executable).is_absolute()
+                or not Path(executable).is_file() or not os.access(executable, os.X_OK)):
+            raise ValueError('Codex participant requires an executable absolute Codex path; '
+                             'rerun install.py --configure-codex --codex PATH')
+
+
 def main():
     os.umask(0o077)
     p=argparse.ArgumentParser(description=__doc__)
@@ -242,6 +251,8 @@ def main():
     agent=a.agent or 'codex'
     model=a.model or (dsh_delivery.default_model() if agent=='deepseek' else None)
     state,name,key=details(prefix,config,a.thread,repo,agent,model)
+    if not (state/'session.json').exists():
+        validate_participant_executable(config, agent, a.action)
     private_dir(state)
     # Lock order: lifecycle, registration, then names (in save_registration).
     # Lifecycle protects start/stop/rename; registration protects saved identity.
@@ -263,8 +274,10 @@ def main():
             if a.action != 'rename':
                 repo=saved['repo']
         else:
+            validate_participant_executable(config, agent, a.action)
             saved=save_registration(state,Path(config['state_root']),a.thread,repo,agent=agent,model=model)
             name=saved['name']
+        validate_participant_executable(config, agent, a.action)
         active=bridge_status(prefix,state)
         observed=session_observation.lifecycle(state,active)
         if a.action=='rename':
