@@ -3,7 +3,7 @@
 User-visible changes to Koinon are recorded here. Unreleased entries move
 into a dated release section when promoted to `main`.
 
-## Unreleased
+## 2026-09-19 — Durable delivery and shared transport
 
 - Use Koinon defaults for new runtime paths, services and managed participant
   guidance. Reuse legacy paths and owned service names, preserve saved custom
