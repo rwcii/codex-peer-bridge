@@ -155,3 +155,12 @@ status-omission discovery fixture has not run: its shared-registry mutation was
 rejected by the reviewer's automatic approval layer. This remains a release gate,
 not a verified compatibility claim. No runtime upgrade has been performed for
 this feature.
+
+An offline check traced the actual daemon reader and `listLivePeerSessions` path
+in Claude 2.1.276. Extracted parser and listing functions accepted both an
+in-memory daemon record with `idle` and one with status omitted. Liveness and
+socket reachability were supplied by synthetic stubs; no registry files, processes,
+native CLI instances or model sessions were created. The extracted function set
+had SHA-256 `67781457284b87697cde91432429ac5aec7b97fdd6937ef585b12df57a08379a`.
+This establishes parser/filter acceptance, not end-to-end native discovery. The
+live gate remains open. Vendor implementation text is not included in this repository.
