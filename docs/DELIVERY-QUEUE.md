@@ -90,6 +90,12 @@ Acquisition evidence from the design conference:
 - Keep only field names and sanitized findings in repository documentation. Private
   session paths, identifiers, contents, and actual runtime counts stay outside it.
 
+- The reviewer found repeated Claude message IDs carrying growing streaming usage
+  updates and withdrew its earlier sum of all usage rows. Deduplicate within the
+  selected provider/session/response identity. The last observed update is not
+  necessarily final during an active response; establish completion or label the
+  report provisional and define how later updates replace it.
+
 Reference reconciliation still required:
 
 - Unify-messaging's `.claude/skills/provenance/SKILL.md` and
@@ -109,6 +115,12 @@ Reference reconciliation still required:
   sandbox. Preserve existing permissions and never scan unrelated sessions by default.
 - Best-effort capture does not waive validation of local records or permit missing
   values to become measured zeros. Report coverage separately from valid counts.
+- Recommend disjoint ordinary-input, cache-read, and cache-write categories for
+  compatibility with the reference, retaining native measurements for reconciliation.
+  Codex subtraction is checked only for observed zero-cache-write records; nonzero
+  cache-write inclusion and category disjointness still need evidence. Inclusive input
+  with separately retained cache subsets is also reversible when their relationships
+  are known; the choice is compatibility, not loss of information by definition.
 
 **Open design decision:** reporting convention versus bridge protocol support.
 No wire-format change is approved by this queue. First inspect the reference
