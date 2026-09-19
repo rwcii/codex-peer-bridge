@@ -187,13 +187,11 @@ def main():
     p.add_argument('--prefix', type=Path)
     p.add_argument('--state-dir', type=Path)
     p.add_argument('--unit-dir', type=Path)
-    p.add_argument('--codex', default=shutil.which('codex'))
+    p.add_argument('--codex')
     p.add_argument('--no-start', action='store_true', help='write files and units without calling systemctl')
     a = p.parse_args()
     if not platform_support.SUPPORTED or sys.version_info < (3,11):
         p.error('Linux or macOS with Python 3.11+ is required')
-    if not a.codex or not Path(a.codex).is_absolute() or not os.access(a.codex,os.X_OK):
-        p.error('provide an executable absolute --codex path, or install Codex CLI on PATH')
     a.prefix = (a.prefix or runtime_names.default_prefix()).expanduser().resolve()
     config_path = a.prefix / 'install.json'
     previous = runtime_names.install_config(a.prefix)
@@ -201,14 +199,25 @@ def main():
     a.unit_dir = Path(a.unit_dir or previous.get('unit_dir') or Path.home()/'.config/systemd/user').expanduser().resolve()
     if not a.thread and not (a.configure_codex or a.configure_deepseek):
         p.error('--thread, --configure-codex or --configure-deepseek is required')
+    participants = set(previous.get('participants', ['codex'] if previous else []))
+    participants.update(name for name, chosen in (('codex', a.configure_codex),
+                                                  ('deepseek', a.configure_deepseek)) if chosen)
+    explicit_codex = a.codex is not None
+    saved_codex = previous.get('codex')
+    saved_codex_usable = (saved_codex and Path(saved_codex).is_absolute()
+                          and Path(saved_codex).is_file() and os.access(saved_codex, os.X_OK))
+    if not explicit_codex:
+        a.codex = saved_codex if saved_codex_usable else shutil.which('codex')
+    # --thread starts a Codex session even when only DeepSeek guidance is selected.
+    if explicit_codex or a.thread or 'codex' in participants:
+        if (not a.codex or not Path(a.codex).is_absolute()
+                or not Path(a.codex).is_file() or not os.access(a.codex, os.X_OK)):
+            p.error('provide an executable absolute --codex path, or install Codex CLI on PATH')
     if a.configure_codex or a.configure_deepseek:
         a.codex_home = a.codex_home or Path(previous.get('codex_home') or
                                           os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
         a.dsh_home = a.dsh_home or Path(previous.get('dsh_home') or
                                       os.environ.get('DSH_HOME', str(Path.home()/'.dsh')))
-        participants = set(previous.get('participants', ['codex'] if previous else []))
-        participants.update(name for name, chosen in (('codex', a.configure_codex),
-                                                      ('deepseek', a.configure_deepseek)) if chosen)
         os.umask(0o077)
         a.prefix.mkdir(parents=True,exist_ok=True)
         source = Path(__file__).resolve().parent.parent

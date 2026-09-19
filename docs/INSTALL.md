@@ -41,6 +41,10 @@ must run under the same OS user. Verify `codex queue --help` and `python3 --vers
 
 A DeepSeek (DSH) participant needs no Codex CLI. It needs the running harness, which
 exports `DSH_HOME`, `DSH_SESSION_ID` and `DSH_WEB_URL` to a session's shell.
+`--configure-deepseek` alone does not require Codex. Installations with a saved or
+selected Codex participant, and explicit `--thread` mode, still require it.
+The executable selection order is explicit `--codex`, a saved installation value
+that is still an executable file, then Codex on `PATH`; an invalid selected executable fails before files are written.
 
 On macOS the system `python3` is often 3.9, which is below the floor; use a 3.11+
 interpreter explicitly, for example `python3.12`.
@@ -305,7 +309,10 @@ older runtime during an upgrade.
 ## Paths and options
 
 `--prefix`, `--state-dir`, `--unit-dir`, `--codex-home`, and an absolute `--codex` path
-support customized installations. In Codex-wide mode, `--state-dir` is the root for
+support customized installations. An explicit invalid `--codex` is refused even in
+DeepSeek-only mode. To add Codex later, rerun with `--configure-codex` and a valid
+executable; `session.py ensure` and `run` refuse Codex startup without one.
+In Codex-wide mode, `--state-dir` is the root for
 all per-thread directories. Installed `install.json` records these private local paths;
 do not commit it. `--no-start` with `--configure-codex` installs files/guidance without
 registering a thread. It still edits the selected Codex instructions; use temporary
