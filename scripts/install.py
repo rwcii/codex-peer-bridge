@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import shlex
 import subprocess
 import sys
 
@@ -90,14 +89,56 @@ def unit_arguments(path):
               if line.startswith('ExecStart=')]
     if len(starts) != 1:
         raise ValueError(f'expected one managed service command: {path}')
-    return shlex.split(starts[0])
+    # The renderer uses JSON-quoted string literals. Shell parsing does not
+    # decode escapes such as \t the same way and can misidentify an owned unit.
+    text, arguments, offset = starts[0], [], 0
+    decoder = json.JSONDecoder()
+    while offset < len(text):
+        if text[offset].isspace():
+            offset += 1
+            continue
+        if text[offset] == '"':
+            value, end = decoder.raw_decode(text, offset)
+            if end < len(text) and not text[end].isspace():
+                raise ValueError(f'ambiguous managed service argument: {path}')
+        else:
+            end = offset
+            while end < len(text) and not text[end].isspace():
+                end += 1
+            value = text[offset:end]
+            if any(char in value for char in ('"', "'", '\\')):
+                raise ValueError(f'unsupported managed service quoting: {path}')
+        arguments.append(value)
+        offset = end
+    return arguments
+
+
+def unit_literal(value, path):
+    """Decode only literal systemd escaping, never a variable or specifier."""
+    result = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char in ('%', '$'):
+            if index + 1 == len(value) or value[index + 1] != char:
+                raise ValueError(f'managed unit contains a variable or specifier: {path}')
+            index += 1
+        result.append(char)
+        index += 1
+    return ''.join(result)
 
 
 def unit_targets_prefix(path, prefix):
     executable = 'session.py' if '-session-' in path.name else ('notify.py' if '-notify.' in path.name else 'bridge.py')
-    expected = str(Path(prefix) / executable).replace('%', '%%').replace('$', '$$')
     arguments = unit_arguments(path)
-    return len(arguments) > 1 and arguments[1] == expected
+    if len(arguments) < 2:
+        raise ValueError(f'managed service executable cannot be determined: {path}')
+    supplied = Path(unit_literal(arguments[1], path))
+    if not supplied.is_absolute():
+        raise ValueError(f'managed service executable is not absolute: {path}')
+    # These are installation files, not peer socket addresses. macOS aliases
+    # and explicit directory symlinks must identify the same installed script.
+    return supplied.resolve() == (Path(prefix) / executable).resolve()
 
 
 def saved_unit_option(path, flag):
@@ -109,7 +150,7 @@ def saved_unit_option(path, flag):
     index = arguments.index(flag) + 1
     if index >= len(arguments):
         raise ValueError(f'missing {flag} value in managed service: {path}')
-    return arguments[index].replace('%%', '%').replace('$$', '$')
+    return unit_literal(arguments[index], path)
 
 
 def active_units(unit_dir, names=SERVICES, prefix=None):

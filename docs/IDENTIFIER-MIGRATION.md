@@ -37,6 +37,14 @@ unrelated units. A file with a recognized marker is not authority to replace a
 unit that belongs to a different installation prefix. Uninstall recognizes both
 unit families and both managed markers. It removes only units owned by the
 selected prefix, while preserving other installations, state and lock inodes.
+Unit executable paths are compared as canonical filesystem paths after literal
+systemd decoding. Managed quoted arguments use the same string decoder as the
+installer renderer, including escaped path characters. Variables, specifiers and
+ambiguous quoting refuse rather than being expanded. A missing, relative or
+unresolvable executable is an ownership refusal, not evidence of another
+installation. Directory aliases identify
+the same installation. This does not
+change the literal-path rule for peer socket addresses and key lookup.
 
 ## Managed participant guidance
 

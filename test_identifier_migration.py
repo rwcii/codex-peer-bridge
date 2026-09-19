@@ -22,7 +22,7 @@ class IdentifierMigrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.env = dict(os.environ, HOME=str(self.root/'home'), XDG_STATE_HOME=str(self.root/'state-base'))
 
     def install(self, *args):
@@ -240,15 +240,21 @@ class IdentifierMigrationTests(unittest.TestCase):
         runtime.write_text('preserved runtime')
         unit = units/'koinon-bridge.service'
         unit.write_text('[Service]\nExecStart="/python" ' + install.unit_arg(str(runtime)) + '\n')
-        before = unit.read_bytes()
-        with mock.patch.object(sys, 'argv', ['uninstall.py', '--prefix', str(app)]), \
-             mock.patch.object(uninstaller.subprocess, 'run') as run:
-            with self.assertRaises(ValueError):
-                uninstaller.main()
-            run.assert_not_called()
-        self.assertEqual(runtime.read_text(), 'preserved runtime')
-        self.assertEqual(unit.read_bytes(), before)
-        self.assertTrue(config.exists())
+        examples = (unit.read_text(),
+                    '# Managed by koinon\n[Service]\nExecStart="/python" "bridge.py"\nWorkingDirectory=' + str(app) + '\n',
+                    '# Managed by koinon\n[Service]\nExecStart="/python"\n')
+        for content in examples:
+            unit.write_text(content)
+            before = unit.read_bytes()
+            with self.subTest(content=content), \
+                 mock.patch.object(sys, 'argv', ['uninstall.py', '--prefix', str(app)]), \
+                 mock.patch.object(uninstaller.subprocess, 'run') as run:
+                with self.assertRaises(ValueError):
+                    uninstaller.main()
+                run.assert_not_called()
+            self.assertEqual(runtime.read_text(), 'preserved runtime')
+            self.assertEqual(unit.read_bytes(), before)
+            self.assertTrue(config.exists())
 
     def test_installed_fixed_service_installer_can_repeat_without_copying_onto_itself(self):
         app, units, state = self.root/'app', self.root/'units', self.root/'state'
@@ -267,3 +273,97 @@ class IdentifierMigrationTests(unittest.TestCase):
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertEqual({p.name:p.read_bytes() for p in units.iterdir()}, before)
         self.assertEqual(retained.stat().st_ino, inode)
+
+    def test_unit_ownership_accepts_directory_aliases_but_not_other_installations(self):
+        real = self.root/'real %install $value'
+        real.mkdir()
+        alias = self.root/'alias %install $value'
+        alias.symlink_to(real, target_is_directory=True)
+        units = self.root/'units'
+        units.mkdir()
+        for old in (False, True):
+            for instance in (None, 'a'*16):
+                rendered = install.units(alias, self.root/'state', 'synthetic', 'peer', '/repo',
+                                         sys.executable, sys.executable, instance=instance, legacy=old)
+                for name, content in rendered.items():
+                    with self.subTest(name=name):
+                        path = units/name
+                        path.write_text(content)
+                        install.check_owned_unit(path, real)
+                        self.assertTrue(install.unit_targets_prefix(path, alias))
+                        with self.assertRaises(ValueError):
+                            install.check_owned_unit(path, self.root/'unrelated')
+
+    def test_systemd_literals_decode_without_accepting_variables_or_specifiers(self):
+        path = self.root/'synthetic.service'
+        self.assertEqual(install.unit_literal('/literal/%%x/$$value', path), '/literal/%x/$value')
+        for text in ('/variable/$HOME/app', '/specifier/%h/app', '/truncated/%', '/truncated/$'):
+            with self.subTest(text=text), self.assertRaises(ValueError) as raised:
+                install.unit_literal(text, path)
+            self.assertIn(str(path), str(raised.exception))
+        path = self.root/'koinon-notify.service'
+        path.write_text('# Managed by koinon\n[Service]\nExecStart="/python" "$HOME/notify.py" "--repo" "%h/repo"\n')
+        for operation in (lambda: install.unit_targets_prefix(path, self.root),
+                          lambda: install.saved_unit_option(path, '--repo')):
+            with self.assertRaises(ValueError) as raised:
+                operation()
+            self.assertIn(str(path), str(raised.exception))
+
+
+    def test_uninstall_removes_owned_alias_unit_and_preserves_state(self):
+        import importlib.util
+        with mock.patch.object(sys, 'path', [str(Path('scripts').resolve()), *sys.path]):
+            spec = importlib.util.spec_from_file_location('alias_uninstall', 'scripts/uninstall.py')
+            uninstaller = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(uninstaller)
+        app, units, state = self.root/'real', self.root/'units', self.root/'state'
+        for path in (app, units, state):
+            path.mkdir()
+        alias = self.root/'alias'
+        alias.symlink_to(app, target_is_directory=True)
+        (app/'install.json').write_text(json.dumps(dict(state_root=str(state), unit_dir=str(units), participants=[])))
+        lock = state/'preserved.lock'
+        lock.touch()
+        inode = lock.stat().st_ino
+        rendered = install.units(alias, state, 'synthetic', 'peer', '/repo', sys.executable,
+                                 sys.executable, legacy=True)
+        for name, content in rendered.items():
+            (units/name).write_text(content)
+        with mock.patch.object(sys, 'argv', ['uninstall.py', '--prefix', str(app)]), \
+             mock.patch.object(uninstaller.subprocess, 'run') as run, redirect_stdout(io.StringIO()):
+            uninstaller.main()
+        self.assertEqual(set(run.call_args_list[0].args[0][4:]), set(rendered))
+        self.assertEqual(list(units.iterdir()), [])
+        self.assertEqual(lock.stat().st_ino, inode)
+        self.assertTrue(alias.is_symlink())
+
+    def test_upgrade_reuses_unit_from_aliased_prefix(self):
+        app, units = self.root/'real', self.root/'units'
+        app.mkdir()
+        units.mkdir()
+        alias = self.root/'alias'
+        alias.symlink_to(app, target_is_directory=True)
+        rendered = install.units(alias, self.root/'state', 'synthetic-thread', 'kept-peer', '/kept-repo',
+                                 sys.executable, sys.executable, legacy=True)
+        for name, content in rendered.items():
+            (units/name).write_text(content)
+        result = self.install('--thread', 'synthetic-thread', '--prefix', app,
+                              '--state-dir', self.root/'state', '--unit-dir', units)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({p.name for p in units.iterdir()}, set(rendered))
+        self.assertEqual(install.saved_unit_option(units/'codex-peer-notify.service', '--name'), 'kept-peer')
+
+    def test_renderer_quoted_path_escapes_decode_to_the_actual_owned_file(self):
+        app = self.root/'literal "quote" \\backslash\ttab'
+        app.mkdir()
+        path = self.root/'koinon-notify.service'
+        rendered = install.units(app, self.root/'state', 'synthetic-thread', 'literal\tname',
+                                 '/repo', sys.executable, sys.executable)
+        path.write_text(rendered[path.name])
+        self.assertEqual(install.unit_arguments(path)[1], str(app/'notify.py'))
+        install.check_owned_unit(path, app)
+        self.assertEqual(install.saved_unit_option(path, '--name'), 'literal\tname')
+        for command in ('"/python""/app/notify.py"', "/python '/app/notify.py'", '/python /app/notify\\.py'):
+            path.write_text('# Managed by koinon\n[Service]\nExecStart=' + command + '\n')
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                install.unit_arguments(path)
