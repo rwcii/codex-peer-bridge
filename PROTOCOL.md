@@ -190,8 +190,10 @@ rather than by a row count, because a row limit multiplied by the maximum body s
 frame.
 
 Sequence numbers come from a durable head that only ever advances. Reclaiming entries moves a
-floor rather than the head, and a consumer below the floor is returned to a fresh snapshot rather
-than handed a gap.
+retained-history floor rather than the head, and a consumer below the floor is returned to a
+fresh snapshot rather than handed a gap. The protocol field remains `floor`. This is a history
+availability boundary; it does not imply summarization. A snapshot contains stored records,
+not a generated summary.
 
 ## Limitations
 

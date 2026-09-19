@@ -509,7 +509,7 @@ reuse of one key with different content is rejected rather than silently accepte
 
 ### Cursors, snapshots, and acknowledgement
 
-A first sync, or a cursor below the compaction floor, enters a snapshot. The snapshot is taken against
+A first sync, or a cursor below the retained-history floor, enters a snapshot. The snapshot is taken against
 a fixed durable head `H`. The reader pages through the whole snapshot, acknowledges that snapshot, and
 only then consumes deltas after `H`. **The page token is not the event cursor**, and finishing one page
 does not advance progress. Snapshot versions are retained for a bounded period.
@@ -548,10 +548,32 @@ so `auth/` conflicts with `auth/session.py`. A lease carries an ownership genera
 explicitly by its owner. An unrelated read by the owner does not extend a claim the owner has
 forgotten.
 
+### Memory maintenance terminology
+
+Use these terms consistently; they describe different operations:
+
+| Term | Meaning |
+| --- | --- |
+| Garbage collection | Remove expired entries and obsolete bookkeeping after their retention requirements are met. |
+| History pruning | Remove historical entries or revisions that the retention policy no longer requires. Preserve current knowledge and the recovery path for readers that missed the removed history. |
+| Memory consolidation | Synthesize related memories into a smaller semantic representation, preserving decisions, exceptions, provenance, and links to supporting records. This requires a separate design; it is not implemented or specified by this programme. |
+| Storage reclamation | Recover storage occupied by removed data. This describes the storage effect, not a decision about which knowledge to retain. |
+| Retained-history floor | The sequence boundary below which incremental synchronization is no longer complete. A reader below it must obtain a snapshot. This is the existing protocol's `floor`, not a new field. |
+
+Earlier descriptions called history pruning "compaction". That wording did not specify
+summarization. Use the precise terms above instead of the unqualified word "compaction".
+A sync snapshot is a consistent selection of records, not a generated summary. SQLite
+checkpointing and incremental vacuum are storage maintenance, not memory consolidation.
+Cross-repository consolidation also requires separate design and validation.
+
+The current service implements expiry-based garbage collection and storage reclamation.
+Stage 6 adds the remaining history-pruning policy and recovery checks. This terminology
+correction does not authorize deleting additional records or change retention requirements.
+
 ### Retention and capacity
 
 Per-entry, total storage, and active-entry limits are defined and enforced from the first memory
-stage. Live directives survive ordinary compaction. That is a retention rule and not an exemption
+stage. Live directives survive ordinary history pruning. That is a retention rule and not an exemption
 from limits: when safe reclamation cannot free enough space, a new write is refused with an
 explicit capacity error and stored data is preserved. Capacity is reserved for bounded revocation
 and control records, so a full store can still record a withdrawal. The service never promises
@@ -710,7 +732,7 @@ Required coverage:
   duplicate work and that deduplication state survives an inbox acknowledgement.
 - Stale presence, disconnection, and an approval wait.
 - Unsupported provider capability, reported explicitly rather than silently ignored.
-- Snapshot pagination during concurrent compaction, an expired snapshot, and a crash before
+- Snapshot pagination during concurrent history pruning, an expired snapshot, and a crash before
   acknowledgement that correctly replays.
 - Idempotent `note`, including rejection of one key reused with a different payload.
 - Concurrent revisions of one entry, proving no silent loss.
@@ -733,12 +755,12 @@ live agent session by default. One driver writes at a time.
 2. Controlled capability checks, then closure of the open contract points with measured facts.
 3. Pull-only repository memory, including lifecycle and failure recovery. Scope, provenance, stable
    consumer identity, explicit cursor acknowledgement, stable pagination, size limits, and safe
-   capacity failure are enforced from this stage; compaction is added later without changing them.
+   capacity failure are enforced from this stage; history pruning is added later without changing them.
 4. Shared transport extracted against both consumers, then bus registration, scoped subscriptions,
    coalesced pointers, and an event wake with durable catch-up. Extraction happens when the second
    consumer exists and its requirements are known, so the abstraction fits both rather than one.
 5. Provider presence, priority declaration, and delivery receipts.
-6. Remaining claims, compaction, and content checks.
+6. Remaining claims, history pruning, and content checks.
 
 Stage size does not determine correctness. A small change is acceptable when it meets a complete
 contract, preserves compatibility, and includes failure recovery. A stage must not leave a known defect

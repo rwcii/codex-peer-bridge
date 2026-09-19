@@ -3,6 +3,16 @@
 User-visible changes to Koinon are recorded here. Unreleased entries move
 into a dated release section when promoted to `main`.
 
+## Unreleased
+
+- Record outstanding usage-reporting requirements, provider defects, and remaining
+  programme work in a repository delivery queue, with proposals marked separately.
+
+- Clarify memory maintenance terminology: expiry-based garbage collection, history
+  pruning, and storage reclamation are distinct from semantic memory consolidation.
+  The planned history-pruning work does not specify summarization. No runtime behavior
+  or retention policy changes.
+
 ## 2026-09-19 — Durable delivery and shared transport
 
 - Use Koinon defaults for new runtime paths, services and managed participant
@@ -110,7 +120,7 @@ into a dated release section when promoted to `main`.
   says which answered. Start is
   serialized, and a socket left by an unclean exit is recovered only after its recorded owner is
   proved dead. Entries are reported data and grant no authority. There is no bus integration and
-  no compaction in this form.
+  no broader history pruning or semantic memory consolidation in this form.
 - `docs/STORAGE-BOUND-DERIVATION.md`, the derivation of the storage bound the memory service
   enforces, with its terms traced to the SQLite sources at a pinned tag. It records why the log
   a single transaction can produce is finite, why the shared-memory and sub-journal files do not

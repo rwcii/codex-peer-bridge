@@ -217,8 +217,11 @@ Limits: 8 KiB per body, 5,000 entries, 32 MiB logical and 128 MiB physical stora
 and pages bounded by encoded bytes rather than a row count. Entry slots and bytes are both
 reserved so a withdrawal stays recordable in a full store. Retained snapshots, acknowledgements,
 idempotency keys and idle consumers each have a lifetime, and expiry returns a defined recovery
-result rather than changing a caller's meaning silently. There is no bus integration and no
-compaction in this form; entries are removed only once expired.
+result rather than changing a caller's meaning silently. Entry garbage collection currently
+removes only expired entries. Broader history pruning remains planned; semantic memory
+consolidation (summarizing related memories) is neither implemented nor specified by this
+programme. Sync snapshots contain records, not generated summaries. See the
+[memory maintenance terminology](docs/PARITY-MEMORY-DESIGN.md#memory-maintenance-terminology).
 
 Bridge and memory database operations use dedicated worker threads with bounded queues.
 Status and stop have separate admission capacity when ordinary requests fill their slots.
@@ -355,3 +358,6 @@ Local bridge and memory subscriptions carry hints only. The notifier reads durab
 state before reserving journal work and calling a provider. See the
 [subscription protocol](PROTOCOL.md#change-subscriptions) and
 [upgrade and recovery procedure](docs/NOTIFIER.md).
+
+Outstanding requirements, confirmed defects, and proposals are recorded in the
+[delivery queue](docs/DELIVERY-QUEUE.md).
