@@ -22,7 +22,9 @@ a defect in review:
   are recorded here, never inferred from a number the caller supplies.
 """
 import argparse
+import runtime_names
 import asyncio
+import subscriptions
 import contextlib
 import fcntl
 import hashlib
@@ -37,11 +39,15 @@ import subprocess
 import time
 import uuid
 
-from bridge import LIMIT, credentials, encode, private_dir
+from database_worker import DatabaseWorker, CapacityError, WorkerFailure
+from service_runtime import Admission, close_writer, drain_handlers, database_status, HANDSHAKE_TIMEOUT
+from peer_transport import LIMIT, credentials, encode, private_dir
 import platform_support
+from peer_transport import control_exchange as transport_exchange, service_path, NoControlReply, UnsafeServiceEndpoint
 
 PROTOCOL = 1
-SCHEMA = 3
+SCHEMA = 4
+VERIFY_TIMEOUT = 5
 
 # One statement per element. `executescript` runs a script in autocommit mode, so these
 # would be one separately committed transaction each: a mid-script failure left the earlier
@@ -203,12 +209,41 @@ SNAPSHOT_ORDER = {'directive': 0, 'decision': 1, 'gotcha': 2, 'handoff': 3, 'fin
 SNAPSHOT_TAIL = {'finding': 25, 'handoff': 25, 'status': 10}
 
 
+# Chained recovery errors must explicitly declare whether their cause is a database
+# fault. Contention, ordinary capacity and configuration refusals are not worker faults.
+CHAINED_DATABASE_FAULTS = {
+    'write_failed': 'storage_error',
+    'storage_blocked': 'storage_error',
+    'repo_unresolved': None,
+    'store_busy': None,
+    'capacity': None,
+    'incompatible_store': None,
+    'socket_in_use': None,
+}
+
+
 class MemoryError_(ValueError):
     """A request the service refuses. `code` names the recovery path."""
 
     def __init__(self, code, detail):
         super().__init__(f'{code}: {detail}')
         self.code, self.detail = code, detail
+
+    @property
+    def database_fault(self):
+        # These recovery errors wrap actual storage failures. Preserve their recovery
+        # codes while keeping the owning worker's observation complete.
+        if isinstance(self.__cause__, sqlite3.ProgrammingError):
+            return 'internal_error'
+        return CHAINED_DATABASE_FAULTS.get(self.code)
+
+
+def private_state_dir(path):
+    try:
+        private_dir(path)
+    except (ValueError, PermissionError, FileExistsError, NotADirectoryError):
+        raise MemoryError_('unsafe_state_directory',
+                           'the state directory must be a private directory owned by this user') from None
 
 
 def repo_identity(start=None):
@@ -275,6 +310,7 @@ class Store:
     def __init__(self, path, repo, fts=None):
         self.repo, self.path = repo, path
         self.expired_at = 0.0
+        self.on_change = None
         # Autocommit, with every transaction opened explicitly below. The driver starts an
         # implicit transaction only for INSERT, UPDATE, DELETE and REPLACE, so DDL ran in
         # autocommit however it was wrapped, and the schema stayed several transactions.
@@ -299,8 +335,13 @@ class Store:
                     for statement in SCHEMA_STATEMENTS:
                         self.db.execute(statement)
                     for key, value in (('repo', repo), ('protocol', PROTOCOL),
-                                       ('schema', SCHEMA), ('head', 0), ('floor', 0)):
+                                       ('schema', SCHEMA), ('head', 0), ('floor', 0),
+                                       ('store_id', uuid.uuid4().hex)):
                         self.set_meta(key, value)
+            elif int(self.meta('schema')) == 3:
+                with self.transaction(control=True):
+                    self.set_meta('store_id', uuid.uuid4().hex)
+                    self.set_meta('schema', SCHEMA)
             self.fts = False if fts is False else self._open_fts()
             self._reconcile_index()
         except sqlite3.Error as exc:
@@ -419,9 +460,13 @@ class Store:
         self.require_writable()
         self.reset_log()
         self.db.execute('BEGIN IMMEDIATE')
+        callback = getattr(self, 'on_change', None)
+        changed = False
         try:
+            previous = self.head() if callback is not None else None
             yield
             self.enforce_pages(control)
+            changed = callback is not None and self.head() != previous
             self.db.execute('COMMIT')
         except BaseException as exc:
             # The rollback comes first and unconditionally, so no path can leave a
@@ -440,6 +485,8 @@ class Store:
                     f'the engine refused a page at the {MAX_PAGES} page ceiling; the '
                     'transaction was rolled back and stored data is intact') from exc
             raise
+        if changed:
+            callback()
 
     def block(self, reason):
         """Record that writes cannot proceed until recovery is asked for explicitly.
@@ -691,7 +738,7 @@ class Store:
                                'was left untouched') from exc
         if rows.get('repo') != repo:
             raise MemoryError_('wrong_repository',
-                               'state directory belongs to another repository; it was left '
+                                       'state directory belongs to another repository; it was left '
                                'untouched')
         for key, current in (('schema', SCHEMA), ('protocol', PROTOCOL)):
             found = int(rows.get(key) or 0)
@@ -700,10 +747,18 @@ class Store:
                                    f'this store declares {key} {found}; this runtime supports '
                                    f'{current}. Upgrade the runtime rather than downgrading the '
                                    'store. Nothing was written')
-            if found < current:
+            if found < current and not (key == 'schema' and found == 3):
                 raise MemoryError_('schema_too_old',
                                    f'this store declares {key} {found}; this runtime expects '
                                    f'{current} and has no migration for it. Nothing was written')
+
+        store_id = self.meta('store_id')
+        if int(rows['schema']) == 3:
+            if store_id is not None:
+                raise MemoryError_('incompatible_store', 'legacy store has unexpected identity metadata')
+        elif (not isinstance(store_id, str) or len(store_id) != 32
+              or any(c not in '0123456789abcdef' for c in store_id)):
+            raise MemoryError_('incompatible_store', 'store identity is missing or invalid; it was left untouched')
 
     # --- schema helpers -------------------------------------------------------
 
@@ -1319,54 +1374,37 @@ def freeze(store, consumer):
     return sid
 
 
-class Service:
-    def __init__(self, root, repo, store):
+def validate_target(request, repo, generation):
+    # Optional for legacy callers. Exact-root clients require the advertised guard
+    # and send both fields; validate before any database maintenance or mutation.
+    if 'repo' not in request and 'generation' not in request:
+        return
+    if request.get('repo') != repo:
+        raise MemoryError_('wrong_repository', 'this service serves another repository')
+    if request.get('generation') != generation:
+        raise MemoryError_('not_this_instance', 'the requested service instance has changed')
+
+
+def stop_result(r, repo, generation):
+    """Validate the exact instance at the point of action, without database access."""
+    if r.get('repo') != repo:
+        raise MemoryError_('wrong_repository',
+                           'this service serves another repository')
+    if r.get('generation') != generation:
+        raise MemoryError_('not_this_instance',
+                           'this endpoint is served by a different instance than the one '
+                           'you asked to stop; it is still running')
+    return dict(stopping=True, generation=generation)
+
+
+class MemoryCommands:
+    """Synchronous protocol operations owned by the database thread."""
+    def __init__(self, root, repo, store, generation=None):
         self.root, self.repo, self.store = Path(root), repo, store
-        self.stop = asyncio.Event()
-        self.generation = uuid.uuid4().hex
-        self.active = 0
-        self.tasks = set()
-        self.idle = asyncio.Event()
-        self.idle.set()
+        self.generation = generation or uuid.uuid4().hex
 
-    # --- connection handling --------------------------------------------------
-
-    async def handle(self, reader, writer):
-        if self.active >= 16:
-            writer.close()
-            return
-        self.active += 1
-        self.idle.clear()
-        task = asyncio.current_task()
-        self.tasks.add(task)
-        try:
-            pid = credentials(writer.get_extra_info('socket'))
-            async with asyncio.timeout(10):
-                request = json.loads(await reader.readline())
-                reply = dict(ok=True, result=self.command(request, pid))
-                if CRASH_AFTER_COMMIT and request.get('op') == 'note':
-                    os._exit(70)
-                if REPLY_DELAY and request.get('op') == 'note':
-                    await asyncio.sleep(REPLY_DELAY)
-        except MemoryError_ as exc:
-            reply = dict(ok=False, code=exc.code, error=str(exc))
-        except (ValueError, KeyError, TypeError, OSError, TimeoutError, sqlite3.Error) as exc:
-            reply = dict(ok=False, code='rejected', error=type(exc).__name__)
-        try:
-            writer.write(encode(reply))
-            await asyncio.wait_for(writer.drain(), 10)
-        except (OSError, ValueError, TimeoutError, asyncio.TimeoutError):
-            pass
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
-            self.tasks.discard(task)
-            self.active -= 1
-            if not self.active:
-                self.idle.set()
+    def close(self):
+        self.store.close()
 
     def consumer(self, r):
         """Stable consumer identity, supplied by the caller, never trusted as authority.
@@ -1386,14 +1424,15 @@ class Service:
     READ_ONLY = ('hello', 'status', 'recall', 'stop', 'recover')
 
     def command(self, r, pid):
+        validate_target(r, self.repo, self.generation)
         op = r.get('op')
         if op not in self.READ_ONLY:
             self.store.maybe_expire()
         if op == 'recover':
             return self.store.recover()
         if op == 'hello':
-            return dict(service='codex-peer-memory', repo=self.repo, protocol=PROTOCOL,
-                        schema=SCHEMA, generation=self.generation, pid=os.getpid(),
+            return dict(service=runtime_names.MEMORY_SERVICE, repo=self.repo, protocol=PROTOCOL,
+                        schema=SCHEMA, store_id=self.store.meta('store_id'), generation=self.generation, pid=os.getpid(),
                         healthy=self.store.healthy(), fts=self.store.fts,
                         indexed=self.store.index_usable(), blocked=self.store.blocked)
         if op == 'note':
@@ -1412,19 +1451,7 @@ class Service:
         if op == 'status':
             return self.status(r)
         if op == 'stop':
-            # Validate the target here, at the point of action. Deciding which instance
-            # to stop from a record read beforehand is a race: a successor can replace
-            # the endpoint between that read and this connection, and an unqualified
-            # request would then stop the wrong service.
-            if r.get('repo') != self.repo:
-                raise MemoryError_('wrong_repository',
-                                   'this service serves another repository')
-            if r.get('generation') != self.generation:
-                raise MemoryError_('not_this_instance',
-                                   'this endpoint is served by a different instance than the one '
-                                   'you asked to stop; it is still running')
-            self.stop.set()
-            return dict(stopping=True, generation=self.generation)
+            return stop_result(r, self.repo, self.generation)
         raise MemoryError_('invalid_request', f'unknown operation: {op}')
 
     # --- protocol state -------------------------------------------------------
@@ -1652,7 +1679,7 @@ class Service:
         # response grows past its frame while the count still looks safe.
         consumers, truncated = bounded((len(encode(x)), x) for x in listed)
         more = truncated or (beyond and len(consumers) == len(listed))
-        return dict(repo=self.repo, protocol=PROTOCOL, schema=SCHEMA, generation=self.generation,
+        return dict(repo=self.repo, protocol=PROTOCOL, schema=SCHEMA, store_id=self.store.meta('store_id'), generation=self.generation,
                     head=head, floor=self.store.floor(), healthy=self.store.healthy(),
                     fts=self.store.fts, usage=use,
                     # A blocked store still answers status; that is the point of blocking
@@ -1671,31 +1698,129 @@ class Service:
                     consumers=consumers, more=more,
                     next_after=consumers[-1]['consumer'] if consumers and more else None)
 
-    async def run(self, sock):
-        server = await asyncio.start_unix_server(self.handle, sock=sock, limit=LIMIT)
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, self.stop.set)
-            except (NotImplementedError, ValueError):
-                pass
-        print(json.dumps(self.status()), flush=True)
+
+
+class Service:
+    """Socket controller; all SQLite work belongs to the dedicated worker."""
+    def __init__(self, root, repo, store_factory):
+        self.root, self.repo = Path(root), repo
+        self.generation = uuid.uuid4().hex
+        self.hints = subscriptions.HintHub(self.generation)
+        self.stop = asyncio.Event()
+        self.tasks = set()
+        self.closing = False
+        self.admission = Admission()
+        def owned_store():
+            store = store_factory()
+            store.on_change = self.hints.notify_committed
+            return MemoryCommands(root, repo, store, self.generation)
+        self.worker = DatabaseWorker(owned_store)
+
+    async def command(self, request, pid):
+        if not isinstance(request, dict) or not isinstance(request.get('op'), str):
+            raise MemoryError_('invalid_request', 'expected an operation object')
+        validate_target(request, self.repo, self.generation)
+        if request['op'] == 'stop':
+            result = stop_result(request, self.repo, self.generation)
+            self.stop.set()
+            return result
+        if request['op'] == 'status':
+            result, diagnostics = await database_status(self.worker, request, pid)
+            if result is None:
+                result = dict(repo=self.repo, protocol=PROTOCOL, schema=SCHEMA,
+                              generation=self.generation, healthy=False)
+            result.update(diagnostics)
+        else:
+            result = await self.worker.call('command', request, pid)
+        if request['op'] in ('hello', 'status'):
+            result['capabilities'] = ['memory_subscription', 'memory_target_guard']
+            fault = (result['database_observed_fault'] if request['op'] == 'status'
+                     else self.worker.fault)
+            if request['op'] == 'hello':
+                result['database_observed_fault'] = fault
+            if fault:
+                result['healthy'] = False
+        return result
+
+    async def handle(self, reader, writer):
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        slot = None
         try:
+            try:
+                if self.closing:
+                    raise MemoryError_('stopping', 'service is stopping')
+                slot = self.admission.enter('handshake')
+                pid = credentials(writer.get_extra_info('socket'))
+                async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+                    request = json.loads(await reader.readline())
+                if not isinstance(request, dict):
+                    raise MemoryError_('invalid_request', 'expected an operation object')
+                if request.get('op') == 'subscribe':
+                    self.admission.leave(slot)
+                    slot = None
+                    subscriptions.validate(request, self.generation, repo=self.repo)
+                    await self.hints.serve(reader, writer)
+                    return
+                async with asyncio.timeout(10):
+                    self.admission.leave(slot)
+                    slot = None
+                    slot = self.admission.enter('control' if request.get('op') in ('status', 'stop') else 'ordinary')
+                    reply = dict(ok=True, result=await self.command(request, pid))
+                    if CRASH_AFTER_COMMIT and request.get('op') == 'note':
+                        os._exit(70)
+                    if REPLY_DELAY and request.get('op') == 'note':
+                        await asyncio.sleep(REPLY_DELAY)
+            except MemoryError_ as exc:
+                reply = local_error_reply(exc.code, str(exc))
+            except CapacityError:
+                reply = local_error_reply('capacity', 'service request capacity reached')
+            except WorkerFailure as exc:
+                reply = local_error_reply(exc.code, 'database operation failed')
+            except (ValueError, OSError, TimeoutError) as exc:
+                reply = local_error_reply('rejected', type(exc).__name__)
+            except Exception:
+                reply = local_error_reply('internal_error', 'service operation failed')
+            try:
+                writer.write(encode(reply))
+                await asyncio.wait_for(writer.drain(), 10)
+            except (OSError, ValueError, TimeoutError):
+                pass
+        finally:
+            try:
+                await close_writer(writer)
+            finally:
+                if slot is not None:
+                    self.admission.leave(slot)
+                self.tasks.discard(task)
+
+    async def run(self, sock):
+        server = None
+        try:
+            # Initialization completed in the worker before the socket was bound.
+            status = await self.command(dict(op='status'), os.getpid())
+            server = await asyncio.start_unix_server(self.handle, sock=sock, limit=LIMIT)
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, self.stop.set)
+                except (NotImplementedError, ValueError):
+                    pass
+            print(json.dumps(status), flush=True)
             await self.stop.wait()
         finally:
-            server.close()
-            await server.wait_closed()
-            # Drain in flight work before the database goes away, so a request that was
-            # accepted is never answered from a closed store. A timeout alone is not
-            # enough: a handler still running when the store closed would fail on a
-            # dead connection, so anything left is cancelled and joined first.
+            self.closing = True
+            self.hints.close()
+            if server is not None:
+                server.close()
             try:
-                await asyncio.wait_for(self.idle.wait(), 10)
-            except (asyncio.TimeoutError, TimeoutError):
-                for task in list(self.tasks):
-                    task.cancel()
-                await asyncio.gather(*list(self.tasks), return_exceptions=True)
-            self.store.close()
+                await drain_handlers(self.tasks)
+            finally:
+                try:
+                    await self.worker.close()
+                finally:
+                    if server is not None:
+                        await server.wait_closed()
 
 
 def write_owner(home, sock_path, generation, repo):
@@ -1721,7 +1846,8 @@ def write_owner(home, sock_path, generation, repo):
 
 def read_owner(home):
     try:
-        return json.loads((Path(home) / 'owner.json').read_text())
+        value = json.loads((Path(home) / 'owner.json').read_text())
+        return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         return None
 
@@ -1744,26 +1870,23 @@ def owner_is_dead(owner):
         return False
 
 
+async def control_exchange(root, payload, timeout=10):
+    owner = read_owner(root)
+    legacy = owner.get('socket') if owner else None
+    return await transport_exchange(root, payload, timeout=timeout, legacy_socket=legacy)
+
+
 async def request(root, payload, timeout=10):
-    control = platform_support.control_socket_path(Path(root))
-    r, w = await asyncio.open_unix_connection(str(control), limit=LIMIT)
     try:
-        credentials(w.get_extra_info('socket'))
-        w.write(encode(payload))
-        await w.drain()
-        line = await asyncio.wait_for(r.readline(), timeout)
-        if not line:
-            raise MemoryError_('no_reply', 'the service closed the connection without replying')
-        return json.loads(line)
-    finally:
-        w.close()
-        try:
-            await w.wait_closed()
-        except OSError:
-            pass
+        reply, _pid = await control_exchange(Path(root), payload, timeout)
+        return reply
+    except UnsafeServiceEndpoint as exc:
+        raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
+    except NoControlReply:
+        raise MemoryError_('no_reply', 'the service closed the connection without replying') from None
 
 
-async def verify_running(root, repo):
+async def verify_running(root, repo, *, require_healthy=True):
     """Confirm the listener is this repository's healthy service before reusing it.
 
     A bind conflict plus any answer proves only that something listens. Reuse
@@ -1771,27 +1894,57 @@ async def verify_running(root, repo):
     between the answer and the durable ownership record.
     """
     try:
-        reply = await request(root, dict(op='hello'), timeout=5)
-    except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
+        reply, connected_pid = await control_exchange(Path(root), dict(op='hello'), timeout=VERIFY_TIMEOUT)
+    except UnsafeServiceEndpoint as exc:
+        raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
+    except (ConnectionRefusedError, FileNotFoundError):
         return None
-    result = reply.get('result') if reply.get('ok') else None
-    if not isinstance(result, dict) or result.get('service') != 'codex-peer-memory':
-        return None
-    if result.get('repo') != repo or result.get('protocol') != PROTOCOL:
+    except TimeoutError:
+        raise MemoryError_('service_unresponsive', 'the service did not complete its handshake; no replacement was started') from None
+    except OSError:
+        raise MemoryError_('service_unavailable', 'the service endpoint could not be contacted; no replacement was started') from None
+    except ValueError:
+        raise MemoryError_('invalid_service_response', 'the service did not return a valid handshake; no replacement was started') from None
+    if reply.get('ok') is False:
+        if reply.get('code') == 'capacity':
+            raise MemoryError_('service_busy', 'the service is at request capacity; retry after pending work settles')
+        raise MemoryError_('service_refused', 'the listening service refused its handshake; no replacement was started')
+    result = reply.get('result') if reply.get('ok') is True else None
+    if not isinstance(result, dict):
+        raise MemoryError_('invalid_service_response', 'the service did not return a valid handshake; no replacement was started')
+    if result.get('service') != runtime_names.MEMORY_SERVICE:
         raise MemoryError_('foreign_service', 'another service holds this socket; refusing to reuse it')
-    if not result.get('healthy'):
+    if (result.get('repo') != repo or type(result.get('protocol')) is not int or
+            result['protocol'] != PROTOCOL):
+        raise MemoryError_('foreign_service', 'another service holds this socket; refusing to reuse it')
+    if require_healthy and not result.get('healthy'):
         raise MemoryError_('unhealthy_service', 'the running service reports an unhealthy store')
     # A listener with no ownership record is not evidence of a healthy service; it is
     # evidence that something is listening. Absence must refuse, not accept.
     owner = read_owner(root)
-    control = platform_support.control_socket_path(Path(root))
     if not owner:
         raise MemoryError_('unknown_owner',
                            'a service is listening with no ownership record; stop it explicitly '
                            'before reusing this state directory')
+    try:
+        control = service_path(Path(root), legacy_socket=owner.get('socket'))
+    except UnsafeServiceEndpoint as exc:
+        raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
+    if (type(owner.get('pid')) is not int or type(result.get('pid')) is not int or
+            owner['pid'] != connected_pid or result['pid'] != connected_pid):
+        raise MemoryError_('ownership_mismatch', 'the connected process does not match the recorded service')
+    if type(owner.get('protocol')) is not int:
+        raise MemoryError_('ownership_mismatch', 'the recorded protocol is invalid')
+    generation = owner.get('generation')
+    if (not isinstance(generation, str) or len(generation) != 32 or
+            any(c not in '0123456789abcdef' for c in generation)):
+        raise MemoryError_('ownership_mismatch', 'the service has no valid recorded generation')
+    marker = owner.get('proc_start')
+    if not isinstance(marker, str) or not marker.strip():
+        raise MemoryError_('ownership_mismatch', 'the service has no recorded process-start marker')
     checks = (('repo', owner.get('repo'), repo),
               ('protocol', owner.get('protocol'), PROTOCOL),
-              ('socket', owner.get('socket'), str(control)),
+              ('socket', platform_support.same_control_socket(owner.get('socket'), control), True),
               ('pid', owner.get('pid'), result.get('pid')),
               ('generation', owner.get('generation'), result.get('generation')))
     for field, recorded, expected in checks:
@@ -1800,7 +1953,9 @@ async def verify_running(root, repo):
                                f'the recorded owner disagrees with the running service on {field}; '
                                'stop it explicitly before reusing this state directory')
     try:
-        live = platform_support.proc_start(owner['pid'])
+        live = await platform_support.async_proc_start(owner['pid'])
+    except BlockingIOError:
+        raise MemoryError_('service_busy', 'process identity verification is at capacity') from None
     except (ProcessLookupError, OSError, subprocess.SubprocessError):
         raise MemoryError_('ownership_mismatch', 'the recorded owner is no longer readable') from None
     if not platform_support.same_process(owner.get('proc_start'), live):
@@ -1809,10 +1964,32 @@ async def verify_running(root, repo):
     return result
 
 
+async def request_bound(root, repo, payload):
+    """Read or mutate one explicit service root, with identity checked at action.
+
+    An unhealthy store can still expose status or readable data. Let its operation
+    policy decide what remains available instead of refusing all client requests.
+    """
+    service = await verify_running(root, repo, require_healthy=False)
+    if service is None:
+        raise MemoryError_('service_unavailable', 'the selected memory service is unavailable')
+    if 'memory_target_guard' not in service.get('capabilities', []):
+        raise MemoryError_('service_refused', 'upgrade this memory service before using --service-dir')
+    request_payload = dict(payload, repo=repo, generation=service['generation'])
+    reply, pid = await control_exchange(root, request_payload)
+    if pid != service['pid']:
+        raise MemoryError_('ownership_mismatch', 'the selected service changed during the request')
+    return reply
+
+
 def bind_exclusive(home, repo, generation):
     """Bind the control socket, recovering only from a provably dead owner."""
-    control = platform_support.control_socket_path(Path(home))
-    private_dir(control.parent)
+    try:
+        control = platform_support.control_socket_path(Path(home))
+        platform_support.refuse_legacy_control_conflict(home)
+    except (OSError, RuntimeError) as exc:
+        raise MemoryError_('socket_in_use', str(exc)) from exc
+    private_state_dir(control.parent)
     for attempt in (0, 1):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -1820,7 +1997,7 @@ def bind_exclusive(home, repo, generation):
         except OSError as exc:
             sock.close()
             owner = read_owner(home)
-            recoverable = (owner and owner.get('socket') == str(control)
+            recoverable = (owner and platform_support.same_control_socket(owner.get('socket'), control)
                            and owner.get('repo') == repo
                            and owner.get('protocol') == PROTOCOL and owner_is_dead(owner))
             if attempt == 0 and recoverable:
@@ -1841,18 +2018,17 @@ def bind_exclusive(home, repo, generation):
 
 def start(home, repo, store_factory):
     """Serialized start. Check and bind happen under one lock, never as a race."""
-    private_dir(Path(home))
+    private_state_dir(Path(home))
     with (Path(home) / 'start.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         existing = asyncio.run(verify_running(home, repo))
         if existing:
             return None, existing
-        store = store_factory()
-        service = Service(home, repo, store)
+        service = Service(home, repo, store_factory)
         try:
             sock, control = bind_exclusive(home, repo, service.generation)
         except BaseException:
-            store.close()
+            service.worker.close_sync()
             raise
         return (service, sock, control), None
 
@@ -1905,19 +2081,33 @@ def stop_service(home, repo, timeout=20):
     """
     control = platform_support.control_socket_path(Path(home))
     target = read_owner(home)
+    try:
+        control = service_path(Path(home), legacy_socket=target.get('socket') if target else None)
+    except FileNotFoundError:
+        pass
+    except UnsafeServiceEndpoint as exc:
+        raise MemoryError_('unsafe_service_endpoint', str(exc)) from None
     if not target:
         return dict(status='not_running', residue=control.exists())
     if target.get('repo') != repo:
         raise MemoryError_('wrong_repository',
-                           'the recorded owner serves another repository; refusing to stop it')
+                                   'the recorded owner serves another repository; refusing to stop it')
     generation = target.get('generation')
     try:
         reply = asyncio.run(request(home, dict(op='stop', repo=repo, generation=generation),
                                     timeout=5))
+        if not reply.get('ok') and reply.get('code') == 'capacity':
+            raise MemoryError_('service_busy', 'the service is at request capacity; retry stop after pending work settles')
         if not reply.get('ok') and reply.get('code') == 'not_this_instance':
             # A successor already owns the endpoint, so the instance we meant to stop is
             # gone and the one now running must be left alone.
             return dict(status='stopped', generation=generation, superseded=True)
+        if not reply.get('ok'):
+            raise MemoryError_('service_refused', 'the listening service refused the stop request')
+    except MemoryError_ as exc:
+        if exc.code != 'no_reply':
+            raise
+        # A lost stop reply is ambiguous; observe the exact instance below.
     except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError, TimeoutError):
         # It may already be draining or gone. The wait below decides, not this call.
         pass
@@ -1938,7 +2128,7 @@ def stop_service(home, repo, timeout=20):
         owner = read_owner(home)
         if not owner or owner.get('generation') != generation:
             return dict(status='stopped', generation=generation)
-        if owner_is_dead(owner) and owner.get('socket') == str(control):
+        if owner_is_dead(owner) and platform_support.same_control_socket(owner.get('socket'), control):
             control.unlink(missing_ok=True)
             (Path(home) / 'owner.json').unlink(missing_ok=True)
             return dict(status='stopped', generation=generation, residue=True, removed=True)
@@ -1946,11 +2136,12 @@ def stop_service(home, repo, timeout=20):
                     detail='the service has not exited within the timeout and is not proven dead')
 
 
-def main():
+def cli_main():
     os.umask(0o077)
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--state-dir', default=str(Path(os.environ.get(
-        'XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'codex-peer-bridge'))
+    paths = p.add_mutually_exclusive_group()
+    paths.add_argument('--state-dir')
+    paths.add_argument('--service-dir', help='exact bound memory service directory; no path suffix is added')
     p.add_argument('--repo-path', default=os.getcwd())
     p.add_argument('--consumer', help='stable consumer key; required for note, sync and ack')
     sub = p.add_subparsers(dest='op', required=True)
@@ -1983,11 +2174,16 @@ def main():
     st = sub.add_parser('status')
     st.add_argument('--after', help='continue from next_after of a previous page')
     args = vars(p.parse_args())
-    root = Path(args.pop('state_dir')).absolute()
+    selected_root = args.pop('state_dir')
+    exact = args.pop('service_dir')
     repo = repo_identity(args.pop('repo_path'))
-    private_dir(root)
-    home = state_dir(root, repo)
-    private_dir(home)
+    if exact is None:
+        root = Path(selected_root or runtime_names.default_state_root()).absolute()
+        private_state_dir(root)
+        home = state_dir(root, repo)
+    else:
+        home = Path(exact).absolute()
+    private_state_dir(home)
     op = args.pop('op')
     if op == 'serve':
         print(json.dumps(serve(home, repo, lambda: Store(home / 'memory.sqlite3', repo))))
@@ -1999,11 +2195,76 @@ def main():
         raise SystemExit(f'{op} requires --consumer, a stable key that outlives one command')
     payload = dict(op=op, **{k: v for k, v in args.items() if v is not None})
     try:
-        reply = asyncio.run(request(home, payload))
+        reply = asyncio.run(request_bound(home, repo, payload) if exact is not None else request(home, payload))
     except (ConnectionRefusedError, FileNotFoundError) as exc:
         raise SystemExit(f'no memory service is running for this repository ({home})') from exc
     print(json.dumps(reply, indent=2))
-    raise SystemExit(0 if reply.get('ok') else 1)
+    raise SystemExit(0 if reply.get('ok') else memory_error_exit_status(reply.get('code')))
+
+
+# Every locally raised recovery code and synthesized error has an explicit CLI policy. Unknown wire
+# codes retain exit 1; they cannot make a client claim a known retry/configuration class.
+SYNTHESIZED_ERROR_CODES = frozenset(('internal_error', 'storage_error', 'rejected')) | runtime_names.PATH_SELECTION_CODES
+ERROR_EXIT_CLASSES = {
+    'software': frozenset(('internal_error',)),
+    'temporary': frozenset((
+        'service_busy', 'service_unresponsive', 'service_unavailable', 'store_busy',
+        'capacity', 'idem_capacity', 'snapshot_capacity', 'stopping',
+    )),
+    'configuration': frozenset((
+        'foreign_service', 'unsafe_service_endpoint', 'unsafe_state_directory',
+        'unknown_owner', 'ownership_mismatch', 'wrong_repository', 'incompatible_store',
+        'schema_too_new', 'schema_too_old', 'repo_unresolved', 'unhealthy_service',
+        'invalid_service_response', 'socket_in_use', 'unsupported_runtime',
+        'store_too_large', 'service_refused', 'storage_blocked',
+    )) | runtime_names.PATH_SELECTION_CODES,
+    'request': frozenset((
+        'consumer_retired', 'entry_too_large', 'foreign_snapshot', 'idempotency_conflict',
+        'invalid_request', 'no_reply', 'no_such_entry', 'not_bootstrapped', 'not_issued',
+        'not_this_instance', 'retry_deadline_expired', 'snapshot_expired',
+        'snapshot_incomplete', 'snapshot_open', 'stale_page_token', 'stale_snapshot',
+        'write_failed', 'storage_error', 'rejected',
+    )),
+}
+
+
+def memory_error_exit_status(code):
+    if not isinstance(code, str):
+        return 1
+    if code in ERROR_EXIT_CLASSES['software']:
+        return platform_support.SOFTWARE_EXIT_STATUS
+    if code in ERROR_EXIT_CLASSES['temporary']:
+        return platform_support.TEMPORARY_EXIT_STATUS
+    if code in ERROR_EXIT_CLASSES['configuration']:
+        return platform_support.CONFIGURATION_EXIT_STATUS
+    return 1
+
+
+def local_error_reply(code, detail):
+    # Local code may not emit an unclassified outcome. Unknown codes received from
+    # another version still use the CLI's deliberate exit-1 compatibility fallback.
+    if not isinstance(code, str) or not any(code in codes for codes in ERROR_EXIT_CLASSES.values()):
+        code, detail = 'internal_error', 'unclassified local error outcome'
+    return dict(ok=False, code=code, error=detail)
+
+
+def main():
+    try:
+        return cli_main()
+    except runtime_names.NameConflict as exc:
+        reply = local_error_reply(exc.code, str(exc))
+        reply['paths'] = exc.paths
+        print(json.dumps(reply))
+        raise SystemExit(memory_error_exit_status(reply['code'])) from None
+    except MemoryError_ as exc:
+        # Factory failures happen before the worker's request classifier is active.
+        # Do not report a wrapped programming defect as an incompatible user file.
+        internal = exc.database_fault == 'internal_error'
+        code = 'internal_error' if internal else exc.code
+        detail = 'internal database operation failed' if internal else exc.detail
+        reply = local_error_reply(code, detail)
+        print(json.dumps(reply))
+        raise SystemExit(memory_error_exit_status(reply['code'])) from None
 
 
 if __name__ == '__main__':

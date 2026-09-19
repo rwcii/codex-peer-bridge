@@ -24,7 +24,10 @@ Three differences matter:
 
 Python standard library only.
 """
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import threading
 import os
 from pathlib import Path
 import socket
@@ -39,6 +42,11 @@ LINUX = sys.platform.startswith('linux')
 # themselves, so this module stays the only place that knows the differences.
 SUPPORTED = DARWIN or LINUX
 SERVICE_MANAGER = 'systemd' if LINUX else None
+# Explicit configuration/ownership refusals require operator action, not restart loops.
+CONFIGURATION_EXIT_STATUS = 78
+TEMPORARY_EXIT_STATUS = 75
+SOFTWARE_EXIT_STATUS = 70
+PERMANENT_EXIT_STATUSES = (SOFTWARE_EXIT_STATUS, CONFIGURATION_EXIT_STATUS)
 
 if not SUPPORTED:
     raise RuntimeError(f'unsupported platform: {sys.platform}')
@@ -97,6 +105,27 @@ def _getpeereid(fd):
     return uid.value, gid.value
 
 
+PROCESS_QUERY_TIMEOUT = 5
+_PROCESS_PROBES = ThreadPoolExecutor(max_workers=2, thread_name_prefix='process-identity')
+_PROCESS_PROBE_SLOTS = threading.BoundedSemaphore(2)
+
+
+async def async_proc_start(pid):
+    """Keep accepted OS probes bounded and off the service event loop."""
+    if not _PROCESS_PROBE_SLOTS.acquire(blocking=False):
+        raise BlockingIOError('process identity probe capacity reached')
+    try:
+        future = _PROCESS_PROBES.submit(proc_start, pid)
+    except BaseException:
+        _PROCESS_PROBE_SLOTS.release()
+        raise
+    # Release on actual completion, never merely because a caller stopped waiting.
+    future.add_done_callback(lambda result: _PROCESS_PROBE_SLOTS.release())
+    wrapped = asyncio.wrap_future(future)
+    wrapped.add_done_callback(lambda result: None if result.cancelled() else result.exception())
+    return await asyncio.shield(wrapped)
+
+
 def proc_start(pid):
     """Local process-start marker for one pid, in this platform's own form.
 
@@ -125,7 +154,7 @@ def proc_start(pid):
     try:
         result = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)],
                                 capture_output=True, text=True, check=True,
-                                env={**os.environ, 'TZ': 'UTC'})
+                                env={**os.environ, 'TZ': 'UTC'}, timeout=PROCESS_QUERY_TIMEOUT)
     except subprocess.CalledProcessError as exc:
         raise ProcessLookupError(f'no such process: {pid}') from exc
     value = result.stdout.strip()
@@ -229,8 +258,105 @@ def control_socket_path(root):
     socket and a saturated one are indistinguishable by probing, because a full
     accept queue refuses a connection on macOS just as a dead owner does.
     """
+    root = Path(root).resolve()
     direct = root / 'control.sock'
     if len(os.fsencode(direct)) < SUN_PATH_BYTES[DARWIN]:
         return direct
+    return fallback_control_socket(root)
+
+
+def fallback_control_socket(root):
+    """The stable private fallback used by both old and new service code."""
     digest = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:16]
     return Path('/tmp/cc-socks') / f'{digest}-control.sock'
+
+
+def legacy_control_socket(root, recorded=None):
+    """A bounded old direct endpoint; never a peer or registry address.
+
+    An old server could select a short alias before checking the path length.
+    Only that root's direct socket is a permitted compatibility destination.
+    """
+    candidate = Path(root) / 'control.sock' if recorded is None else recorded
+    if not isinstance(candidate, (str, Path)):
+        return None
+    candidate = Path(candidate)
+    try:
+        if (candidate.is_absolute() and len(os.fsencode(candidate)) < SUN_PATH_BYTES[DARWIN]
+                and candidate.resolve() == (Path(root).resolve() / 'control.sock')):
+            return candidate
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
+def same_control_socket(recorded, expected):
+    """Compare private service endpoint identities, never peer token paths."""
+    if not isinstance(recorded, str) or not Path(recorded).is_absolute():
+        return False
+    try:
+        return Path(recorded).resolve() == Path(expected).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def refuse_legacy_control_conflict(root):
+    """Never start a new endpoint beside either retained legacy endpoint."""
+    canonical = control_socket_path(root).resolve()
+    candidates = (Path(root).resolve() / 'control.sock', fallback_control_socket(root))
+    for candidate in candidates:
+        if candidate.resolve() == canonical:
+            continue
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        raise FileExistsError(f'legacy control endpoint remains at {candidate}; '
+                              'stop its owner and verify it is gone before removing a leftover socket')
+
+
+class AccountHomeUnavailable(RuntimeError):
+    """The effective OS account has no usable persistent home directory."""
+
+
+def account_home():
+    """Read the OS account entry, never HOME or a provider-specific override."""
+    import pwd
+    try:
+        value = pwd.getpwuid(os.geteuid()).pw_dir
+        if not value or not Path(value).is_absolute() or not Path(value).is_dir():
+            raise AccountHomeUnavailable('account_home_unavailable')
+        return Path(value)
+    except (KeyError, OSError, ValueError):
+        raise AccountHomeUnavailable('account_home_unavailable') from None
+
+
+def participant_lock_dir():
+    """Persistent singleton namespace shared by every state root of this account."""
+    home = account_home()
+    if DARWIN:
+        return home / 'Library' / 'Application Support' / 'koinon-locks'
+    return home / '.local' / 'state' / 'koinon-locks'
+
+
+def sync_state_file(fd):
+    """Flush one state file; request the stronger device flush on macOS.
+
+    Fail visibly if the platform cannot honor the requested flush. Filesystem and
+    device compliance remains an assumption, not a process-crash test result.
+    """
+    os.fsync(fd)
+    if DARWIN:
+        import fcntl
+        operation = getattr(fcntl, 'F_FULLFSYNC', None)
+        if operation is None:
+            raise OSError('full state synchronization is unavailable')
+        fcntl.fcntl(fd, operation)
+
+
+def sync_state_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

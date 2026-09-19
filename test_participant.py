@@ -220,13 +220,13 @@ class InstallRecordTests(unittest.TestCase):
             self.assertEqual(updated['participants'], ['codex', 'deepseek'])
             self.assertEqual(updated['codex_home'], record['codex_home'])
             self.assertEqual(updated['dsh_home'], record['dsh_home'])
-            self.assertIn('BEGIN DEEPSEEK PEER BRIDGE', (root/'dsh/AGENTS.md').read_text())
+            self.assertIn('BEGIN KOINON DEEPSEEK', (root/'dsh/AGENTS.md').read_text())
 
     def test_each_flag_writes_only_its_own_section(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.install(root, '--configure-deepseek')
-            self.assertIn('BEGIN DEEPSEEK PEER BRIDGE', (root / 'dsh' / 'AGENTS.md').read_text())
+            self.assertIn('BEGIN KOINON DEEPSEEK', (root / 'dsh' / 'AGENTS.md').read_text())
             self.assertNotIn('PEER BRIDGE', (root / 'codex' / 'AGENTS.md').read_text(),
                              'a DeepSeek-only install must not touch the Codex guidance')
 
@@ -332,7 +332,7 @@ class ServiceUnitTests(unittest.TestCase):
                          '/repo', '/usr/bin/python3', '/usr/bin/codex',
                          agent='deepseek', model='deepseek-v4-pro',
                          dsh_url='http://127.0.0.1:51992', dsh_credentials='/home/u/.credentials.yaml')
-        content = rendered['codex-peer-notify.service']
+        content = rendered['koinon-notify.service']
         self.assertIn('--agent', content)
         self.assertIn('deepseek', content)
         self.assertIn('--dsh-url', content)
@@ -344,7 +344,7 @@ class ServiceUnitTests(unittest.TestCase):
         rendered = units(Path('/app'), Path('/state'), 'session-abc', 'deepseek-v4-pro-repo-1a',
                          '/repo', '/usr/bin/python3', '/usr/bin/codex', instance='a' * 16,
                          agent='deepseek', model='deepseek-v4-pro')
-        content = rendered['codex-peer-session-' + 'a' * 16 + '.service']
+        content = rendered['koinon-session-' + 'a' * 16 + '.service']
         self.assertIn('--agent', content)
         self.assertIn('--model', content)
         self.assertIn('deepseek-v4-pro', content)
@@ -353,8 +353,8 @@ class ServiceUnitTests(unittest.TestCase):
         from scripts.install import units
         rendered = units(Path('/app'), Path('/state'), 'thread-a', 'codex-repo-1a',
                          '/repo', '/usr/bin/python3', '/usr/bin/codex')
-        self.assertIn('--codex', rendered['codex-peer-notify.service'])
-        self.assertNotIn('--agent', rendered['codex-peer-notify.service'])
+        self.assertIn('--codex', rendered['koinon-notify.service'])
+        self.assertNotIn('--agent', rendered['koinon-notify.service'])
 
 
 if __name__ == '__main__':

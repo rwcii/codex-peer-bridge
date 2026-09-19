@@ -23,6 +23,9 @@ from bridge import private_dir, peers
 import dsh_delivery
 from notify import save
 import platform_support
+import runtime_names
+import notification_health
+import session_observation
 from scripts.install import units, check_owned_unit, start_command_for
 
 
@@ -60,27 +63,17 @@ def bridge_status(prefix, state):
     return None
 
 
-def notifier_ready(state, bridge):
+def notifier_readiness(state, bridge):
     if not bridge:
-        return False
-    try:
-        ready=json.loads((state/'notify-ready.json').read_text())
-        if ready['bridge_pid'] != bridge['pid']:
-            return False
-        pid=ready['notifier_pid']
-        if not platform_support.same_process(ready['proc_start'], platform_support.proc_start(pid)):
-            return False
-    except (OSError,ValueError,KeyError,IndexError,subprocess.SubprocessError):
-        return False
-    try:
-        with (state/'notifier.lock').open('a') as lock:
-            try:
-                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-    except OSError:
-        pass
-    return False
+        return None
+    ready = notification_health.verify_owner(state)
+    if ready is None or ready['bridge_pid'] != bridge.get('pid'):
+        return None
+    return ready
+
+
+def notifier_ready(state, bridge):
+    return notifier_readiness(state, bridge) is not None
 
 
 def read_config(prefix):
@@ -151,6 +144,14 @@ def notify_command(prefix, config, state, thread, repo, name, agent='codex', mod
     return command
 
 
+def permanent_child_exit(children):
+    for child in children:
+        status = child.poll()
+        if status in platform_support.PERMANENT_EXIT_STATUSES:
+            return status
+    return None
+
+
 def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=None):
     # A persistent managed session owns both children; repeated calls cannot duplicate it.
     with (state/'supervisor.lock').open('a') as lock:
@@ -170,7 +171,10 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
         try:
             children.append(subprocess.Popen([sys.executable,str(prefix/'bridge.py'),'--state-dir',str(state),'serve']))
             for _ in range(100):
-                if stopped or children[0].poll() is not None:
+                bridge_exit = children[0].poll()
+                if bridge_exit in platform_support.PERMANENT_EXIT_STATUSES:
+                    raise SystemExit(bridge_exit)
+                if stopped or bridge_exit is not None:
                     raise RuntimeError('bridge exited during startup')
                 if bridge_status(prefix,state):
                     break
@@ -179,7 +183,11 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
                 raise RuntimeError('bridge did not become ready')
             children.append(subprocess.Popen(notify_command(prefix,config,state,thread,repo,name,agent,model)))
             for _ in range(100):
-                if stopped or children[-1].poll() is not None:
+                notifier_exit = children[-1].poll()
+                permanent_exit = permanent_child_exit(children)
+                if permanent_exit is not None:
+                    raise SystemExit(permanent_exit)
+                if stopped or notifier_exit is not None:
                     raise RuntimeError('notifier exited during startup')
                 if notifier_ready(state,bridge_status(prefix,state)):
                     break
@@ -190,6 +198,9 @@ def supervisor(prefix, config, state, thread, repo, name, agent='codex', model=N
             while not stopped and all(p.poll() is None for p in children):
                 time.sleep(.2)
             if not stopped:
+                permanent_exit = permanent_child_exit(children)
+                if permanent_exit is not None:
+                    raise SystemExit(permanent_exit)
                 raise RuntimeError('session child exited; restart the complete session')
         finally:
             for child in reversed(children):
@@ -255,8 +266,9 @@ def main():
             saved=save_registration(state,Path(config['state_root']),a.thread,repo,agent=agent,model=model)
             name=saved['name']
         active=bridge_status(prefix,state)
+        observed=session_observation.lifecycle(state,active)
         if a.action=='rename':
-            if active:
+            if observed != 'stopped':
                 raise ValueError('stop this thread before explicitly renaming it')
             # Rename is the one action where an explicit request wins over the
             # saved identity, so an advertised model can actually be corrected. An
@@ -267,18 +279,21 @@ def main():
                                     model=a.model or model)
             print(json.dumps(saved))
             return
-        healthy=notifier_ready(state,active)
-        if a.action=='status' or (a.action=='ensure' and active):
-            data=result(prefix,state,name,a.thread,repo,'running' if healthy else ('repair_required' if active else 'stopped'),agent,model)
+        ready=notifier_readiness(state,active)
+        healthy=ready is not None
+        if a.action=='status' or (a.action=='ensure' and observed != 'stopped'):
+            data=result(prefix,state,name,a.thread,repo,'running' if healthy else ('repair_required' if active else observed),agent,model)
             data['bridge']=active
+            data['participant_lock']=ready.get('participant_lock') if ready else None
+            data['delivery_health']=notification_health.read(state,ready)
             if active and not healthy:
                 data['repair_command']=shlex.join([sys.executable,str(prefix/'session.py'),'stop','--thread',a.thread])
             print(json.dumps(data))
             return
         if a.action=='stop':
-            unit=Path(config['unit_dir'])/f'codex-peer-session-{key}.service'
+            unit=Path(config['unit_dir'])/runtime_names.selected_service_names(Path(config['unit_dir']), key)[0]
             if unit.exists():
-                check_owned_unit(unit)
+                check_owned_unit(unit, prefix)
                 try:
                     available=subprocess.run(['systemctl','--user','show-environment'],stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,timeout=5).returncode==0
@@ -287,14 +302,22 @@ def main():
                 if available:
                     subprocess.run(['systemctl','--user','stop',unit.name],check=True)
                 active=bridge_status(prefix,state)
-            if active:
-                subprocess.run([sys.executable,str(prefix/'bridge.py'),'--state-dir',str(state),'stop'],check=True)
-                for _ in range(100):
-                    if not bridge_status(prefix,state) and not notifier_ready(state,active):
-                        break
-                    time.sleep(.1)
-                else:
-                    raise RuntimeError('session did not stop completely')
+            # Try independently addressable controls even if status could not answer.
+            # Never interpret a timeout or a retained endpoint as proof of shutdown.
+            for executable, endpoint in (('notify.py', state/'notifier'), ('bridge.py', state)):
+                if session_observation.endpoint_present(endpoint):
+                    try:
+                        subprocess.run([sys.executable,str(prefix/executable),'--state-dir',str(state),'stop'],
+                                       check=True, capture_output=True, timeout=12)
+                    except (OSError,subprocess.SubprocessError):
+                        # A lost stop reply is ambiguous; the observation below
+                        # decides whether shutdown completed.
+                        pass
+            deadline=time.monotonic()+10
+            while session_observation.lifecycle(state,bridge_status(prefix,state)) != 'stopped':
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('session stop is unconfirmed; lifecycle remains unknown')
+                time.sleep(.1)
             # systemd's Restart=on-failure does not restart a clean stop.
             return
         if a.action=='ensure':
@@ -307,13 +330,15 @@ def main():
                 print(json.dumps(result(prefix,state,name,a.thread,repo,'manual_required',agent,model)))
                 return
             unit_dir=Path(config['unit_dir'])
+            selected = runtime_names.selected_service_names(unit_dir, key)
             rendered=units(prefix,state,a.thread,name,repo,sys.executable,config['codex'],instance=key,
                            agent=agent,model=model,dsh_url=config.get('dsh_url'),
-                           dsh_credentials=config.get('dsh_credentials'))
+                           dsh_credentials=config.get('dsh_credentials'),
+                           legacy=selected == runtime_names.service_names(key, legacy=True))
             unit_dir.mkdir(parents=True,exist_ok=True)
             for filename,content in rendered.items():
                 target=unit_dir/filename
-                check_owned_unit(target)
+                check_owned_unit(target, prefix)
                 target.write_text(content)
             # `run` needs this lock before it can start either child. Keep the
             # lifecycle lock until both children are ready, so another ensure,
@@ -334,4 +359,8 @@ def main():
 
 
 if __name__=='__main__':
-    main()
+    try:
+        main()
+    except runtime_names.NameConflict as exc:
+        print(json.dumps(dict(ok=False, code=exc.code, paths=exc.paths)))
+        raise SystemExit(platform_support.CONFIGURATION_EXIT_STATUS) from None

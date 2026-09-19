@@ -16,7 +16,8 @@ permissions. Memory consolidation across repositories is not implemented.
 
 Python standard library only. No pip dependencies, cloud relay, or repository-specific integration.
 
-Runtime paths, service names, and registry identifiers retain their existing names. See the
+Fresh installations use Koinon paths and service names. Existing paths and state
+remain in place. External wire identifiers remain unchanged. See the
 [compatibility notes](docs/INSTALL.md#name-and-path-compatibility).
 
 ## Participants
@@ -219,12 +220,22 @@ idempotency keys and idle consumers each have a lifetime, and expiry returns a d
 result rather than changing a caller's meaning silently. There is no bus integration and no
 compaction in this form; entries are removed only once expired.
 
+Bridge and memory database operations use dedicated worker threads with bounded queues.
+Status and stop have separate admission capacity when ordinary requests fill their slots.
+Incomplete control frames have a separate bounded pool and a two-second deadline; a full
+pool can refuse any operation until a slot becomes available. Status returns known process
+and queue information after one second if the database cannot answer, with database values
+marked unknown. An accepted write can still commit after its caller disconnects or times out. Shutdown
+waits for those writes before closing the database. `database_observed_fault` records observed
+storage or programming failures until restart; it is not an integrity check.
+
 See [the design contract](docs/PARITY-MEMORY-DESIGN.md) for the requirements this implements and
 for the capabilities that remain unverified.
 
 ## Storage and multiple sessions
 
-Persistent state defaults to `$XDG_STATE_HOME/codex-peer-bridge`, or `~/.local/state/codex-peer-bridge`. For another instance, give **both processes** a distinct state directory:
+Fresh persistent state defaults to `$XDG_STATE_HOME/koinon`, or `~/.local/state/koinon`.
+An existing legacy default is reused; if both names exist, supply an explicit path. For another instance, give **both processes** a distinct state directory:
 
 ```sh
 python3 bridge.py --state-dir /path/to/private/state serve
@@ -234,7 +245,33 @@ python3 bridge.py --state-dir /path/to/private/state inbox
 
 State directories must be owned by the current user and mode 0700. The notifier checkpoint is tied to its thread ID; do not reuse one instance for unrelated conversations. Runtime databases, sockets, checkpoints, peer keys, and logs do not belong in Git.
 
-The watcher checks every two seconds and batches new user messages into a notice. It skips controls to avoid receipt loops. Queue failures retry after 30 seconds, and checkpoints advance only after queue success. An ambiguous timeout or crash can produce a duplicate notice. Codex controls notification scheduling: delivery may wait until an active turn finishes. Older notices can therefore surface after their messages have already been handled.
+The notifier subscribes before checking durable inbox state and repeats the check
+at a two-second recovery interval. It skips peer controls. Each notice contains at
+most ten ordinary message pointers, or one memory pointer. A separate bounded
+journal records attempts before provider calls; each unit has three automatic
+attempts with 30- and 60-second delays. An ambiguous provider result or crash can
+produce a duplicate notice. A successful unit is not resent because a later unit
+failed. Delivery health is separate from process readiness. See
+[notifier operation and recovery](docs/NOTIFIER.md).
+
+Codex controls notification scheduling: delivery can wait until an active turn
+finishes. Older notices can arrive after their messages have been handled.
+Transport completion does not prove that a model processed a notice.
+
+## Notifier ownership
+
+One notifier may serve a provider/session identity per OS account, even when bridge
+instances use different state directories or provider homes. The scope is deliberately
+account-local: equal session IDs in separate DeepSeek harnesses conflict conservatively.
+Different session IDs or providers can run together. A refused start reports
+`participant_in_use` with provider, scope and a digest; `session.py status` exposes the
+same `participant_lock` value for a running instance. Manual installations can inspect
+that value in their private `notify-ready.json`. Neither diagnostic prints the target ID.
+
+Locks use a persistent `koinon-locks` directory below the OS account's home, independent
+of environment overrides. See [installation](docs/INSTALL.md#notifier-ownership) for the
+paths and upgrade procedure. This coordinates Koinon notifiers only; it cannot exclude
+other programs that deliver to the same session without taking this lock.
 
 ## Lifecycle
 
@@ -254,7 +291,7 @@ A DeepSeek participant additionally reads the harness signing secret at `$DSH_HO
 
 Incoming controls are stored as inert data. Message bodies never execute shell commands. Attachment metadata may be stored, but attachments are never fetched. Notices omit peer bodies and are submitted using subprocess argument arrays, without a shell.
 
-Limits: 16 active connections, six-second handler deadline, 32 frames per incoming connection, 256 KiB wire frames, 64 KiB stored frames, and 1,000 inbox records. Full inboxes reject new records; read and acknowledge regularly. A successful send means transport completion, not processing by a model. The bridge emits no peer delivery receipts, idle notifications, or artifact-yield responses.
+Ordinary peer limits: 16 active connections, six-second handler deadline, 32 frames per incoming connection, 256 KiB wire frames, 64 KiB stored frames, and 1,000 inbox records. Full inboxes reject new records; read and acknowledge regularly. A successful send means transport completion, not processing by a model. The bridge emits no peer delivery receipts, idle notifications, or artifact-yield responses. Explicit local change subscriptions have separate connection and write limits; see [the subscription contract](PROTOCOL.md#change-subscriptions).
 
 ## Development
 
@@ -285,3 +322,36 @@ scripts/setup-repo.sh
 ## License
 
 [MIT](LICENSE) © 2026 Robert Capps.
+
+### Bridge startup and control failures
+
+The bridge reserves its control and messaging socket paths before opening the inbox
+database. It listens only after database initialization commits. An existing path
+refuses startup without opening the inbox; `serve` reports `endpoint_unavailable`
+and exits 78. No status probe or new advisory lock substitutes for this reservation.
+Shutdown keeps the reservation until accepted database operations finish.
+
+Control timeouts, lost replies, transport failures and invalid replies produce
+structured CLI errors and exit 1. A failed reply does not establish whether a
+mutation committed. The CLI does not automatically repeat that mutation.
+
+On Linux, installed systemd bridge and session services do not restart on exit 70
+(internal software error) or 78 (configuration refusal).
+On macOS, the manual process exits and must be started again after correction; see
+[macOS setup](docs/INSTALL.md#macos). For a leftover socket, follow [recovery from a killed instance](docs/INSTALL.md#recovering-from-a-killed-instance).
+Remove a socket only after verifying that its owner is dead. Unsafe startup
+directories also produce a structured ownership refusal with exit 78.
+
+### Inbox migration progress
+
+The bridge now maintains a transactional acknowledgement watermark and durable
+journal activation evidence in inbox schema 3 (introduced in schema 2). Migration preserves retained messages
+and sequence allocation. See [the schema contract](PROTOCOL.md#inbox-schema-2-and-journal-activation).
+Explicit repository bindings and content-free memory pointers are available through
+[the binding controls](PROTOCOL.md#memory-bindings-and-pointers). The notifier
+refreshes these bindings through subscriptions and finite recovery checks, then
+queues content-free sync commands. No notification acknowledges memory.
+Local bridge and memory subscriptions carry hints only. The notifier reads durable
+state before reserving journal work and calling a provider. See the
+[subscription protocol](PROTOCOL.md#change-subscriptions) and
+[upgrade and recovery procedure](docs/NOTIFIER.md).

@@ -12,6 +12,14 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 from scripts.install import units
 
+
+def isolate_account_home(app, home):
+    home.mkdir(parents=True, exist_ok=True)
+    # Test-owned installed copy only; production has no environment escape hatch.
+    with (app/'platform_support.py').open('a') as stream:
+        stream.write('\ndef account_home():\n    return Path(' + repr(str(home)) + ')\n')
+
+
 class SessionTests(unittest.TestCase):
     def test_isolation_and_units(self):
         config={'state_root':'/state'}
@@ -22,7 +30,7 @@ class SessionTests(unittest.TestCase):
         ua=units(Path('/app'),a[0],'thread-a',a[1],'/repo',sys.executable,sys.executable,a[2])
         ub=units(Path('/app'),b[0],'thread-b',b[1],'/repo',sys.executable,sys.executable,b[2])
         self.assertFalse(set(ua)&set(ub))
-        self.assertEqual(list(ua),[f'codex-peer-session-{a[2]}.service'])
+        self.assertEqual(list(ua),[f'koinon-session-{a[2]}.service'])
         self.assertIn('session.py',next(iter(ua.values())))
         for invalid in ('','../../bad','thread\nvalue'):
             with self.assertRaises(ValueError): session.identity(invalid)
@@ -73,6 +81,7 @@ class SessionTests(unittest.TestCase):
             subprocess.run([sys.executable,'scripts/install.py','--configure-codex','--no-start',
                 '--codex',sys.executable,'--prefix',str(app),'--state-dir',str(root/'state'),
                 '--unit-dir',str(root/'units'),'--codex-home',str(root/'codex')],check=True,capture_output=True,env=env)
+            isolate_account_home(app, root/'account')
             config=session.read_config(app)
             processes=[]
             try:
@@ -92,15 +101,43 @@ class SessionTests(unittest.TestCase):
                     self.assertTrue(session.notifier_ready(state,status))
                     result=subprocess.run([sys.executable,str(app/'session.py'),'ensure','--thread',thread],
                                            env=env,capture_output=True,text=True,check=True)
-                    self.assertEqual(json.loads(result.stdout)['bridge']['pid'],status['pid'])
+                    reported = json.loads(result.stdout)
+                    self.assertEqual(reported['bridge']['pid'],status['pid'])
+                    from participant_lock import identity
+                    self.assertEqual(reported['participant_lock'], identity('codex', thread))
+                    self.assertEqual(json.loads((state/'notify-ready.json').read_text())[
+                        'participant_lock'], reported['participant_lock'])
+                # Provider failure must not turn ensure into a second owner launch.
+                # These installed fixtures use Python as the unavailable queue CLI.
+                import sqlite3
+                failed_state,_,_=session.details(app,config,'thread-one','/test-project')
+                ready_before=json.loads((failed_state/'notify-ready.json').read_text())
+                from contextlib import closing
+                with closing(sqlite3.connect(failed_state/'inbox.sqlite3')) as db:
+                    db.execute('INSERT INTO inbox(pid,frame) VALUES(?,?)',
+                        (123, json.dumps(dict(type='user', message=dict(content='synthetic test')))))
+                    db.commit()
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    observed=subprocess.run([sys.executable,str(app/'session.py'),'ensure','--thread','thread-one'],
+                        env=env,capture_output=True,text=True,check=True)
+                    result=json.loads(observed.stdout)
+                    if 'uncertain_delivery' in result['delivery_health']['reasons']:
+                        break
+                    time.sleep(.05)
+                else:
+                    self.fail('provider failure did not reach delivery health')
+                self.assertEqual(result['status'],'running')
+                self.assertEqual(result['bridge']['pid'],statuses[0]['pid'])
+                self.assertEqual(json.loads((failed_state/'notify-ready.json').read_text()),ready_before)
                 self.assertNotEqual(statuses[0]['pid'],statuses[1]['pid'])
                 self.assertNotEqual(statuses[0]['address'],statuses[1]['address'])
                 # A unit file alone must not prevent shutting down a manual instance.
                 state,_,key=session.details(app,config,'thread-one','/test-project')
                 unit_dir=root/'units'
                 unit_dir.mkdir(exist_ok=True)
-                from scripts.install import MARKER
-                (unit_dir/f'codex-peer-session-{key}.service').write_text(MARKER+'[Service]\n')
+                from scripts.install import MARKER, unit_arg
+                (unit_dir/f'codex-peer-session-{key}.service').write_text(MARKER+'[Service]\nExecStart='+unit_arg(sys.executable)+' '+unit_arg(str(app/'session.py'))+'\n')
                 # Force no systemctl resolution for this subprocess without changing children.
                 stop_env=dict(env,PATH='/nonexistent')
                 stopped=subprocess.run([sys.executable,str(app/'session.py'),'stop','--thread','thread-one'],
@@ -141,6 +178,7 @@ class SystemdStartupTests(unittest.TestCase):
                         '--unit-dir', str(self.root/'units'),
                         '--codex-home', str(self.root/'codex')],
                        check=True, capture_output=True, env=self.env)
+        isolate_account_home(self.app, self.root/'account')
         # A competing command must never reach the host's service manager.
         binaries = self.root/'bin'
         binaries.mkdir()
@@ -175,6 +213,113 @@ class SystemdStartupTests(unittest.TestCase):
                                    stderr=subprocess.PIPE, text=True)
         self.processes.append(process)
         return process
+
+    def test_bridge_refusal_propagates_during_notifier_startup_and_running(self):
+        from unittest.mock import Mock
+        self.state.mkdir(parents=True, exist_ok=True)
+        for phase, exit_code in ((phase, code) for phase in ('notifier_startup', 'running') for code in (70, 78)):
+            with self.subTest(phase=phase, exit_code=exit_code):
+                bridge_child, notifier_child = Mock(), Mock()
+                bridge_child.poll.return_value = None
+                notifier_child.poll.return_value = None
+                children = []
+                def spawn(*args, **kwargs):
+                    child = bridge_child if not children else notifier_child
+                    children.append(child)
+                    if child is notifier_child and phase == 'notifier_startup':
+                        bridge_child.poll.return_value = exit_code
+                    return child
+                def readiness(*args):
+                    bridge_child.poll.return_value = exit_code
+                    return True
+                with patch.object(session.subprocess, 'Popen', side_effect=spawn), \
+                     patch.object(session, 'bridge_status', side_effect=lambda *a: {'pid':123} if children else None), \
+                     patch.object(session, 'notifier_ready', side_effect=readiness), \
+                     patch.object(session, 'notify_command', return_value=['synthetic-notifier']), \
+                     patch.object(session, 'result', return_value={'status':'running'}), \
+                     patch.object(session.signal, 'signal'), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        session.supervisor(self.app, self.config, self.state, self.thread, self.repo, 'synthetic')
+                self.assertEqual(caught.exception.code, exit_code)
+                notifier_child.terminate.assert_called_once()
+                notifier_child.wait.assert_called_once_with(timeout=20)
+                bridge_child.terminate.assert_not_called()
+
+    def test_supervisor_preserves_bridge_startup_refusal(self):
+        script = self.app/'bridge.py'
+        source = script.read_text().split("if __name__ == '__main__':", 1)[0]
+        for exit_code in (70, 78):
+            script.write_text(source + f"if __name__ == '__main__':\n    import sys\n    if sys.argv[-1] == 'serve':\n        raise SystemExit({exit_code})\n    main()\n")
+            process = self.spawn([sys.executable, str(self.app/'session.py'), 'run',
+                                  '--thread', self.thread, '--repo', self.repo])
+            stdout, stderr = process.communicate(timeout=20)
+            self.assertEqual(process.returncode, exit_code, stderr)
+            self.assertNotIn('Traceback', stderr)
+            self.assertFalse((self.state/'inbox.sqlite3').exists())
+
+    def test_supervisor_preserves_configuration_refusal_and_stops_bridge(self):
+        notifier = self.app/'notify.py'
+        source = notifier.read_text().split("if __name__ == '__main__':", 1)[0]
+        notifier.write_text(source + "if __name__ == '__main__':\n    raise SystemExit(78)\n")
+        process = self.spawn([sys.executable, str(self.app/'session.py'), 'run',
+                              '--thread', self.thread, '--repo', self.repo])
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 78, stderr)
+        self.assertIn('address', stdout, 'the bridge must start before the child refusal')
+        self.assertNotIn('Traceback', stderr)
+        self.assertIsNone(session.bridge_status(self.app, self.state))
+
+    def test_supervisor_preserves_refusal_after_notifier_readiness(self):
+        # This test-owned child takes the real readiness lock, then exits with the
+        # permanent-refusal code after the supervisor has entered its running loop.
+        notifier = self.app/'notify.py'
+        source = notifier.read_text().split("if __name__ == '__main__':", 1)[0]
+        import textwrap
+        notifier.write_text(source + "if __name__ == '__main__':\n" + textwrap.indent("""
+import fcntl, json, os, sys, time
+from pathlib import Path
+import platform_support
+root = Path(sys.argv[sys.argv.index('--state-dir')+1])
+lock = (root/'notifier.lock').open('a')
+fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+# The bridge PID comes from the installed bridge CLI, not from a test assumption.
+import subprocess
+bridge = json.loads(subprocess.check_output([sys.executable,
+    str(Path(__file__).with_name('bridge.py')), '--state-dir', str(root), 'status']))['result']
+(root/'notify-ready.json').write_text(json.dumps(dict(owner='a'*32,
+    bridge_pid=bridge['pid'], notifier_pid=os.getpid(),
+    proc_start=platform_support.proc_start(os.getpid()))))
+while not (root/'exit-now').exists():
+    time.sleep(.02)
+raise SystemExit(78)
+""", '    '))
+        process = self.spawn([sys.executable, str(self.app/'session.py'), 'run',
+                              '--thread', self.thread, '--repo', self.repo])
+        # Read actual supervisor output until it reports the running state.
+        import select
+        deadline = time.monotonic()+15
+        running = False
+        buffered = b''
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stdout], [], [], .2)
+            if not readable:
+                continue
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            buffered += chunk
+            while b'\n' in buffered:
+                line, buffered = buffered.split(b'\n', 1)
+                if json.loads(line).get('status') == 'running':
+                    running = True
+            if running:
+                break
+        self.assertTrue(running, 'supervisor did not report running')
+        (self.state/'exit-now').touch()
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 78, stderr)
+        self.assertNotIn('Traceback', stderr)
+        self.assertIsNone(session.bridge_status(self.app, self.state))
 
     def start_session(self, before_start=None):
         real_run = subprocess.run
