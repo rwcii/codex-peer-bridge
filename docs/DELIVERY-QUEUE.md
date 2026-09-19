@@ -35,16 +35,19 @@ Return one row per reporting agent, with these columns:
 | --- | --- | --- | --- | --- | --- | --- | --- |
 
 The figures support commit provenance notes. Cost estimation is a separate work
-product and is excluded. Reference implementations named by the user are
-`cordalo/forge` and `cordalo/unify-messaging`; inspect their relevant implementation
-before choosing metric sources. Their behavior has not yet been verified here.
+product and is excluded. The user specifically named the provenance-notes skills in
+`cordalo/forge` and `cordalo/unify-messaging`; inspect those skills and their supporting
+implementation before choosing metric sources. Their behavior has not yet been
+verified here.
 
 Acceptance requirements:
 
 - Support a request made before work and a retrospective request for completed work.
 - Identify the reporting agent and work block unambiguously; retain the eight
   requested columns and one row per reporting agent.
-- Produce metrics suitable for commit provenance without adding cost figures.
+- Include only the metrics required for the commit notes. The eight requested columns
+  are the complete report set for this requirement; additional metrics and cost
+  estimation are separate scope.
 
 Proposed correctness gates, to resolve in the implementation contract:
 
@@ -74,8 +77,12 @@ system or a new transport merely to populate commit notes.
 **Source:** recorded implementation defect (F071). **Status:** queued for reproduction
 and correction; not claimed fixed.
 
-The installer currently applies a Codex executable requirement on the DeepSeek-only
-configuration path, contrary to the documented provider requirement.
+The installer validates the Codex executable unconditionally before it resolves the
+installation mode and participant set. On a DeepSeek-only host without Codex on PATH,
+that check fails before provider-specific configuration is selected. This contradicts
+the documented provider requirement. Resolve the mode and participant set before
+validating their required executables; a check inside a later DeepSeek branch would
+leave the earlier unconditional failure in place.
 
 Acceptance: demonstrate the failure with a synthetic DeepSeek-only setup and no
 Codex executable; correct provider-specific validation; verify DeepSeek-only setup
@@ -111,8 +118,8 @@ evidence or a substitute for this contract.
 **Source:** gap discussed with the user; the proposed solution below is not an
 approved implementation contract. **Status:** scope/design decision pending.
 
-Records carry type, scope, scope target, and optional path. Current `recall` searches
-body text and paginates newest-first; it has no metadata filters or first-class topic
+Records carry type, scope, scope target, and optional path. Current `recall` uses FTS token matching when the index is usable and a body-substring
+scan otherwise, and paginates newest-first; it has no metadata filters or first-class topic
 model. Initial sync selects repository records and later sync returns repository
 changes; stored scope is not a server-side audience filter. Typed storage alone does
 not give agents selective retrieval or scope isolation.
