@@ -379,6 +379,9 @@ class Bridge:
             if control and not reply_started:
                 try:
                     error = dict(ok=False, code=code, error=type(exc).__name__)
+                    if (isinstance(request, dict) and request.get('op') == 'send'
+                            and isinstance(exc, (TimeoutError, OSError, WorkerFailure))):
+                        error.update(code='delivery_indeterminate', outcome='unknown')
                     if isinstance(exc, memory_bindings.BindingError):
                         error['recovery'] = exc.recovery
                         if exc.code == 'binding_timeout':

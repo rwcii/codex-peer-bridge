@@ -357,6 +357,33 @@ class SocketEvidenceTests(unittest.IsolatedAsyncioTestCase):
             await server.wait_closed()
             await asyncio.sleep(.01)
 
+    async def test_control_timeout_preserves_unknown_and_late_send_reservation(self):
+        import threading
+        release = threading.Event()
+        original = bridge.InboxStore.outgoing
+        def blocked(store, *args):
+            release.wait(2)
+            return original(store, *args)
+        timeout = asyncio.timeout
+        deadline = time.time() + 60
+        request = dict(op='send', to='uds:/synthetic.sock', message='synthetic', priority='next', msg_id='late', deadline=deadline)
+        reader, writer = await asyncio.open_unix_connection(str(self.path))
+        try:
+            with mock.patch.object(bridge.InboxStore, 'outgoing', blocked), mock.patch.object(bridge, 'target_path', return_value=self.root/'peer.sock'), mock.patch.object(bridge.asyncio, 'timeout', lambda seconds: timeout(.02 if seconds == 6 else seconds)):
+                writer.write(bridge.encode(request))
+                await writer.drain()
+                result = json.loads(await reader.readline())
+                self.assertEqual(result['code'], 'delivery_indeterminate')
+                self.assertEqual(result['outcome'], 'unknown')
+                self.assertEqual(await reader.read(), b'')
+        finally:
+            release.set()
+            writer.close()
+            await writer.wait_closed()
+        reservation = await self.bus.worker.call('outgoing', request['to'], request['message'], 'next', 'late', deadline)
+        self.assertFalse(reservation['new'])
+        self.assertEqual(reservation['status'], 'indeterminate')
+
     async def test_lost_control_reply_exposes_the_original_retry_identifiers(self):
         output = io.StringIO()
         request = dict(op='send', to='uds:/tmp/synthetic.sock', message='synthetic', msg_id='id', deadline=123)
