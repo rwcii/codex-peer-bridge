@@ -66,6 +66,29 @@ Proposed correctness gates, to resolve in the implementation contract:
 - Test before-work and retrospective requests, missing historical measurements,
   multiple agents, partial reports, and prevention of double counting.
 
+Acquisition evidence from the design conference:
+
+- The current Codex runtime writes `token_usage_record` entries to its own session
+  JSONL record. `payload.usage` contains `input_tokens`, `output_tokens`,
+  `cache_write_input_tokens`, `cached_input_tokens`, `reasoning_output_tokens`, and
+  `total_tokens`. Model identity is present in `turn_context.payload.model`; role
+  remains declared project metadata. The driver read its own records and verified
+  their session attribution, response identifiers, and all six fields.
+- In that inspected sample, per-response sums matched the thread aggregate, total
+  equalled input plus output, and cache reads and reasoning were bounded by input
+  and output respectively. All observed cache-write counts were zero, so the sample
+  does not establish nonzero cache-write accounting. Do not generalize this evidence
+  to every provider or runtime version.
+- Some separate `token_count` event snapshots had a nonzero total with zero component
+  fields. They are not interchangeable with per-response usage records. A collector
+  must distinguish event kinds and avoid summing cumulative snapshots or duplicate
+  responses. A session total is not a work-block report without identified boundaries.
+- The reviewer independently reports a Claude session-record source. Its provider
+  mapping and aggregation require their own checks; copying the Codex total formula
+  or adding cache fields to Codex input would be incorrect without normalization.
+- Keep only field names and sanitized findings in repository documentation. Private
+  session paths, identifiers, contents, and actual runtime counts stay outside it.
+
 **Open design decision:** reporting convention versus bridge protocol support.
 No wire-format change is approved by this queue. First inspect the reference
 implementations and establish the report/data-source contract, then recommend the
